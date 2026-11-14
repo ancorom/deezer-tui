@@ -1,0 +1,961 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, thiserror::Error)]
+pub enum DeezerError {
+    #[error("HTTP error: {0}")]
+    Http(String),
+
+    #[error("API error: {0}")]
+    Api(String),
+
+    #[error("Authentication failed: {0}")]
+    Auth(String),
+
+    #[error("Decryption error: {0}")]
+    Decrypt(String),
+
+    #[error("Playback error: {0}")]
+    Playback(String),
+
+    #[error("No track available in requested quality")]
+    QualityUnavailable,
+
+    #[error("Track not available: {0}")]
+    TrackUnavailable(String),
+
+    #[error("Track is already in this playlist")]
+    TrackAlreadyInPlaylist,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioQuality {
+    #[serde(rename = "MP3_64", alias = "Mp3_64", alias = "mp3_64")]
+    Mp3_64,
+    #[default]
+    #[serde(rename = "MP3_128", alias = "Mp3_128", alias = "mp3_128")]
+    Mp3_128,
+    #[serde(rename = "MP3_320", alias = "Mp3_320", alias = "mp3_320")]
+    Mp3_320,
+    #[serde(rename = "FLAC", alias = "Flac", alias = "flac")]
+    Flac,
+}
+
+impl AudioQuality {
+    pub fn as_api_format(&self) -> &'static str {
+        match self {
+            Self::Mp3_64 => "MP3_64",
+            Self::Mp3_128 => "MP3_128",
+            Self::Mp3_320 => "MP3_320",
+            Self::Flac => "FLAC",
+        }
+    }
+
+    /// Human-friendly label for UI display.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Mp3_64 => "MP3 64 kbps",
+            Self::Mp3_128 => "MP3 128 kbps",
+            Self::Mp3_320 => "MP3 320 kbps (Premium)",
+            Self::Flac => "FLAC (HiFi)",
+        }
+    }
+
+    /// All variants in display order (lowest to highest).
+    pub const ALL: &'static [AudioQuality] =
+        &[Self::Mp3_64, Self::Mp3_128, Self::Mp3_320, Self::Flac];
+
+    pub fn fallback(&self) -> Option<Self> {
+        match self {
+            Self::Flac => Some(Self::Mp3_320),
+            Self::Mp3_320 => Some(Self::Mp3_128),
+            Self::Mp3_128 => Some(Self::Mp3_64),
+            Self::Mp3_64 => None,
+        }
+    }
+
+    /// Returns all qualities to try, starting from `self`, going down, then up.
+    /// Example for Mp3_128: [Mp3_128, Mp3_64, Mp3_320, Flac]
+    pub fn all_fallbacks(&self) -> Vec<Self> {
+        let all_desc = [Self::Flac, Self::Mp3_320, Self::Mp3_128, Self::Mp3_64];
+        let mut result = Vec::with_capacity(4);
+        // First: self and below (preferred direction)
+        let mut q = Some(*self);
+        while let Some(quality) = q {
+            result.push(quality);
+            q = quality.fallback();
+        }
+        // Then: above self (try higher if lower fails)
+        for &quality in &all_desc {
+            if quality == *self {
+                break;
+            }
+            if !result.contains(&quality) {
+                result.push(quality);
+            }
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserData {
+    #[serde(rename = "USER")]
+    pub user: UserInfo,
+    #[serde(rename = "checkForm")]
+    pub api_token: String,
+    #[serde(rename = "OFFER")]
+    #[serde(default)]
+    pub offer: Option<UserOffer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserInfo {
+    #[serde(rename = "USER_ID")]
+    #[serde(deserialize_with = "deserialize_string_or_number")]
+    pub user_id: u64,
+    #[serde(rename = "BLOG_NAME")]
+    #[serde(default)]
+    pub user_name: String,
+    #[serde(rename = "OPTIONS")]
+    pub options: UserOptions,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserOptions {
+    pub license_token: String,
+    #[serde(rename = "web_streaming")]
+    #[serde(default)]
+    pub web_streaming: bool,
+    #[serde(rename = "web_hq")]
+    #[serde(default)]
+    pub web_hq: bool,
+    #[serde(rename = "web_lossless")]
+    #[serde(default)]
+    pub web_lossless: bool,
+    #[serde(rename = "mobile_offlinestreaming")]
+    #[serde(default)]
+    pub mobile_offline: bool,
+    #[serde(rename = "license_country")]
+    #[serde(default)]
+    pub license_country: String,
+    #[serde(rename = "expiration_timestamp")]
+    #[serde(default)]
+    pub expiration_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserOffer {
+    #[serde(rename = "OFFER_NAME")]
+    #[serde(default)]
+    pub offer_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackData {
+    #[serde(rename = "SNG_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub track_id: String,
+    #[serde(rename = "SNG_TITLE")]
+    pub title: String,
+    #[serde(rename = "ART_NAME")]
+    pub artist: String,
+    #[serde(rename = "ART_ID")]
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_optional_id")]
+    pub artist_id: Option<String>,
+    #[serde(rename = "ALB_TITLE")]
+    #[serde(default)]
+    pub album: String,
+    #[serde(rename = "DURATION")]
+    #[serde(default)]
+    pub duration: String,
+    #[serde(rename = "ALB_PICTURE")]
+    #[serde(default)]
+    pub album_picture: String,
+    #[serde(rename = "ALB_ID")]
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_optional_id")]
+    pub album_id: Option<String>,
+    #[serde(rename = "TRACK_TOKEN")]
+    #[serde(default)]
+    pub track_token: Option<String>,
+    #[serde(rename = "MD5_ORIGIN")]
+    #[serde(default)]
+    pub md5_origin: String,
+    #[serde(rename = "FALLBACK")]
+    #[serde(default)]
+    pub fallback: Option<TrackFallback>,
+    /// Ready-to-play URL for podcast episodes hosted outside Deezer: the audio
+    /// is fetched as-is, with no media API call and no Blowfish decryption.
+    #[serde(rename = "EPISODE_DIRECT_STREAM_URL")]
+    #[serde(default)]
+    pub direct_stream_url: Option<String>,
+    /// Unix timestamp the track was added to the playlist it was loaded from
+    /// (`deezer.pagePlaylist` only). 0 when unknown.
+    #[serde(rename = "DATE_ADD")]
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_string_or_number")]
+    pub date_add: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackFallback {
+    #[serde(rename = "SNG_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub track_id: String,
+}
+
+impl TrackData {
+    pub fn duration_secs(&self) -> u64 {
+        self.duration.parse().unwrap_or(0)
+    }
+
+    pub fn has_track_token(&self) -> bool {
+        self.track_token.as_ref().is_some_and(|t| !t.is_empty())
+    }
+
+    /// Podcast episode served straight from its host — no token, no decryption.
+    pub fn direct_stream_url(&self) -> Option<&str> {
+        self.direct_stream_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+    }
+
+    /// User-uploaded MP3s have a negative SNG_ID.
+    pub fn is_user_uploaded(&self) -> bool {
+        self.track_id.starts_with('-')
+    }
+
+    /// Re-label a FALLBACK stream with the track the user actually asked for.
+    ///
+    /// A FALLBACK is a different `SNG_ID` — another release of the song, often
+    /// with its own credits — that exists only because the requested one is no
+    /// longer streamable. Everything else keys off the requested id: the queue
+    /// row, the favorites entry the track was started from, the terminal title,
+    /// MPRIS. Handing them the fallback id leaves the playing row unmarked and
+    /// the track reading as un-favorited, so keep the requested identity and
+    /// take only `duration` from the stream, which is the audio that decodes.
+    ///
+    /// A no-op when nothing was substituted.
+    #[must_use]
+    pub fn with_identity_of(self, requested: &Self) -> Self {
+        if self.track_id == requested.track_id {
+            return self;
+        }
+        Self {
+            duration: self.duration,
+            ..requested.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaUrl {
+    pub sources: Vec<MediaSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaSource {
+    pub url: String,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResults {
+    pub data: Vec<TrackData>,
+    #[serde(default)]
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistData {
+    #[serde(rename = "ART_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub artist_id: String,
+    #[serde(rename = "ART_NAME")]
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "NB_FAN")]
+    #[serde(default)]
+    pub nb_fan: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlbumData {
+    #[serde(rename = "ALB_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub album_id: String,
+    #[serde(rename = "ALB_TITLE")]
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "ART_NAME")]
+    #[serde(default)]
+    pub artist: String,
+    #[serde(rename = "NUMBER_TRACK", alias = "NB_SONG")]
+    #[serde(default)]
+    pub nb_tracks: u64,
+    #[serde(rename = "PHYSICAL_RELEASE_DATE", alias = "DIGITAL_RELEASE_DATE")]
+    #[serde(default)]
+    pub release_date: String,
+    #[serde(rename = "NB_FAN")]
+    #[serde(default)]
+    pub nb_fan: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistData {
+    #[serde(rename = "PLAYLIST_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub playlist_id: String,
+    #[serde(rename = "TITLE")]
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "NB_SONG")]
+    #[serde(default)]
+    pub nb_songs: u64,
+    #[serde(rename = "PARENT_USERNAME")]
+    #[serde(default)]
+    pub author: String,
+    /// True if playlist is collaborative (writable by users other than the owner).
+    /// Synthesized in `get_user_playlists_raw` from the raw STATUS field; not
+    /// deserialized from the API directly.
+    #[serde(default)]
+    pub collaborative: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PodcastData {
+    #[serde(rename = "SHOW_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub show_id: String,
+    #[serde(rename = "SHOW_NAME")]
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "SHOW_DESCRIPTION")]
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeData {
+    #[serde(rename = "EPISODE_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub episode_id: String,
+    #[serde(rename = "EPISODE_TITLE")]
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "SHOW_ID")]
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_optional_id")]
+    pub show_id: Option<String>,
+    #[serde(rename = "SHOW_NAME")]
+    #[serde(default)]
+    pub show_name: String,
+    #[serde(rename = "DURATION")]
+    #[serde(default)]
+    pub duration: String,
+    /// Set for shows streamed from their own host (most podcasts): the episode
+    /// plays from this URL directly, unencrypted.
+    #[serde(rename = "EPISODE_DIRECT_STREAM_URL")]
+    #[serde(default)]
+    pub direct_stream_url: Option<String>,
+    /// Only set for Deezer-hosted episodes, which go through the media API.
+    #[serde(rename = "TRACK_TOKEN")]
+    #[serde(default)]
+    pub track_token: Option<String>,
+    #[serde(rename = "MD5_ORIGIN")]
+    #[serde(default)]
+    pub md5_origin: String,
+}
+
+impl EpisodeData {
+    /// Adapt to a `TrackData` so episodes flow through the regular queue and
+    /// playback path. The show takes the artist/album slots.
+    pub fn to_track(&self) -> TrackData {
+        TrackData {
+            track_id: self.episode_id.clone(),
+            title: self.title.clone(),
+            artist: self.show_name.clone(),
+            artist_id: None,
+            album: String::new(),
+            duration: self.duration.clone(),
+            album_picture: String::new(),
+            album_id: None,
+            track_token: self.track_token.clone(),
+            md5_origin: self.md5_origin.clone(),
+            fallback: None,
+            direct_stream_url: self.direct_stream_url.clone(),
+            date_add: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileData {
+    #[serde(rename = "USER_ID")]
+    #[serde(deserialize_with = "deserialize_string_or_number")]
+    pub user_id: u64,
+    #[serde(rename = "BLOG_NAME")]
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A radio station from the Deezer public API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadioData {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A "mood" channel from the Deezer catalog (e.g. Chill, Workout, Party).
+/// `target` is either a slug like "/channels/soft" (resolved via page.get) or
+/// empty when the mood maps directly to a `radio_id` (hardcoded fallback).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoodItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub radio_id: Option<u64>,
+}
+
+/// A music genre/category from the Deezer public API (`/genre`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenreData {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub picture: String,
+}
+
+/// Full content of a music genre/category — top tracks, albums, artists, playlists, radios.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GenreDetail {
+    pub genre_id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub tracks: Vec<TrackData>,
+    #[serde(default)]
+    pub albums: Vec<AlbumData>,
+    #[serde(default)]
+    pub artists: Vec<ArtistData>,
+    #[serde(default)]
+    pub playlists: Vec<PlaylistData>,
+    #[serde(default)]
+    pub radios: Vec<RadioData>,
+}
+
+/// Full album detail returned from the public API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlbumDetail {
+    pub album_id: String,
+    pub title: String,
+    pub artist: String,
+    pub nb_tracks: u64,
+    pub release_date: String,
+    pub cover_url: String,
+    pub label: String,
+    pub tracks: Vec<TrackData>,
+}
+
+/// An album entry within an artist detail page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistAlbumEntry {
+    pub album_id: String,
+    pub title: String,
+    pub release_date: String,
+    pub fans: u64,
+    pub record_type: String,
+    #[serde(default)]
+    pub cover_url: String,
+}
+
+/// A similar artist entry within an artist detail page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimilarArtistEntry {
+    pub artist_id: String,
+    pub name: String,
+    pub nb_fan: u64,
+}
+
+/// Sub-tab category for the artist detail right panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ArtistSubTab {
+    #[default]
+    TopTracks,
+    Albums,
+    Lives,
+    Other,
+    Similar,
+}
+
+impl ArtistSubTab {
+    pub const ALL: [Self; 5] = [
+        Self::TopTracks,
+        Self::Albums,
+        Self::Lives,
+        Self::Other,
+        Self::Similar,
+    ];
+
+    pub fn next(&self) -> Self {
+        let all = Self::ALL;
+        let idx = all.iter().position(|c| c == self).unwrap_or(0);
+        all[(idx + 1) % all.len()]
+    }
+
+    pub fn prev(&self) -> Self {
+        let all = Self::ALL;
+        let idx = all.iter().position(|c| c == self).unwrap_or(0);
+        all[(idx + all.len() - 1) % all.len()]
+    }
+}
+
+/// Full artist detail returned from the public API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistDetail {
+    pub artist_id: String,
+    pub name: String,
+    pub nb_fan: u64,
+    pub picture_url: String,
+    pub top_tracks: Vec<TrackData>,
+    pub albums: Vec<ArtistAlbumEntry>,
+    #[serde(default)]
+    pub similar_artists: Vec<SimilarArtistEntry>,
+}
+
+impl ArtistDetail {
+    /// Filter albums by sub-tab category.
+    /// Lives are detected by title keywords since the API doesn't have a "live" record_type.
+    pub fn albums_for_tab(&self, tab: ArtistSubTab) -> Vec<&ArtistAlbumEntry> {
+        self.albums
+            .iter()
+            .filter(|a| match tab {
+                ArtistSubTab::Albums => a.record_type == "album" && !a.is_live(),
+                ArtistSubTab::Lives => a.is_live(),
+                ArtistSubTab::Other => a.record_type != "album" && !a.is_live(),
+                ArtistSubTab::TopTracks | ArtistSubTab::Similar => false,
+            })
+            .collect()
+    }
+}
+
+impl ArtistAlbumEntry {
+    /// Detect live albums by title keywords.
+    pub fn is_live(&self) -> bool {
+        let lower = self.title.to_lowercase();
+        lower.contains("live") || lower.contains("concert") || lower.contains("en direct")
+    }
+}
+
+/// Full playlist detail returned from the public API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistDetail {
+    pub playlist_id: String,
+    pub title: String,
+    pub creator: String,
+    pub nb_tracks: u64,
+    pub tracks: Vec<TrackData>,
+}
+
+/// A unified display item for rendering in tables.
+/// Adapts different Deezer data types into a common 4-column format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayItem {
+    pub col1: String,
+    pub col2: String,
+    pub col3: String,
+    pub col4: String,
+    /// Original track data, if this item is playable.
+    pub track: Option<TrackData>,
+    /// Album ID, if this item represents or belongs to an album.
+    #[serde(default)]
+    pub album_id: Option<String>,
+    /// Playlist ID, if this item represents a playlist.
+    #[serde(default)]
+    pub playlist_id: Option<String>,
+    /// Artist ID, if this item represents an artist.
+    #[serde(default)]
+    pub artist_id: Option<String>,
+    /// Show ID, if this item represents a podcast show.
+    #[serde(default)]
+    pub show_id: Option<String>,
+    /// Explicit item type; `None` lets `kind()` infer it from the IDs.
+    #[serde(default)]
+    pub kind: Option<ItemKind>,
+}
+
+/// What a `DisplayItem` represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ItemKind {
+    Track,
+    Artist,
+    Album,
+    Playlist,
+    Podcast,
+    Episode,
+    Profile,
+}
+
+impl DisplayItem {
+    /// The item type: explicit when set, otherwise inferred from which IDs it
+    /// carries (episodes are the only playable items attached to a show).
+    pub fn kind(&self) -> ItemKind {
+        if let Some(kind) = self.kind {
+            kind
+        } else if self.track.is_some() {
+            if self.show_id.is_some() {
+                ItemKind::Episode
+            } else {
+                ItemKind::Track
+            }
+        } else if self.artist_id.is_some() {
+            ItemKind::Artist
+        } else if self.album_id.is_some() {
+            ItemKind::Album
+        } else if self.playlist_id.is_some() {
+            ItemKind::Playlist
+        } else if self.show_id.is_some() {
+            ItemKind::Podcast
+        } else {
+            ItemKind::Profile
+        }
+    }
+
+    /// Same item, laid out for the All search category: name, type (left
+    /// empty — the frontend fills in a localized label from `kind()`), and a
+    /// short detail (artist, author, show…).
+    pub fn into_all_row(mut self) -> Self {
+        let detail = match self.kind() {
+            ItemKind::Podcast | ItemKind::Profile => String::new(),
+            _ => std::mem::take(&mut self.col2),
+        };
+        self.col2 = String::new();
+        self.col3 = detail;
+        self.col4 = String::new();
+        self
+    }
+
+    pub fn from_track(track: &TrackData) -> Self {
+        let dur = track.duration_secs();
+        Self {
+            col1: track.title.clone(),
+            col2: track.artist.clone(),
+            col3: track.album.clone(),
+            col4: format!("{}:{:02}", dur / 60, dur % 60),
+            track: Some(track.clone()),
+            album_id: None,
+            playlist_id: None,
+            artist_id: None,
+            show_id: None,
+            kind: Some(ItemKind::Track),
+        }
+    }
+
+    pub fn from_artist(artist: &ArtistData) -> Self {
+        Self {
+            col1: artist.name.clone(),
+            col2: format!("{} fans", format_number(artist.nb_fan)),
+            col3: String::new(),
+            col4: String::new(),
+            track: None,
+            album_id: None,
+            playlist_id: None,
+            artist_id: Some(artist.artist_id.clone()),
+            show_id: None,
+            kind: Some(ItemKind::Artist),
+        }
+    }
+
+    pub fn from_album(album: &AlbumData) -> Self {
+        Self {
+            col1: album.title.clone(),
+            col2: album.artist.clone(),
+            col3: album.release_date.clone(),
+            col4: album.nb_tracks.to_string(),
+            track: None,
+            album_id: Some(album.album_id.clone()),
+            playlist_id: None,
+            artist_id: None,
+            show_id: None,
+            kind: Some(ItemKind::Album),
+        }
+    }
+
+    pub fn from_playlist(playlist: &PlaylistData) -> Self {
+        Self {
+            col1: playlist.title.clone(),
+            col2: playlist.author.clone(),
+            col3: playlist.nb_songs.to_string(),
+            col4: String::new(),
+            track: None,
+            album_id: None,
+            playlist_id: Some(playlist.playlist_id.clone()),
+            artist_id: None,
+            show_id: None,
+            kind: Some(ItemKind::Playlist),
+        }
+    }
+
+    pub fn from_podcast(podcast: &PodcastData) -> Self {
+        Self {
+            col1: podcast.name.clone(),
+            col2: podcast.description.clone(),
+            col3: String::new(),
+            col4: String::new(),
+            track: None,
+            album_id: None,
+            playlist_id: None,
+            artist_id: None,
+            show_id: Some(podcast.show_id.clone()),
+            kind: Some(ItemKind::Podcast),
+        }
+    }
+
+    pub fn from_episode(episode: &EpisodeData) -> Self {
+        let dur: u64 = episode.duration.parse().unwrap_or(0);
+        Self {
+            col1: episode.title.clone(),
+            col2: episode.show_name.clone(),
+            col3: String::new(),
+            col4: format!("{}:{:02}", dur / 60, dur % 60),
+            // Playable: `PlayFromSearch` picks the track up straight from here.
+            track: Some(episode.to_track()),
+            album_id: None,
+            playlist_id: None,
+            artist_id: None,
+            show_id: episode.show_id.clone(),
+            kind: Some(ItemKind::Episode),
+        }
+    }
+
+    pub fn from_profile(profile: &ProfileData) -> Self {
+        Self {
+            col1: profile.name.clone(),
+            col2: String::new(),
+            col3: String::new(),
+            col4: String::new(),
+            track: None,
+            album_id: None,
+            playlist_id: None,
+            artist_id: None,
+            show_id: None,
+            kind: Some(ItemKind::Profile),
+        }
+    }
+}
+
+fn format_number(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Deezer sends numeric IDs as strings (e.g. "123456") or as integers (e.g. 0 for invalid).
+fn deserialize_string_or_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrNumber;
+
+    impl<'de> de::Visitor<'de> for StringOrNumber {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or number")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            Ok(v as u64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            v.parse().map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrNumber)
+}
+
+/// Deezer sends IDs as either strings or numbers, or may be missing. Returns Option<String>.
+fn deserialize_optional_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct OptionalId;
+
+    impl<'de> de::Visitor<'de> for OptionalId {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string, number, or null")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Option<String>, E> {
+            if v == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(v.to_string()))
+            }
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Option<String>, E> {
+            if v <= 0 {
+                Ok(None)
+            } else {
+                Ok(Some(v.to_string()))
+            }
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<String>, E> {
+            if v.is_empty() || v == "0" {
+                Ok(None)
+            } else {
+                Ok(Some(v.to_string()))
+            }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalId)
+}
+
+/// Deezer sends IDs as either strings or numbers. This always returns a String.
+fn deserialize_id_to_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct IdToString;
+
+    impl<'de> de::Visitor<'de> for IdToString {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or number")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(IdToString)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed from a real `deezer.pageSearch` EPISODE entry.
+    const EPISODE_JSON: &str = r#"{
+        "EPISODE_ID": "907330422",
+        "SHOW_ID": "3851047",
+        "SHOW_NAME": "After Tour",
+        "EPISODE_TITLE": "Lenny Martinez",
+        "MD5_ORIGIN": "",
+        "EPISODE_DIRECT_STREAM_URL": "https://host.example/audio/128/default.mp3",
+        "DURATION": "1357",
+        "TRACK_TOKEN": "AAAAAWpm"
+    }"#;
+
+    fn track(id: &str, artist: &str, duration: &str) -> TrackData {
+        serde_json::from_value(serde_json::json!({
+            "SNG_ID": id,
+            "SNG_TITLE": "Us and Them",
+            "ART_NAME": artist,
+            "ALB_TITLE": "Noir Lac",
+            "DURATION": duration,
+        }))
+        .unwrap()
+    }
+
+    /// A FALLBACK must not leak its own id or credits into the player state:
+    /// the UI matches the playing row and the favorites entry on the id the
+    /// user picked.
+    #[test]
+    fn fallback_stream_keeps_the_requested_identity() {
+        let requested = track("101", "David Neerman", "357");
+        let streamed = track("202", "Ensemble Sequenza 9.3", "360");
+
+        let played = streamed.with_identity_of(&requested);
+        assert_eq!(played.track_id, "101");
+        assert_eq!(played.artist, "David Neerman");
+        // Duration describes the audio that actually decodes, so it comes from
+        // the stream.
+        assert_eq!(played.duration, "360");
+    }
+
+    #[test]
+    fn with_identity_of_is_a_no_op_without_a_substitution() {
+        let requested = track("101", "David Neerman", "357");
+        let played = track("101", "David Neerman", "357").with_identity_of(&requested);
+        assert_eq!(played.track_id, "101");
+        assert_eq!(played.duration, "357");
+    }
+
+    #[test]
+    fn episode_parses_and_converts_to_a_playable_track() {
+        let episode: EpisodeData = serde_json::from_str(EPISODE_JSON).unwrap();
+        assert_eq!(episode.show_id.as_deref(), Some("3851047"));
+
+        let track = episode.to_track();
+        assert_eq!(track.track_id, "907330422");
+        assert_eq!(track.artist, "After Tour");
+        assert_eq!(track.duration_secs(), 1357);
+        assert_eq!(
+            track.direct_stream_url(),
+            Some("https://host.example/audio/128/default.mp3")
+        );
+    }
+
+    #[test]
+    fn episode_display_item_carries_the_track_and_show() {
+        let episode: EpisodeData = serde_json::from_str(EPISODE_JSON).unwrap();
+        let item = DisplayItem::from_episode(&episode);
+        // Playback reads the track straight off the display item.
+        assert!(item.track.is_some());
+        assert_eq!(item.show_id.as_deref(), Some("3851047"));
+        assert_eq!(item.col4, "22:37");
+    }
+
+    #[test]
+    fn a_regular_track_has_no_direct_stream() {
+        let track: TrackData = serde_json::from_str(
+            r#"{"SNG_ID": "123", "SNG_TITLE": "T", "ART_NAME": "A", "DURATION": "200"}"#,
+        )
+        .unwrap();
+        assert_eq!(track.direct_stream_url(), None);
+    }
+}

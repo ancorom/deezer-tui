@@ -1,0 +1,45 @@
+**tokio > fs > read_to_string**
+
+# Module: fs::read_to_string
+
+## Contents
+
+**Functions**
+
+- [`read_to_string`](#read_to_string) - Creates a future which will open a file for reading and read the entire
+
+---
+
+## tokio::fs::read_to_string::read_to_string
+
+*Function*
+
+Creates a future which will open a file for reading and read the entire
+contents into a string and return said string.
+
+This is the async equivalent of [`std::fs::read_to_string`][std].
+
+This operation is implemented by running the equivalent blocking operation
+on a separate thread pool using [`spawn_blocking`].
+
+[`spawn_blocking`]: crate::task::spawn_blocking
+[std]: fn@std::fs::read_to_string
+
+# Examples
+
+```no_run
+use tokio::fs;
+
+# async fn dox() -> std::io::Result<()> {
+let contents = fs::read_to_string("foo.txt").await?;
+println!("foo.txt contains {} bytes", contents.len());
+# Ok(())
+# }
+```
+
+```rust
+fn read_to_string<impl AsRef<Path>>(path: impl Trait) -> io::Result<String>
+```
+
+
+

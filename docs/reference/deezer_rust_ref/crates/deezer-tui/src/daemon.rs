@@ -1,0 +1,4505 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use tokio::io::BufReader;
+use tokio::net::UnixListener;
+use tracing::{debug, error, info, warn};
+
+use deezer_core::api::models::{
+    AlbumDetail, ArtistDetail, ArtistSubTab, AudioQuality, DeezerError, DisplayItem, ItemKind,
+    PlaylistData, PlaylistDetail, TrackData,
+};
+use deezer_core::api::DeezerClient;
+use deezer_core::offline::OfflineIndex;
+use deezer_core::player::engine::{AudioInput, PlayerEngine};
+use deezer_core::player::eq::EqHandle;
+use deezer_core::player::state::{PlaybackStatus, PlayerState, RepeatMode};
+use deezer_core::player::stream::StreamReader;
+use deezer_core::Config;
+
+use crate::favorites_cache::FavoritesCache;
+use crate::i18n::t;
+use crate::protocol::{
+    pid_path, read_line, socket_path, ActiveTab, Command, DaemonSnapshot, ExploreCategory,
+    FavoritesCategory, GenreItem, MoodEntry, OfflineCategory, RadioItem, Screen, SearchCategory,
+    ServerMessage,
+};
+use deezer_core::api::models::GenreDetail;
+
+const TICK_RATE: Duration = Duration::from_millis(250);
+
+/// Distance kept from the end of the downloaded part when seeking a track that
+/// is still streaming: bytes map to time only roughly (FLAC is VBR).
+const SEEK_SAFETY_MARGIN_SECS: u64 = 5;
+
+/// Audio the current track must have downloaded ahead of playback before the
+/// next one starts downloading, so the two only share the link once the
+/// current one is safe.
+const PREFETCH_MIN_AHEAD_SECS: f64 = 20.0;
+
+/// Async results from background tasks.
+enum AsyncResult {
+    LoginSuccess(String),
+    LoginError(String),
+    MasterKeyReady([u8; 16]),
+    MasterKeyError(String),
+    SearchResults(Vec<TrackData>),
+    SearchError(String),
+    SearchDisplayResults(Vec<DisplayItem>),
+    /// Tracks for a favorites category. Carries the category the request was
+    /// issued for so a late response cannot be attributed to another one.
+    FavoritesLoaded(FavoritesCategory, Vec<TrackData>),
+    FavoritesError(FavoritesCategory, String),
+    /// Display items for a favorites category (see `FavoritesLoaded`).
+    FavoritesDisplayLoaded(FavoritesCategory, Vec<DisplayItem>),
+    TrackReady {
+        audio_data: AudioInput,
+        track: TrackData,
+        quality: AudioQuality,
+        generation: u64,
+    },
+    /// Outcome of fetching the next track ahead of time (see `maybe_prefetch_next`).
+    Prefetched {
+        track_id: String,
+        result: Result<(StreamReader, TrackData, AudioQuality), String>,
+    },
+    TrackFetchError {
+        err: String,
+        generation: u64,
+    },
+    FavoriteAdded(String),
+    FavoriteRemoved(String),
+    FavoriteError(String),
+    FavoriteArtistAdded(String),
+    FavoriteArtistRemoved(String),
+    FavoriteArtistError(String),
+    FavoriteAlbumAdded(String),
+    FavoriteAlbumRemoved(String),
+    FavoriteAlbumError(String),
+    FavoriteIdsLoaded {
+        track_ids: Vec<String>,
+        artist_ids: Vec<String>,
+        album_ids: Vec<String>,
+    },
+    PlaylistsReady(Vec<PlaylistData>),
+    PlaylistsError(String),
+    AddedToPlaylist(String),
+    AddToPlaylistError(String),
+    AlreadyInPlaylist,
+    RemovedFromPlaylist {
+        playlist_id: String,
+        track_id: String,
+    },
+    RemoveFromPlaylistError(String),
+    PlaylistCreatedAndAdded {
+        playlist_id: String,
+    },
+    PlaylistCreatedError(String),
+    PlaylistRenamed {
+        playlist_id: String,
+        new_title: String,
+    },
+    PlaylistRenameError(String),
+    PlaylistDeleted(String),
+    PlaylistDeleteError(String),
+    DislikeOk,
+    DislikeError(String),
+    MixReady(Vec<TrackData>),
+    MixError(String),
+    /// Mix for a track already playing: appended after it, without restarting
+    /// playback.
+    SeededMixReady {
+        seed_id: String,
+        tracks: Vec<TrackData>,
+    },
+    FlowReady(Vec<TrackData>),
+    FlowError(String),
+    AlbumDetailReady(AlbumDetail),
+    AlbumDetailError(String),
+    ArtistDetailReady(ArtistDetail),
+    ArtistDetailError(String),
+    PlaylistDetailReady {
+        detail: PlaylistDetail,
+        background: bool,
+    },
+    /// Podcast show episodes. Shares the playlist detail view slot but is never
+    /// cached: show IDs and playlist IDs are unrelated ID spaces.
+    ShowDetailReady(PlaylistDetail),
+    ShowDetailError(String),
+    PlaylistDetailError {
+        err: String,
+        background: bool,
+    },
+    RadiosReady(Vec<RadioItem>),
+    RadiosError(String),
+    RadioTracksReady(Vec<TrackData>),
+    RadioTracksError(String),
+    MoodsReady(Vec<MoodEntry>),
+    MoodsError(String),
+    MoodTracksReady {
+        tracks: Vec<TrackData>,
+        continuation: bool,
+    },
+    MoodTracksError {
+        err: String,
+        continuation: bool,
+    },
+    GenresReady(Vec<GenreItem>),
+    GenresError(String),
+    GenreDetailReady(GenreDetail),
+    GenreDetailError(String),
+    OfflineTrackSaved {
+        track: TrackData,
+        quality: AudioQuality,
+    },
+    OfflineTrackSaveError(String),
+    OfflineAlbumSaved {
+        album: AlbumDetail,
+    },
+    OfflineAlbumSaveError(String),
+    OfflinePlaylistSaved {
+        playlist: PlaylistDetail,
+    },
+    OfflinePlaylistSaveError(String),
+    /// Progress of an ongoing offline playlist download, 0-100.
+    OfflineDownloadProgress {
+        percent: u8,
+    },
+}
+
+/// The next track, fetched while the current one finishes.
+struct Prefetch {
+    track_id: String,
+    /// Quality asked for: a prefetch made before a quality change is not reused.
+    quality: AudioQuality,
+    /// Set once the fetch succeeded; stays `None` while in flight or after a
+    /// failure (the track is then fetched normally when its turn comes).
+    ready: Option<(StreamReader, TrackData, AudioQuality)>,
+}
+
+pub struct Daemon {
+    config: Config,
+    screen: Screen,
+    active_tab: ActiveTab,
+    status_msg: Option<String>,
+
+    // Login state
+    login_error: Option<String>,
+    login_loading: bool,
+    user_name: Option<String>,
+
+    // Search state
+    search_results: Vec<TrackData>,
+    search_selected: usize,
+    search_loading: bool,
+    search_category: SearchCategory,
+    search_display: Vec<DisplayItem>,
+    last_search_query: String,
+
+    // Favorites state
+    favorites: Vec<TrackData>,
+    favorites_selected: usize,
+    favorites_loading: bool,
+    favorites_category: FavoritesCategory,
+    favorites_display: Vec<DisplayItem>,
+    favorite_track_ids: Vec<String>,
+    favorite_artist_ids: Vec<String>,
+    favorite_album_ids: Vec<String>,
+    favorites_cache: FavoritesCache,
+
+    // Explore tab
+    explore_category: ExploreCategory,
+
+    // Radios
+    radios: Vec<RadioItem>,
+    radios_selected: usize,
+    radios_loading: bool,
+
+    // Moods
+    moods: Vec<MoodEntry>,
+    moods_selected: usize,
+    moods_loading: bool,
+
+    // Genres / Categories
+    genres: Vec<GenreItem>,
+    genres_selected: usize,
+    genres_loading: bool,
+
+    // Offline
+    offline_index: OfflineIndex,
+    offline_category: OfflineCategory,
+    offline_selected: usize,
+    offline_loading: bool,
+
+    // Playlists (for popup menu playlist picker)
+    playlists: Vec<PlaylistData>,
+
+    // Album detail
+    album_detail: Option<AlbumDetail>,
+    album_detail_selected: usize,
+    album_detail_loading: bool,
+
+    // Artist detail
+    artist_detail: Option<ArtistDetail>,
+    artist_detail_selected: usize,
+    artist_detail_loading: bool,
+    artist_detail_sub_tab: ArtistSubTab,
+
+    // Playlist detail
+    playlist_detail: Option<PlaylistDetail>,
+    playlist_detail_selected: usize,
+    playlist_detail_loading: bool,
+
+    // Genre detail
+    genre_detail: Option<GenreDetail>,
+    genre_detail_loading: bool,
+
+    // Navigation overlay stack (persisted across client reconnections)
+    nav_overlay: Option<crate::protocol::NavOverlay>,
+    nav_overlay_stack: Vec<crate::protocol::NavOverlay>,
+
+    // Player
+    player_state: Arc<Mutex<PlayerState>>,
+    /// Live equalizer parameters, shared with every `PlayerEngine`.
+    eq: EqHandle,
+    client: Arc<tokio::sync::Mutex<DeezerClient>>,
+    engine: Option<PlayerEngine>,
+    master_key: Option<[u8; 16]>,
+
+    /// Playback order of the current shuffle cycle: every queue index exactly
+    /// once, in random order. Lets shuffle be a full pass over the queue rather
+    /// than an endless random walk, which is what makes "repeat all" able to
+    /// repeat *the shuffle* instead of the queue's natural order.
+    shuffle_order: Vec<usize>,
+    /// How far through `shuffle_order` the current cycle is.
+    shuffle_pos: usize,
+
+    // Network connectivity
+    is_offline: bool,
+
+    // Shared HTTP client for CDN downloads (connection reuse)
+    cdn_http: deezer_core::CdnClient,
+
+    // Async channel
+    async_tx: tokio::sync::mpsc::UnboundedSender<AsyncResult>,
+    async_rx: tokio::sync::mpsc::UnboundedReceiver<AsyncResult>,
+
+    // Generation counter to discard stale track fetch results
+    track_generation: u64,
+    // Count consecutive failed track fetches to avoid infinite skip loop
+    consecutive_skip_count: u32,
+    /// Next track fetched ahead of time, used if it is the one played next.
+    prefetch: Option<Prefetch>,
+
+    // Flow mode — when true, auto-fetch more Flow tracks when queue ends
+    flow_active: bool,
+
+    // Currently playing mood — when set, auto-fetch more tracks for this mood
+    // when the queue ends (mutually exclusive with `flow_active`).
+    active_mood: Option<deezer_core::api::models::MoodItem>,
+
+    // Track ID for which we already sent log.listen during this play.
+    // Reset on every new track start so each play is logged exactly once.
+    listen_logged_for: Option<String>,
+
+    // MPRIS D-Bus server (Linux desktops only). Lets media keys / now-playing
+    // widgets control playback. `None` if D-Bus is unavailable.
+    #[cfg(target_os = "linux")]
+    mpris: Option<mpris_server::Server<crate::mpris::MprisHandler>>,
+    #[cfg(target_os = "linux")]
+    mpris_last: crate::mpris::MprisSnapshot,
+}
+
+impl Daemon {
+    pub fn new() -> Result<Self> {
+        let config = Config::load();
+        let initial_volume = config.volume;
+        let initial_quality = config.quality;
+        let eq = EqHandle::new(&config.equalizer);
+
+        // Check network connectivity against Deezer itself (a public DNS
+        // server may be blocked on networks where Deezer is reachable).
+        let is_offline = !std::net::ToSocketAddrs::to_socket_addrs("www.deezer.com:443")
+            .map(|mut addrs| {
+                addrs.any(|addr| {
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
+                })
+            })
+            .unwrap_or(false);
+
+        let screen = if is_offline {
+            Screen::Main
+        } else if config.arl.is_some() {
+            Screen::Main
+        } else {
+            Screen::Login
+        };
+
+        let client = DeezerClient::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let cdn_http =
+            deezer_core::player::stream::new_cdn_client().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (async_tx, async_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let favorites_cache = FavoritesCache::load();
+        let cached_moods = favorites_cache.moods.clone().unwrap_or_default();
+        let favorite_track_ids = favorites_cache
+            .tracks
+            .as_ref()
+            .map(|tracks| tracks.iter().map(|t| t.track_id.clone()).collect())
+            .unwrap_or_default();
+
+        Ok(Self {
+            config,
+            screen,
+            active_tab: if is_offline {
+                ActiveTab::Downloads
+            } else {
+                ActiveTab::Search
+            },
+            status_msg: None,
+
+            login_error: None,
+            login_loading: false,
+            user_name: None,
+
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_loading: false,
+            search_category: SearchCategory::default(),
+            search_display: Vec::new(),
+            last_search_query: String::new(),
+
+            favorites: Vec::new(),
+            favorites_selected: 0,
+            favorites_loading: false,
+            favorites_category: FavoritesCategory::default(),
+            favorites_display: Vec::new(),
+            favorite_track_ids,
+            favorite_artist_ids: Vec::new(),
+            favorite_album_ids: Vec::new(),
+            favorites_cache,
+
+            offline_index: OfflineIndex::load(),
+            offline_category: OfflineCategory::default(),
+            offline_selected: 0,
+            offline_loading: false,
+
+            explore_category: ExploreCategory::default(),
+            radios: Vec::new(),
+            radios_selected: 0,
+            radios_loading: false,
+            moods: cached_moods,
+            moods_selected: 0,
+            moods_loading: false,
+            genres: Vec::new(),
+            genres_selected: 0,
+            genres_loading: false,
+
+            playlists: Vec::new(),
+
+            album_detail: None,
+            album_detail_selected: 0,
+            album_detail_loading: false,
+
+            artist_detail: None,
+            artist_detail_selected: 0,
+            artist_detail_loading: false,
+            artist_detail_sub_tab: ArtistSubTab::default(),
+
+            playlist_detail: None,
+            playlist_detail_selected: 0,
+            playlist_detail_loading: false,
+
+            genre_detail: None,
+            genre_detail_loading: false,
+
+            nav_overlay: None,
+            nav_overlay_stack: Vec::new(),
+
+            eq,
+            player_state: Arc::new(Mutex::new(PlayerState {
+                volume: initial_volume,
+                quality: initial_quality,
+                ..PlayerState::default()
+            })),
+
+            client: Arc::new(tokio::sync::Mutex::new(client)),
+            cdn_http,
+            engine: None,
+            master_key: None,
+            shuffle_order: Vec::new(),
+            shuffle_pos: 0,
+
+            is_offline,
+
+            async_tx,
+            async_rx,
+
+            track_generation: 0,
+            consecutive_skip_count: 0,
+            prefetch: None,
+            flow_active: false,
+            active_mood: None,
+            listen_logged_for: None,
+
+            #[cfg(target_os = "linux")]
+            mpris: None,
+            #[cfg(target_os = "linux")]
+            mpris_last: crate::mpris::MprisSnapshot::default(),
+        })
+    }
+
+    /// Run the daemon: listen for client connections and process commands.
+    pub async fn run(&mut self) -> Result<()> {
+        let sock_path = socket_path();
+
+        // Clean up stale socket
+        if sock_path.exists() {
+            let _ = std::fs::remove_file(&sock_path);
+        }
+        if let Some(parent) = sock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let listener = UnixListener::bind(&sock_path)?;
+        info!(?sock_path, "Daemon listening");
+
+        // Write PID file so the client can kill us during updates
+        let pid_file = pid_path();
+        let _ = std::fs::write(&pid_file, std::process::id().to_string());
+
+        if self.is_offline {
+            // In offline mode, create the audio engine immediately (no master key needed for local playback)
+            match PlayerEngine::new([0u8; 16], Arc::clone(&self.player_state), self.eq.clone()) {
+                Ok(engine) => {
+                    engine.set_volume(self.config.volume);
+                    self.engine = Some(engine);
+                }
+                Err(e) => {
+                    warn!("Failed to init audio engine in offline mode: {e}");
+                }
+            }
+        } else if let Some(arl) = self.config.arl.clone() {
+            self.status_msg = Some(t().login_connecting.into());
+            self.start_login(arl);
+        }
+
+        // Main daemon loop — supports multiple concurrent clients.
+        // Each client has a spawned reader task that pushes commands into a channel.
+        // Writers are kept in a shared map; snapshots are broadcast to all clients.
+        type ClientWriters = Arc<
+            tokio::sync::Mutex<
+                HashMap<u64, Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>,
+            >,
+        >;
+        let clients: ClientWriters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let mut next_client_id: u64 = 0;
+        let (client_cmd_tx, mut client_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, Option<Command>)>();
+
+        // Register the MPRIS D-Bus media player (Linux desktops). Commands from
+        // media keys / now-playing widgets arrive on `mpris_cmd_rx` and are fed
+        // through the normal command path below. On non-Linux the sender is
+        // dropped immediately so the receiver branch stays dormant.
+        let (mpris_cmd_tx, mut mpris_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        #[cfg(target_os = "linux")]
+        {
+            let handler =
+                crate::mpris::MprisHandler::new(mpris_cmd_tx, Arc::clone(&self.player_state));
+            match mpris_server::Server::new(crate::mpris::BUS_SUFFIX, handler).await {
+                Ok(server) => {
+                    info!("MPRIS server registered");
+                    self.mpris = Some(server);
+                }
+                Err(e) => {
+                    warn!("MPRIS unavailable (no D-Bus session?): {e}");
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        drop(mpris_cmd_tx);
+
+        loop {
+            // Build tick interval
+            let tick = tokio::time::sleep(TICK_RATE);
+
+            tokio::select! {
+                // Accept new client connection
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, _addr)) => {
+                            let id = next_client_id;
+                            next_client_id += 1;
+                            info!(client_id = id, "Client connected");
+
+                            let (read_half, write_half) = stream.into_split();
+                            let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+
+                            // Register the client BEFORE any I/O so one-shot commands
+                            // (which disconnect immediately after writing) are always read.
+                            clients.lock().await.insert(id, writer.clone());
+
+                            // Spawn reader task for this client
+                            let cmd_tx = client_cmd_tx.clone();
+                            tokio::spawn(async move {
+                                let mut reader = BufReader::new(read_half);
+                                loop {
+                                    match read_line::<Command, _>(&mut reader).await {
+                                        Ok(Some(cmd)) => {
+                                            if cmd_tx.send((id, Some(cmd))).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Ok(None) | Err(_) => {
+                                            let _ = cmd_tx.send((id, None));
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Best-effort initial snapshot. One-shot clients (`-n`/`-b`/`-p`)
+                            // may have already disconnected — that's fine, the reader task
+                            // will still deliver their command from the kernel buffer.
+                            let snap = self.snapshot();
+                            let msg = ServerMessage::Snapshot(snap);
+                            let mut w = writer.lock().await;
+                            if let Err(e) = send_line_writer(&mut *w, &msg).await {
+                                debug!(client_id = id, "Initial snapshot failed (likely one-shot client): {e}");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Accept error: {e}");
+                        }
+                    }
+                }
+
+                // Command received from any connected client (or disconnect notification)
+                Some((id, maybe_cmd)) = client_cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(command) => {
+                            debug!(client_id = id, ?command, "Received command");
+                            let should_shutdown = matches!(command, Command::Shutdown);
+                            self.handle_command(command);
+
+                            // Broadcast snapshot to all clients
+                            let snap = self.snapshot();
+                            broadcast_snapshot(&clients, snap).await;
+                            self.mpris_refresh().await;
+
+                            if should_shutdown {
+                                info!("Shutdown requested, exiting daemon");
+                                break;
+                            }
+                        }
+                        None => {
+                            info!(client_id = id, "Client disconnected");
+                            clients.lock().await.remove(&id);
+                        }
+                    }
+                }
+
+                // Command received from the MPRIS D-Bus interface (media keys, etc.)
+                Some(command) = mpris_cmd_rx.recv() => {
+                    debug!(?command, "Received MPRIS command");
+                    let should_shutdown = matches!(command, Command::Shutdown);
+                    self.handle_command(command);
+
+                    let snap = self.snapshot();
+                    broadcast_snapshot(&clients, snap).await;
+                    self.mpris_refresh().await;
+
+                    if should_shutdown {
+                        info!("Shutdown requested via MPRIS, exiting daemon");
+                        break;
+                    }
+                }
+
+                // Tick: update position, auto-advance, process async results
+                _ = tick => {
+                    self.process_async_results();
+                    self.on_tick();
+
+                    // Broadcast periodic snapshot to all clients
+                    let snap = self.snapshot();
+                    broadcast_snapshot(&clients, snap).await;
+                    self.mpris_refresh().await;
+                }
+            }
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&pid_file);
+        info!("Daemon stopped");
+        Ok(())
+    }
+
+    /// Selection cursor of the list currently shown by the active tab.
+    fn selection_mut(&mut self) -> &mut usize {
+        match self.active_tab {
+            ActiveTab::Search => &mut self.search_selected,
+            ActiveTab::Favorites => &mut self.favorites_selected,
+            ActiveTab::Explore => match self.explore_category {
+                ExploreCategory::Moods => &mut self.moods_selected,
+                ExploreCategory::Categories => &mut self.genres_selected,
+                ExploreCategory::Radios => &mut self.radios_selected,
+            },
+            ActiveTab::Downloads => &mut self.offline_selected,
+        }
+    }
+
+    /// Item count of the list currently shown by the active tab.
+    fn current_list_len(&self) -> usize {
+        match self.active_tab {
+            ActiveTab::Search => self.search_display.len(),
+            ActiveTab::Favorites => self.favorites_display.len(),
+            ActiveTab::Explore => match self.explore_category {
+                ExploreCategory::Moods => self.moods.len(),
+                ExploreCategory::Categories => self.genres.len(),
+                ExploreCategory::Radios => self.radios.len(),
+            },
+            ActiveTab::Downloads => match self.offline_category {
+                OfflineCategory::Tracks => self.offline_index.tracks.len(),
+                OfflineCategory::Albums => self.offline_index.albums.len(),
+                OfflineCategory::Playlists => self.offline_index.playlists.len(),
+            },
+        }
+    }
+
+    /// Position of the active tab's category within its `ALL` list, and that
+    /// list's length.
+    fn category_position(&self) -> (usize, usize) {
+        fn pos<T: PartialEq>(all: &[T], current: &T) -> (usize, usize) {
+            (
+                all.iter().position(|c| c == current).unwrap_or(0),
+                all.len(),
+            )
+        }
+        match self.active_tab {
+            ActiveTab::Search => pos(&SearchCategory::ALL, &self.search_category),
+            ActiveTab::Favorites => pos(&FavoritesCategory::ALL, &self.favorites_category),
+            ActiveTab::Explore => pos(&ExploreCategory::ALL, &self.explore_category),
+            ActiveTab::Downloads => pos(&OfflineCategory::ALL, &self.offline_category),
+        }
+    }
+
+    /// Switch the active tab's category to `index` in its `ALL` list, resetting
+    /// the selection and kicking off whatever load the new category needs.
+    /// Out-of-range indices and no-op switches are ignored.
+    fn set_category_index(&mut self, index: usize) {
+        match self.active_tab {
+            ActiveTab::Search => {
+                let Some(&cat) = SearchCategory::ALL.get(index) else {
+                    return;
+                };
+                if cat == self.search_category {
+                    return;
+                }
+                self.search_category = cat;
+                self.search_selected = 0;
+                if !self.last_search_query.is_empty() {
+                    self.start_search(self.last_search_query.clone());
+                }
+            }
+            ActiveTab::Favorites => {
+                let Some(&cat) = FavoritesCategory::ALL.get(index) else {
+                    return;
+                };
+                if cat == self.favorites_category {
+                    return;
+                }
+                self.favorites_category = cat;
+                self.favorites_selected = 0;
+                self.start_load_favorites_category();
+            }
+            ActiveTab::Explore => {
+                let Some(&cat) = ExploreCategory::ALL.get(index) else {
+                    return;
+                };
+                if cat == self.explore_category {
+                    return;
+                }
+                self.explore_category = cat;
+                if cat == ExploreCategory::Categories
+                    && self.genres.is_empty()
+                    && !self.genres_loading
+                {
+                    self.start_load_genres();
+                }
+            }
+            ActiveTab::Downloads => {
+                let Some(&cat) = OfflineCategory::ALL.get(index) else {
+                    return;
+                };
+                if cat == self.offline_category {
+                    return;
+                }
+                self.offline_category = cat;
+                self.offline_selected = 0;
+            }
+        }
+    }
+
+    fn handle_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::GetSnapshot => {} // Snapshot is sent after every command anyway
+            Command::Login { arl } => {
+                self.config.arl = Some(arl.clone());
+                let _ = Config::update(|c| c.arl = Some(arl.clone()));
+                self.start_login(arl);
+            }
+            Command::Search { query } => {
+                self.last_search_query = query.clone();
+                self.start_search(query);
+            }
+            Command::PlayFromSearch { index } => {
+                // All view: play the picked item alone; a track also gets a
+                // mix inspired by it queued up behind it.
+                if self.search_category == SearchCategory::All {
+                    if let Some(item) = self.search_display.get(index) {
+                        if let Some(track) = item.track.clone() {
+                            let with_mix = item.kind() == ItemKind::Track;
+                            self.flow_active = false;
+                            self.active_mood = None;
+                            if let Ok(mut state) = self.player_state.lock() {
+                                state.queue = vec![track.clone()];
+                                state.queue_index = 0;
+                            }
+                            if with_mix {
+                                self.start_seeded_mix(track.track_id.clone());
+                            }
+                            self.start_play_track(track);
+                        }
+                    }
+                    return;
+                }
+                // Try to get a playable track from display items
+                if let Some(item) = self.search_display.get(index) {
+                    if let Some(track) = &item.track {
+                        // Build queue from all playable tracks in search results
+                        let playable: Vec<TrackData> = self
+                            .search_display
+                            .iter()
+                            .filter_map(|d| d.track.clone())
+                            .collect();
+                        let queue_idx = playable
+                            .iter()
+                            .position(|t| t.track_id == track.track_id)
+                            .unwrap_or(0);
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = playable;
+                            state.queue_index = queue_idx;
+                        }
+                        self.start_play_track(track.clone());
+                    }
+                }
+            }
+            Command::PlayFromFavorites { index } => {
+                info!(
+                    index,
+                    favorites_display_len = self.favorites_display.len(),
+                    "PlayFromFavorites"
+                );
+                if let Some(item) = self.favorites_display.get(index) {
+                    if let Some(track) = &item.track {
+                        let playable: Vec<TrackData> = self
+                            .favorites_display
+                            .iter()
+                            .filter_map(|d| d.track.clone())
+                            .collect();
+                        let queue_idx = playable
+                            .iter()
+                            .position(|t| t.track_id == track.track_id)
+                            .unwrap_or(0);
+                        info!(track_id = %track.track_id, title = %track.title, queue_len = playable.len(), queue_idx, "PlayFromFavorites: setting queue and playing");
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = playable;
+                            state.queue_index = queue_idx;
+                        }
+                        self.start_play_track(track.clone());
+                    }
+                }
+            }
+            Command::TogglePause => {
+                if let Some(ref engine) = self.engine {
+                    engine.toggle_pause();
+                }
+            }
+            Command::NextTrack => self.play_next(),
+            Command::PrevTrack => self.play_prev(),
+            Command::SetVolume { volume } => {
+                let volume = volume.clamp(0.0, 1.0);
+                if let Some(ref engine) = self.engine {
+                    engine.set_volume(volume);
+                } else if let Ok(mut state) = self.player_state.lock() {
+                    // No engine yet (nothing playing) — keep state authoritative
+                    // so the UI and MPRIS reflect the new volume.
+                    state.volume = volume;
+                }
+                self.config.volume = volume;
+                let _ = Config::update(|c| c.volume = volume);
+            }
+            Command::SetEqualizer { settings } => {
+                self.eq.apply(&settings);
+                let _ = Config::update(|c| c.equalizer = settings.clone());
+                self.config.equalizer = settings;
+            }
+            Command::SetQuality { quality } => {
+                self.config.quality = quality;
+                let _ = Config::update(|c| c.quality = quality);
+                info!(
+                    quality = quality.as_api_format(),
+                    "preferred quality updated (applies to next track)"
+                );
+            }
+            Command::SeekForward { secs } => {
+                self.seek_relative(secs as i64);
+            }
+            Command::SeekBackward { secs } => {
+                self.seek_relative(-(secs as i64));
+            }
+            Command::SeekAbsolute { secs } => {
+                self.seek_absolute(secs);
+            }
+            Command::Stop => {
+                if let Some(engine) = self.engine.as_mut() {
+                    engine.stop();
+                }
+                self.prefetch = None;
+            }
+            Command::ToggleShuffle => {
+                let (shuffle, queue_len, current) = {
+                    let mut state = self.player_state.lock().unwrap();
+                    state.shuffle = !state.shuffle;
+                    if state.shuffle {
+                        // Turning shuffle on clears repeat: the two are set from
+                        // scratch, and repeat is then free to be re-enabled on
+                        // top of shuffle (repeat does not clear shuffle).
+                        state.repeat = RepeatMode::Off;
+                    }
+                    (state.shuffle, state.queue.len(), state.queue_index)
+                };
+                if shuffle {
+                    // Start a fresh cycle from whatever is playing now.
+                    self.rebuild_shuffle_order(queue_len, current);
+                } else {
+                    self.shuffle_order.clear();
+                    self.shuffle_pos = 0;
+                }
+            }
+            Command::CycleRepeat => {
+                let mut state = self.player_state.lock().unwrap();
+                state.repeat = match state.repeat {
+                    RepeatMode::Off => RepeatMode::Queue,
+                    RepeatMode::Queue => RepeatMode::Track,
+                    RepeatMode::Track => RepeatMode::Off,
+                };
+            }
+            Command::LoadFavorites => {
+                self.start_load_favorites();
+            }
+            Command::SelectUp => {
+                let sel = self.selection_mut();
+                *sel = sel.saturating_sub(1);
+            }
+            Command::SelectDown => {
+                let len = self.current_list_len();
+                let sel = self.selection_mut();
+                if len > 0 {
+                    *sel = (*sel + 1).min(len - 1);
+                }
+            }
+            Command::NextTab => {
+                self.active_tab = match self.active_tab {
+                    ActiveTab::Search => ActiveTab::Favorites,
+                    ActiveTab::Favorites => ActiveTab::Explore,
+                    ActiveTab::Explore => ActiveTab::Downloads,
+                    ActiveTab::Downloads => ActiveTab::Search,
+                };
+            }
+            Command::PrevTab => {
+                self.active_tab = match self.active_tab {
+                    ActiveTab::Search => ActiveTab::Downloads,
+                    ActiveTab::Favorites => ActiveTab::Search,
+                    ActiveTab::Explore => ActiveTab::Favorites,
+                    ActiveTab::Downloads => ActiveTab::Explore,
+                };
+            }
+            Command::NextCategory => {
+                let (idx, count) = self.category_position();
+                self.set_category_index((idx + 1) % count);
+            }
+            Command::PrevCategory => {
+                let (idx, count) = self.category_position();
+                self.set_category_index((idx + count - 1) % count);
+            }
+            Command::SetCategory { index } => self.set_category_index(index),
+            Command::SetTab { tab } => self.active_tab = tab,
+            Command::SelectIndex { index } => {
+                let len = self.current_list_len();
+                let sel = self.selection_mut();
+                if len > 0 {
+                    *sel = index.min(len - 1);
+                }
+            }
+            Command::ShuffleFavorites => {
+                // `self.favorites` is whatever the Favorites tab displays
+                // (Recently Played, …): only trust it on the Tracks category.
+                let favorites = match &self.favorites_cache.tracks {
+                    Some(tracks) => tracks.clone(),
+                    None if self.favorites_category == FavoritesCategory::Tracks => {
+                        self.favorites.clone()
+                    }
+                    None => Vec::new(),
+                };
+                if !favorites.is_empty() {
+                    // Set queue from favorites with shuffle enabled
+                    self.flow_active = false;
+                    self.active_mood = None;
+                    if let Ok(mut state) = self.player_state.lock() {
+                        state.queue = favorites.clone();
+                        state.shuffle = true;
+                        // Same rule as toggling shuffle by hand: enabling it
+                        // clears repeat.
+                        state.repeat = RepeatMode::Off;
+                    }
+                    // Pick a random track to start
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    Instant::now().hash(&mut hasher);
+                    let idx = hasher.finish() as usize % favorites.len();
+                    if let Ok(mut state) = self.player_state.lock() {
+                        state.queue_index = idx;
+                    }
+                    // Build the cycle around the track we're about to start.
+                    self.rebuild_shuffle_order(favorites.len(), idx);
+                    if let Some(track) = favorites.get(idx).cloned() {
+                        self.start_play_track(track);
+                    }
+                }
+            }
+            Command::AddFavorite { track_id } => {
+                if !self.favorite_track_ids.contains(&track_id) {
+                    self.favorite_track_ids.push(track_id.clone());
+                }
+                self.start_add_favorite(track_id);
+            }
+            Command::RemoveFavorite { track_id } => {
+                self.favorite_track_ids.retain(|id| id != &track_id);
+                self.start_remove_favorite(track_id);
+            }
+            Command::AddFavoriteArtist { artist_id } => {
+                self.start_add_favorite_artist(artist_id);
+            }
+            Command::RemoveFavoriteArtist { artist_id } => {
+                self.start_remove_favorite_artist(artist_id);
+            }
+            Command::AddFavoriteAlbum { album_id } => {
+                self.start_add_favorite_album(album_id);
+            }
+            Command::RemoveFavoriteAlbum { album_id } => {
+                self.start_remove_favorite_album(album_id);
+            }
+            Command::RequestPlaylists => {
+                self.start_load_playlists();
+            }
+            Command::AddToPlaylist {
+                playlist_id,
+                track_id,
+            } => {
+                self.start_add_to_playlist(playlist_id, track_id);
+            }
+            Command::RemoveFromPlaylist {
+                playlist_id,
+                track_id,
+            } => {
+                self.start_remove_from_playlist(playlist_id, track_id);
+            }
+            Command::CreatePlaylistAndAdd { title, track_id } => {
+                self.start_create_playlist_and_add(title, track_id);
+            }
+            Command::RenamePlaylist {
+                playlist_id,
+                new_title,
+            } => {
+                self.start_rename_playlist(playlist_id, new_title);
+            }
+            Command::DeletePlaylist { playlist_id } => {
+                self.start_delete_playlist(playlist_id);
+            }
+            Command::DislikeTrack { track_id } => {
+                self.start_dislike_track(track_id);
+            }
+            Command::PlayNext { track } => {
+                if let Ok(mut state) = self.player_state.lock() {
+                    let insert_idx = state.queue_index + 1;
+                    if insert_idx <= state.queue.len() {
+                        state.queue.insert(insert_idx, track.clone());
+                    } else {
+                        state.queue.push(track.clone());
+                    }
+                }
+                self.status_msg = Some(t().status_play_next.into());
+            }
+            Command::AddToQueue { track } => {
+                if let Ok(mut state) = self.player_state.lock() {
+                    state.queue.push(track.clone());
+                }
+                self.status_msg = Some(t().status_added_to_queue.into());
+            }
+            Command::PlayFromQueue { index } => {
+                let track = {
+                    let mut state = self.player_state.lock().unwrap();
+                    if let Some(track) = state.queue.get(index).cloned() {
+                        state.queue_index = index;
+                        Some(track)
+                    } else {
+                        None
+                    }
+                };
+                // Jumping straight to a track moves the shuffle cycle to it, so
+                // next/prev continue from where the user actually is.
+                if let Some(pos) = self.shuffle_order.iter().position(|&i| i == index) {
+                    self.shuffle_pos = pos;
+                }
+                if let Some(track) = track {
+                    self.start_play_track(track);
+                }
+            }
+            Command::RemoveFromQueue { index } => {
+                if let Ok(mut state) = self.player_state.lock() {
+                    if index < state.queue.len() && index != state.queue_index {
+                        state.queue.remove(index);
+                        // Adjust queue_index if the removed track was before the current one
+                        if index < state.queue_index {
+                            state.queue_index = state.queue_index.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            Command::StartMix { track_id } => {
+                self.start_mix(track_id);
+            }
+            Command::StartFlow => {
+                self.flow_active = false;
+                self.active_mood = None;
+                self.start_flow();
+            }
+            Command::GetAlbumDetail { album_id } => {
+                self.start_load_album_detail(album_id);
+            }
+            Command::GetArtistDetail { artist_id } => {
+                self.start_load_artist_detail(artist_id);
+            }
+            Command::PlayFromArtist { index } => {
+                if let Some(ref detail) = self.artist_detail {
+                    if let Some(track) = detail.top_tracks.get(index).cloned() {
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = detail.top_tracks.clone();
+                            state.queue_index = index;
+                        }
+                        self.start_play_track(track);
+                    }
+                }
+            }
+            Command::OpenArtistAlbum { index } => {
+                if let Some(ref detail) = self.artist_detail {
+                    let albums = detail.albums_for_tab(self.artist_detail_sub_tab);
+                    if let Some(album) = albums.get(index) {
+                        let album_id = album.album_id.clone();
+                        self.start_load_album_detail(album_id);
+                    }
+                }
+            }
+            Command::PlayFromAlbum { index } => {
+                if let Some(ref detail) = self.album_detail {
+                    if let Some(track) = detail.tracks.get(index).cloned() {
+                        // Set queue from album tracks
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = detail.tracks.clone();
+                            state.queue_index = index;
+                        }
+                        self.start_play_track(track);
+                    }
+                }
+            }
+            Command::GetPlaylistDetail { playlist_id } => {
+                self.start_load_playlist_detail(playlist_id);
+            }
+            Command::GetShowDetail { show_id } => {
+                self.start_load_show_detail(show_id);
+            }
+            Command::PlayFromPlaylist { index, order } => {
+                if let Some(ref detail) = self.playlist_detail {
+                    if let Some(track) = detail.tracks.get(index).cloned() {
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        let (queue, queue_index) = playlist_queue(&detail.tracks, index, &order);
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = queue;
+                            state.queue_index = queue_index;
+                        }
+                        self.start_play_track(track);
+                    }
+                }
+            }
+            Command::GetGenreDetail { genre_id, name } => {
+                self.start_load_genre_detail(genre_id, name);
+            }
+            Command::PlayFromGenreTrack { index } => {
+                if let Some(ref detail) = self.genre_detail {
+                    if let Some(track) = detail.tracks.get(index).cloned() {
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = detail.tracks.clone();
+                            state.queue_index = index;
+                        }
+                        self.start_play_track(track);
+                    }
+                }
+            }
+            Command::PlayFromGenreRadio { index } => {
+                if let Some(ref detail) = self.genre_detail {
+                    if let Some(radio) = detail.radios.get(index) {
+                        let radio_id = radio.id;
+                        self.start_play_radio(radio_id);
+                    }
+                }
+            }
+            Command::Logout => {
+                // Clear ARL, stop playback, return to login screen
+                self.config.arl = None;
+                let _ = Config::update(|c| c.arl = None);
+                self.screen = Screen::Login;
+                self.user_name = None;
+                self.master_key = None;
+                self.engine = None;
+                if let Ok(mut state) = self.player_state.lock() {
+                    state.status = PlaybackStatus::Stopped;
+                    state.current_track = None;
+                    state.queue.clear();
+                    state.queue_index = 0;
+                }
+                self.search_results.clear();
+                self.search_display.clear();
+                self.favorites.clear();
+                self.favorites_display.clear();
+                self.radios.clear();
+                self.genres.clear();
+                self.genre_detail = None;
+                self.playlists.clear();
+                self.nav_overlay = None;
+                self.nav_overlay_stack.clear();
+                self.status_msg = None;
+                self.login_error = None;
+                self.login_loading = false;
+            }
+            Command::LoadRadios => {
+                self.start_load_radios();
+            }
+            Command::PlayFromRadio { index } => {
+                if let Some(radio) = self.radios.get(index) {
+                    let radio_id = radio.id;
+                    self.start_play_radio(radio_id);
+                }
+            }
+            Command::LoadMoods => {
+                self.start_load_moods();
+            }
+            Command::PlayFromMood { index } => {
+                if let Some(mood) = self.moods.get(index).cloned() {
+                    self.flow_active = false;
+                    let core_mood = deezer_core::api::models::MoodItem {
+                        id: mood.id,
+                        title: mood.title,
+                        target: mood.target,
+                        radio_id: mood.radio_id,
+                    };
+                    self.start_play_mood(core_mood, false);
+                }
+            }
+            Command::LoadGenres => {
+                self.start_load_genres();
+            }
+            Command::DownloadOffline { track } => {
+                self.start_download_offline(track);
+            }
+            Command::DownloadAlbumOffline { album_id } => {
+                self.start_download_album_offline(album_id);
+            }
+            Command::DownloadPlaylistOffline { playlist_id } => {
+                self.start_download_playlist_offline(playlist_id);
+            }
+            Command::RemoveOfflineTrack { track_id } => {
+                self.offline_index.remove_track(&track_id);
+                let _ = self.offline_index.save();
+                self.status_msg = Some(t().status_removed_offline.into());
+            }
+            Command::RemoveOfflineAlbum { album_id } => {
+                self.offline_index.remove_album(&album_id);
+                let _ = self.offline_index.save();
+                self.status_msg = Some(t().status_removed_offline.into());
+            }
+            Command::RemoveOfflinePlaylist { playlist_id } => {
+                self.offline_index.remove_playlist(&playlist_id);
+                let _ = self.offline_index.save();
+                self.status_msg = Some(t().status_removed_offline.into());
+            }
+            Command::PlayFromOffline { index } => {
+                let tracks: Vec<TrackData> = self
+                    .offline_index
+                    .tracks
+                    .iter()
+                    .map(|ot| ot.track.clone())
+                    .collect();
+                if let Some(track) = tracks.get(index).cloned() {
+                    self.flow_active = false;
+                    self.active_mood = None;
+                    if let Ok(mut state) = self.player_state.lock() {
+                        state.queue = tracks;
+                        state.queue_index = index;
+                    }
+                    self.start_play_offline_track(track);
+                }
+            }
+            Command::PlayOfflineAlbum {
+                album_id,
+                track_index,
+            } => {
+                if let Some(album) = self
+                    .offline_index
+                    .albums
+                    .iter()
+                    .find(|a| a.album_id == album_id)
+                {
+                    let tracks = album.tracks.clone();
+                    if let Some(track) = tracks.get(track_index).cloned() {
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = tracks;
+                            state.queue_index = track_index;
+                        }
+                        self.start_play_offline_track(track);
+                    }
+                }
+            }
+            Command::PlayOfflinePlaylist {
+                playlist_id,
+                track_index,
+            } => {
+                if let Some(playlist) = self
+                    .offline_index
+                    .playlists
+                    .iter()
+                    .find(|p| p.playlist_id == playlist_id)
+                {
+                    let tracks = playlist.tracks.clone();
+                    if let Some(track) = tracks.get(track_index).cloned() {
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = tracks;
+                            state.queue_index = track_index;
+                        }
+                        self.start_play_offline_track(track);
+                    }
+                }
+            }
+            Command::PushNavOverlay(nav) => {
+                if let Some(current) = self.nav_overlay.take() {
+                    self.nav_overlay_stack.push(current);
+                }
+                self.nav_overlay = Some(nav);
+            }
+            Command::PopNavOverlay => {
+                self.nav_overlay = self.nav_overlay_stack.pop();
+            }
+            Command::ClearNavOverlayStack => {
+                self.nav_overlay = None;
+                self.nav_overlay_stack.clear();
+            }
+            Command::Shutdown => {
+                // Handled in the main loop
+            }
+        }
+    }
+
+    fn snapshot(&self) -> DaemonSnapshot {
+        let state = self.player_state.lock().unwrap();
+        DaemonSnapshot {
+            screen: self.screen,
+            active_tab: self.active_tab,
+            status: state.status,
+            current_track: state.current_track.clone(),
+            quality: state.quality,
+            position_secs: state.position_secs,
+            duration_secs: state.duration_secs,
+            volume: state.volume,
+            shuffle: state.shuffle,
+            repeat: state.repeat,
+            equalizer: self.config.equalizer.clone(),
+            queue: state.queue.clone(),
+            queue_index: state.queue_index,
+            search_results: self.search_results.clone(),
+            search_selected: self.search_selected,
+            search_loading: self.search_loading,
+            search_category: self.search_category,
+            search_display: self.search_display.clone(),
+            favorites: self.favorites.clone(),
+            favorites_selected: self.favorites_selected,
+            favorites_loading: self.favorites_loading,
+            favorites_category: self.favorites_category,
+            favorites_display: self.favorites_display.clone(),
+            favorite_track_ids: self.favorite_track_ids.clone(),
+            favorite_artist_ids: self.favorite_artist_ids.clone(),
+            favorite_album_ids: self.favorite_album_ids.clone(),
+            offline_category: self.offline_category,
+            offline_tracks: {
+                // Tracks listed on their own: those not covered by a downloaded
+                // album or playlist.
+                let grouped_track_ids: std::collections::HashSet<&str> = self
+                    .offline_index
+                    .albums
+                    .iter()
+                    .flat_map(|a| a.tracks.iter().map(|t| t.track_id.as_str()))
+                    .chain(
+                        self.offline_index
+                            .playlists
+                            .iter()
+                            .flat_map(|p| p.tracks.iter().map(|t| t.track_id.as_str())),
+                    )
+                    .collect();
+                self.offline_index
+                    .tracks
+                    .iter()
+                    .filter(|t| !grouped_track_ids.contains(t.track.track_id.as_str()))
+                    .cloned()
+                    .collect()
+            },
+            offline_albums: self.offline_index.albums.clone(),
+            offline_playlists: self.offline_index.playlists.clone(),
+            offline_selected: self.offline_selected,
+            offline_loading: self.offline_loading,
+            offline_track_ids: self.offline_index.track_ids(),
+            explore_category: self.explore_category,
+            radios: self.radios.clone(),
+            radios_selected: self.radios_selected,
+            radios_loading: self.radios_loading,
+            moods: self.moods.clone(),
+            moods_selected: self.moods_selected,
+            moods_loading: self.moods_loading,
+            genres: self.genres.clone(),
+            genres_selected: self.genres_selected,
+            genres_loading: self.genres_loading,
+            playlists: self.playlists.clone(),
+            album_detail: self.album_detail.clone(),
+            album_detail_selected: self.album_detail_selected,
+            album_detail_loading: self.album_detail_loading,
+            artist_detail: self.artist_detail.clone(),
+            artist_detail_selected: self.artist_detail_selected,
+            artist_detail_loading: self.artist_detail_loading,
+            artist_detail_sub_tab: self.artist_detail_sub_tab,
+            playlist_detail: self.playlist_detail.clone(),
+            playlist_detail_selected: self.playlist_detail_selected,
+            playlist_detail_loading: self.playlist_detail_loading,
+            genre_detail: self.genre_detail.clone(),
+            genre_detail_loading: self.genre_detail_loading,
+            nav_overlay: self.nav_overlay.clone(),
+            nav_overlay_stack: self.nav_overlay_stack.clone(),
+            status_msg: self.status_msg.clone(),
+            login_error: self.login_error.clone(),
+            login_loading: self.login_loading,
+            user_name: self.user_name.clone(),
+            is_offline: self.is_offline,
+        }
+    }
+
+    // --- Async actions ---
+
+    fn start_login(&mut self, arl: String) {
+        self.login_loading = true;
+        self.login_error = None;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let mut client = client.lock().await;
+            match client.login_arl(&arl).await {
+                Ok(session) => {
+                    let _ = tx.send(AsyncResult::LoginSuccess(session.user_name));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::LoginError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_fetch_master_key(&mut self) {
+        self.status_msg = Some(t().status_fetching_key.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match deezer_core::decrypt::fetch_master_key(client.http()).await {
+                Ok(key) => {
+                    let _ = tx.send(AsyncResult::MasterKeyReady(key));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::MasterKeyError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_search(&mut self, query: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.search_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        let category = self.search_category;
+        let api_key = category.api_key().to_string();
+
+        if category == SearchCategory::All {
+            tokio::spawn(async move {
+                let client = client.lock().await;
+                match client.search_all(&query).await {
+                    Ok(items) => {
+                        let _ = tx.send(AsyncResult::SearchDisplayResults(items));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::SearchError(e.to_string()));
+                    }
+                }
+            });
+        } else if category == SearchCategory::Track {
+            // Track search: populate both search_results (for playback) and search_display
+            tokio::spawn(async move {
+                let client = client.lock().await;
+                match client.search(&query).await {
+                    Ok(results) => {
+                        let _ = tx.send(AsyncResult::SearchResults(results.data));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::SearchError(e.to_string()));
+                    }
+                }
+            });
+        } else {
+            // Non-track search: only populate search_display
+            tokio::spawn(async move {
+                let client = client.lock().await;
+                match client.search_category(&query, &api_key).await {
+                    Ok(items) => {
+                        let _ = tx.send(AsyncResult::SearchDisplayResults(items));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::SearchError(e.to_string()));
+                    }
+                }
+            });
+        }
+    }
+
+    fn start_load_favorites(&mut self) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.favorites_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_favorites().await {
+                Ok(tracks) => {
+                    let _ = tx.send(AsyncResult::FavoritesLoaded(
+                        FavoritesCategory::Tracks,
+                        tracks,
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoritesError(
+                        FavoritesCategory::Tracks,
+                        e.to_string(),
+                    ));
+                }
+            }
+        });
+    }
+
+    fn start_load_favorites_category(&mut self) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+
+        let category = self.favorites_category;
+
+        // ── Cache hit: serve immediately without a network call ──────────
+        match category {
+            FavoritesCategory::Tracks => {
+                if let Some(tracks) = self.favorites_cache.tracks.clone() {
+                    self.favorites_display = tracks.iter().map(DisplayItem::from_track).collect();
+                    self.favorites = tracks;
+                    self.favorites_selected = 0;
+                    self.favorites_loading = false;
+                    return;
+                }
+            }
+            FavoritesCategory::Artists => {
+                if let Some(items) = self.favorites_cache.artists.clone() {
+                    self.favorites.clear();
+                    self.favorites_display = items;
+                    self.favorites_selected = 0;
+                    self.favorites_loading = false;
+                    return;
+                }
+            }
+            FavoritesCategory::Albums => {
+                if let Some(items) = self.favorites_cache.albums.clone() {
+                    self.favorites.clear();
+                    self.favorites_display = items;
+                    self.favorites_selected = 0;
+                    self.favorites_loading = false;
+                    return;
+                }
+            }
+            FavoritesCategory::Playlists => {
+                if let Some(items) = self.favorites_cache.playlists.clone() {
+                    self.favorites.clear();
+                    self.favorites_display = items;
+                    self.favorites_selected = 0;
+                    self.favorites_loading = false;
+                    return;
+                }
+            }
+            FavoritesCategory::Following => {
+                if let Some(items) = self.favorites_cache.following.clone() {
+                    self.favorites.clear();
+                    self.favorites_display = items;
+                    self.favorites_selected = 0;
+                    self.favorites_loading = false;
+                    return;
+                }
+            }
+            // RecentlyPlayed is never cached (changes after every play)
+            FavoritesCategory::RecentlyPlayed => {}
+        }
+
+        // ── Cache miss: fetch from API ───────────────────────────────────
+        self.favorites_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        match category {
+            FavoritesCategory::Tracks => {
+                tokio::spawn(async move {
+                    let client = client.lock().await;
+                    match client.get_favorites().await {
+                        Ok(tracks) => {
+                            let _ = tx.send(AsyncResult::FavoritesLoaded(category, tracks));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                        }
+                    }
+                });
+            }
+            FavoritesCategory::RecentlyPlayed => {
+                tokio::spawn(async move {
+                    let client = client.lock().await;
+                    match client.get_listening_history().await {
+                        Ok(tracks) => {
+                            let _ = tx.send(AsyncResult::FavoritesLoaded(category, tracks));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                        }
+                    }
+                });
+            }
+            FavoritesCategory::Artists => {
+                tokio::spawn(async move {
+                    let client = client.lock().await;
+                    debug!("Loading favorite artists...");
+                    match client.get_favorite_artists().await {
+                        Ok(items) => {
+                            debug!("Favorite artists loaded: {} items", items.len());
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                        }
+                        Err(e) => {
+                            debug!("Favorite artists error: {e}");
+                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                        }
+                    }
+                });
+            }
+            FavoritesCategory::Albums => {
+                tokio::spawn(async move {
+                    let client = client.lock().await;
+                    match client.get_favorite_albums().await {
+                        Ok(items) => {
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                        }
+                    }
+                });
+            }
+            FavoritesCategory::Playlists => {
+                tokio::spawn(async move {
+                    let client = client.lock().await;
+                    match client.get_playlists().await {
+                        Ok(items) => {
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                        }
+                    }
+                });
+            }
+            FavoritesCategory::Following => {
+                tokio::spawn(async move {
+                    let client = client.lock().await;
+                    match client.get_following().await {
+                        Ok(items) => {
+                            let _ = tx.send(AsyncResult::FavoritesDisplayLoaded(category, items));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncResult::FavoritesError(category, e.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn start_add_favorite(&mut self, track_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.add_favorite(&track_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::FavoriteAdded(track_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoriteError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_remove_favorite(&mut self, track_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.remove_favorite(&track_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::FavoriteRemoved(track_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoriteError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_add_favorite_artist(&mut self, artist_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.add_favorite_artist(&artist_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::FavoriteArtistAdded(artist_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoriteArtistError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_remove_favorite_artist(&mut self, artist_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.remove_favorite_artist(&artist_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::FavoriteArtistRemoved(artist_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoriteArtistError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_add_favorite_album(&mut self, album_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.add_favorite_album(&album_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::FavoriteAlbumAdded(album_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoriteAlbumError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_remove_favorite_album(&mut self, album_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.remove_favorite_album(&album_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::FavoriteAlbumRemoved(album_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FavoriteAlbumError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_favorite_ids(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            let track_ids = match client.get_favorites().await {
+                Ok(tracks) => tracks.iter().map(|t| t.track_id.clone()).collect(),
+                Err(_) => Vec::new(),
+            };
+            let artist_ids = match client.get_favorite_artists().await {
+                Ok(items) => items.iter().filter_map(|d| d.artist_id.clone()).collect(),
+                Err(_) => Vec::new(),
+            };
+            let album_ids = match client.get_favorite_albums().await {
+                Ok(items) => items.iter().filter_map(|d| d.album_id.clone()).collect(),
+                Err(_) => Vec::new(),
+            };
+            let _ = tx.send(AsyncResult::FavoriteIdsLoaded {
+                track_ids,
+                artist_ids,
+                album_ids,
+            });
+        });
+    }
+
+    /// Apply a delta to a playlist's track count in cached `self.playlists` and
+    /// in any visible DisplayItem lists (col3 = plain track count).
+    fn adjust_playlist_count(&mut self, playlist_id: &str, delta: i64) {
+        for pl in self.playlists.iter_mut() {
+            if pl.playlist_id == playlist_id {
+                pl.nb_songs = (pl.nb_songs as i64 + delta).max(0) as u64;
+            }
+        }
+        let bump = |items: &mut [DisplayItem]| {
+            for it in items.iter_mut() {
+                if it.playlist_id.as_deref() == Some(playlist_id) {
+                    let new_count = it
+                        .col3
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse::<i64>().ok())
+                        .map(|n| (n + delta).max(0))
+                        .unwrap_or(0);
+                    it.col3 = new_count.to_string();
+                }
+            }
+        };
+        bump(&mut self.search_display);
+        bump(&mut self.favorites_display);
+    }
+
+    /// Set a playlist's track count to an authoritative value (e.g. from a
+    /// freshly-fetched `PlaylistDetail`), everywhere it's cached or displayed —
+    /// unlike `adjust_playlist_count`, this also updates the on-disk favorites
+    /// cache, so counts stay correct after a track was added/removed from
+    /// another device rather than just after a local add/remove.
+    fn set_playlist_track_count(&mut self, playlist_id: &str, count: usize) {
+        for pl in self.playlists.iter_mut() {
+            if pl.playlist_id == playlist_id {
+                pl.nb_songs = count as u64;
+            }
+        }
+        let set = |items: &mut [DisplayItem]| {
+            for it in items.iter_mut() {
+                if it.playlist_id.as_deref() == Some(playlist_id) {
+                    it.col3 = count.to_string();
+                }
+            }
+        };
+        set(&mut self.search_display);
+        set(&mut self.favorites_display);
+        if let Some(ref mut cached) = self.favorites_cache.playlists {
+            set(cached);
+        }
+    }
+
+    fn start_load_playlists(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_user_playlists_raw().await {
+                Ok(playlists) => {
+                    let _ = tx.send(AsyncResult::PlaylistsReady(playlists));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::PlaylistsError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_add_to_playlist(&mut self, playlist_id: String, track_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client
+                .add_to_playlist(&playlist_id, &[track_id.as_str()])
+                .await
+            {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::AddedToPlaylist(playlist_id));
+                }
+                Err(DeezerError::TrackAlreadyInPlaylist) => {
+                    let _ = tx.send(AsyncResult::AlreadyInPlaylist);
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::AddToPlaylistError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_remove_from_playlist(&mut self, playlist_id: String, track_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client
+                .remove_from_playlist(&playlist_id, &[track_id.as_str()])
+                .await
+            {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::RemovedFromPlaylist {
+                        playlist_id,
+                        track_id,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::RemoveFromPlaylistError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_create_playlist_and_add(&mut self, title: String, track_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.create_playlist(&title).await {
+                Ok(playlist_id) => match client
+                    .add_to_playlist(&playlist_id, &[track_id.as_str()])
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = tx.send(AsyncResult::PlaylistCreatedAndAdded { playlist_id });
+                    }
+                    Err(DeezerError::TrackAlreadyInPlaylist) => {
+                        let _ = tx.send(AsyncResult::AlreadyInPlaylist);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::AddToPlaylistError(e.to_string()));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::PlaylistCreatedError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_rename_playlist(&mut self, playlist_id: String, new_title: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.rename_playlist(&playlist_id, &new_title).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::PlaylistRenamed {
+                        playlist_id,
+                        new_title,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::PlaylistRenameError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_delete_playlist(&mut self, playlist_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.delete_playlist(&playlist_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::PlaylistDeleted(playlist_id));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::PlaylistDeleteError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_dislike_track(&mut self, track_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.dislike_track(&track_id).await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncResult::DislikeOk);
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::DislikeError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_mix(&mut self, track_id: String) {
+        self.status_msg = Some(t().status_loading_mix.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_smart_radio(&track_id).await {
+                Ok(tracks) => {
+                    let _ = tx.send(AsyncResult::MixReady(tracks));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::MixError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// Fetch a mix inspired by a track that is already playing, to fill the
+    /// queue behind it (see `AsyncResult::SeededMixReady`).
+    fn start_seeded_mix(&mut self, seed_id: String) {
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_smart_radio(&seed_id).await {
+                Ok(tracks) => {
+                    let _ = tx.send(AsyncResult::SeededMixReady { seed_id, tracks });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::MixError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_flow(&mut self) {
+        self.status_msg = Some(t().status_loading_flow.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_flow().await {
+                Ok(tracks) => {
+                    let _ = tx.send(AsyncResult::FlowReady(tracks));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::FlowError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_album_detail(&mut self, album_id: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.album_detail_loading = true;
+        self.album_detail = None;
+        self.album_detail_selected = 0;
+        self.status_msg = Some(t().status_loading_album.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_album_detail(&album_id).await {
+                Ok(detail) => {
+                    let _ = tx.send(AsyncResult::AlbumDetailReady(detail));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::AlbumDetailError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_artist_detail(&mut self, artist_id: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.artist_detail_loading = true;
+        self.artist_detail = None;
+        self.artist_detail_selected = 0;
+        self.artist_detail_sub_tab = ArtistSubTab::default();
+        self.status_msg = Some(t().status_loading_artist.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_artist_detail(&artist_id).await {
+                Ok(detail) => {
+                    let _ = tx.send(AsyncResult::ArtistDetailReady(detail));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::ArtistDetailError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_playlist_detail(&mut self, playlist_id: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+
+        // Cache hit: serve immediately without a network call, then refresh
+        // in the background so stale content (e.g. tracks added from another
+        // device) eventually shows up without a jarring reload.
+        let background = self
+            .favorites_cache
+            .playlist_details
+            .get(&playlist_id)
+            .cloned()
+            .is_some_and(|cached| {
+                self.status_msg =
+                    Some(t().fmt_playlist_tracks_status(&cached.title, cached.tracks.len()));
+                self.playlist_detail = Some(cached);
+                self.playlist_detail_selected = 0;
+                self.playlist_detail_loading = false;
+                true
+            });
+
+        if !background {
+            self.playlist_detail_loading = true;
+            self.playlist_detail = None;
+            self.playlist_detail_selected = 0;
+            self.status_msg = Some(t().status_loading_playlist.into());
+        }
+
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_playlist_detail(&playlist_id).await {
+                Ok(detail) => {
+                    let _ = tx.send(AsyncResult::PlaylistDetailReady { detail, background });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::PlaylistDetailError {
+                        err: e.to_string(),
+                        background,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Load a podcast show's episodes into the playlist detail slot: episodes
+    /// are `TrackData`, so the detail overlay and playback work unchanged.
+    fn start_load_show_detail(&mut self, show_id: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+
+        self.playlist_detail_loading = true;
+        self.playlist_detail = None;
+        self.playlist_detail_selected = 0;
+        self.status_msg = Some(t().loading.into());
+
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_show_episodes(&show_id).await {
+                Ok((name, episodes)) => {
+                    let tracks: Vec<TrackData> = episodes.iter().map(|e| e.to_track()).collect();
+                    let detail = PlaylistDetail {
+                        playlist_id: show_id,
+                        title: name,
+                        creator: String::new(),
+                        nb_tracks: tracks.len() as u64,
+                        tracks,
+                    };
+                    let _ = tx.send(AsyncResult::ShowDetailReady(detail));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::ShowDetailError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_radios(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        self.radios_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_radios().await {
+                Ok(radios) => {
+                    let items: Vec<RadioItem> = radios
+                        .iter()
+                        .map(|r| RadioItem {
+                            id: r.id,
+                            title: r.title.clone(),
+                        })
+                        .collect();
+                    let _ = tx.send(AsyncResult::RadiosReady(items));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::RadiosError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_genres(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        self.genres_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_genres().await {
+                Ok(genres) => {
+                    let items: Vec<GenreItem> = genres
+                        .iter()
+                        .map(|g| GenreItem {
+                            id: g.id,
+                            name: g.name.clone(),
+                        })
+                        .collect();
+                    let _ = tx.send(AsyncResult::GenresReady(items));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::GenresError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_genre_detail(&mut self, genre_id: u64, name: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.genre_detail = None;
+        self.genre_detail_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_genre_detail(genre_id, name).await {
+                Ok(detail) => {
+                    let _ = tx.send(AsyncResult::GenreDetailReady(detail));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::GenreDetailError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_play_radio(&mut self, radio_id: u64) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.status_msg = Some(t().status_loading_radio_tracks.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_radio_tracks(radio_id).await {
+                Ok(tracks) => {
+                    let _ = tx.send(AsyncResult::RadioTracksReady(tracks));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::RadioTracksError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_load_moods(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        // Skip if we already have a cached list — moods rarely change.
+        if !self.moods.is_empty() {
+            return;
+        }
+        self.moods_loading = true;
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_moods().await {
+                Ok(moods) => {
+                    let items: Vec<MoodEntry> = moods
+                        .iter()
+                        .map(|m| MoodEntry {
+                            id: m.id.clone(),
+                            title: m.title.clone(),
+                            target: m.target.clone(),
+                            radio_id: m.radio_id,
+                        })
+                        .collect();
+                    let _ = tx.send(AsyncResult::MoodsReady(items));
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::MoodsError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_play_mood(
+        &mut self,
+        core_mood: deezer_core::api::models::MoodItem,
+        continuation: bool,
+    ) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        self.status_msg = Some(t().status_loading_radio_tracks.into());
+        let client = Arc::clone(&self.client);
+        let tx = self.async_tx.clone();
+
+        // Remember which mood is active so play_next() can fetch more of it
+        // once the queue runs out — mirrors `flow_active` for Deezer Flow.
+        if !continuation {
+            self.active_mood = Some(core_mood.clone());
+        }
+
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            match client.get_mood_tracks(&core_mood).await {
+                Ok(tracks) => {
+                    let _ = tx.send(AsyncResult::MoodTracksReady {
+                        tracks,
+                        continuation,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::MoodTracksError {
+                        err: e.to_string(),
+                        continuation,
+                    });
+                }
+            }
+        });
+    }
+
+    fn start_play_track(&mut self, track: TrackData) {
+        // Already queued in the engine (gapless): switch to it there instead
+        // of fetching it again. Only the bookkeeping of a track start is left.
+        if let Some(engine) = self.engine.as_mut() {
+            if engine.queued_track_id() == Some(track.track_id.as_str()) {
+                engine.play_queued();
+                self.track_generation += 1;
+                self.listen_logged_for = None;
+                self.consecutive_skip_count = 0;
+                self.status_msg = None;
+                info!(gen = self.track_generation, track_id = %track.track_id, title = %track.title, "start_play_track: switched to queued track");
+                return;
+            }
+            engine.cancel_queued();
+        }
+
+        if self.is_offline {
+            // Only `Command::PlayFromOffline*` used to reach the on-disk copy,
+            // so `next`, `previous` and the end-of-track auto-advance all died
+            // here even when the track was downloaded (issue #27).
+            if self.offline_index.has_track(&track.track_id) {
+                self.start_play_offline_track(track);
+                return;
+            }
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        // Podcast episodes streamed from the show's own host are not encrypted,
+        // so they need neither the master key nor the media API.
+        let direct_url = track.direct_stream_url().map(str::to_string);
+        let master_key = self.master_key;
+        if master_key.is_none() && direct_url.is_none() {
+            self.status_msg = Some(t().status_player_not_ready.into());
+            return;
+        }
+
+        // Increment generation so any in-flight fetch for a previous track is ignored
+        self.track_generation += 1;
+        let generation = self.track_generation;
+        self.listen_logged_for = None;
+
+        info!(
+            gen = generation,
+            track_id = %track.track_id,
+            title = %track.title,
+            has_token = track.has_track_token(),
+            "start_play_track: begin"
+        );
+
+        if let Ok(mut state) = self.player_state.lock() {
+            state.status = PlaybackStatus::Loading;
+            state.current_track = Some(track.clone());
+            state.duration_secs = track.duration_secs();
+            state.position_secs = 0;
+        }
+
+        self.status_msg = Some(t().loading.into());
+
+        let quality = self.config.quality;
+
+        // Whatever was prefetched is only useful if it is this very track;
+        // otherwise dropping it cancels its download.
+        if let Some(prefetch) = self.prefetch.take() {
+            if prefetch.track_id == track.track_id && prefetch.quality == quality {
+                if let Some((reader, track, quality)) = prefetch.ready {
+                    info!(gen = generation, track_id = %track.track_id, "start_play_track: using prefetched stream");
+                    let _ = self.async_tx.send(AsyncResult::TrackReady {
+                        audio_data: reader.into(),
+                        track,
+                        quality,
+                        generation,
+                    });
+                    return;
+                }
+            }
+        }
+
+        let client = Arc::clone(&self.client);
+        let cdn_http = self.cdn_http.clone();
+        let tx = self.async_tx.clone();
+        let not_ready_msg = t().status_player_not_ready;
+
+        tokio::spawn(async move {
+            let start = Instant::now();
+
+            // Externally hosted episode: fetch the audio as-is and skip the
+            // token / media API / decryption chain entirely.
+            if let Some(url) = direct_url {
+                match deezer_core::player::stream::download_direct(&url, &cdn_http).await {
+                    Ok(audio_data) => {
+                        info!(
+                            gen = generation,
+                            track_id = %track.track_id,
+                            bytes = audio_data.len(),
+                            total_ms = start.elapsed().as_millis(),
+                            "fetch_task: direct stream download OK"
+                        );
+                        let _ = tx.send(AsyncResult::TrackReady {
+                            audio_data: audio_data.into(),
+                            track,
+                            quality,
+                            generation,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(gen = generation, track_id = %track.track_id, err = %e, "fetch_task: direct stream download FAILED");
+                        let _ = tx.send(AsyncResult::TrackFetchError {
+                            err: e.to_string(),
+                            generation,
+                        });
+                    }
+                }
+                return;
+            }
+
+            match fetch_stream(
+                client,
+                cdn_http,
+                track,
+                quality,
+                master_key,
+                generation,
+                not_ready_msg,
+            )
+            .await
+            {
+                Ok((reader, track, quality)) => {
+                    let _ = tx.send(AsyncResult::TrackReady {
+                        audio_data: reader.into(),
+                        track,
+                        quality,
+                        generation,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncResult::TrackFetchError { err, generation });
+                }
+            }
+        });
+    }
+
+    /// The track `play_next` would move to, without moving the queue. `None`
+    /// when the next step is not a plain queue move (repeat-one, end of a
+    /// Flow/Mood batch, reshuffle, end of queue).
+    fn peek_next_track(&self) -> Option<TrackData> {
+        let state = self.player_state.lock().ok()?;
+        if state.repeat == RepeatMode::Track {
+            return None;
+        }
+        let idx = if state.shuffle {
+            if self.shuffle_order.len() != state.queue.len() {
+                return None;
+            }
+            *self.shuffle_order.get(self.shuffle_pos + 1)?
+        } else if state.queue_index + 1 < state.queue.len() {
+            state.queue_index + 1
+        } else if state.repeat == RepeatMode::Queue
+            && !self.flow_active
+            && self.active_mood.is_none()
+        {
+            0
+        } else {
+            return None;
+        };
+        state.queue.get(idx).cloned()
+    }
+
+    /// Fetch the next track as soon as the current one is buffered far enough
+    /// ahead (it streams to a cache file, not RAM), so it is queued for a
+    /// gapless start long before it is needed. Until then the current download
+    /// keeps the whole link.
+    fn maybe_prefetch_next(&mut self) {
+        if self.is_offline {
+            return;
+        }
+        let Some(master_key) = self.master_key else {
+            return;
+        };
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        {
+            let state = self.player_state.lock().unwrap();
+            if state.status != PlaybackStatus::Playing {
+                return;
+            }
+            // Still downloading: wait until enough is buffered ahead.
+            if let Some(progress) = engine.stream_progress() {
+                let buffered_secs = progress * state.duration_secs as f64;
+                if buffered_secs < state.position_secs as f64 + PREFETCH_MIN_AHEAD_SECS {
+                    return;
+                }
+            }
+        }
+        let Some(next) = self.peek_next_track() else {
+            return;
+        };
+        let quality = self.config.quality;
+        if self
+            .prefetch
+            .as_ref()
+            .is_some_and(|p| p.track_id == next.track_id && p.quality == quality)
+            || engine.queued_track_id() == Some(next.track_id.as_str())
+        {
+            return;
+        }
+        // Podcast episodes from their own host download whole anyway.
+        if next.direct_stream_url().is_some() {
+            return;
+        }
+
+        info!(track_id = %next.track_id, title = %next.title, "maybe_prefetch_next: fetching next track");
+        self.prefetch = Some(Prefetch {
+            track_id: next.track_id.clone(),
+            quality,
+            ready: None,
+        });
+        let client = Arc::clone(&self.client);
+        let cdn_http = self.cdn_http.clone();
+        let tx = self.async_tx.clone();
+        let generation = self.track_generation;
+        let not_ready_msg = t().status_player_not_ready;
+        tokio::spawn(async move {
+            let track_id = next.track_id.clone();
+            let result = fetch_stream(
+                client,
+                cdn_http,
+                next,
+                quality,
+                Some(master_key),
+                generation,
+                not_ready_msg,
+            )
+            .await;
+            let _ = tx.send(AsyncResult::Prefetched { track_id, result });
+        });
+    }
+
+    /// Hand a prefetched next track to the engine, queued behind the current
+    /// one so it starts on the exact sample the current one ends.
+    fn maybe_queue_gapless(&mut self) {
+        if self.prefetch.as_ref().is_none_or(|p| p.ready.is_none()) {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        if engine.queued_track_id().is_some() || engine.is_finished() {
+            return;
+        }
+        let status = self.player_state.lock().unwrap().status;
+        if status != PlaybackStatus::Playing && status != PlaybackStatus::Paused {
+            return;
+        }
+        let Some(next) = self.peek_next_track() else {
+            return;
+        };
+        let quality = self.config.quality;
+        let Some(Prefetch {
+            ready: Some((reader, track, actual_quality)),
+            ..
+        }) = self
+            .prefetch
+            .take_if(|p| p.track_id == next.track_id && p.quality == quality)
+        else {
+            return;
+        };
+        if let Some(engine) = self.engine.as_mut() {
+            match engine.queue_next(reader, &track, actual_quality) {
+                Ok(()) => {
+                    info!(track_id = %track.track_id, "maybe_queue_gapless: next track queued")
+                }
+                // The track is fetched again normally when its turn comes.
+                Err(e) => {
+                    warn!(track_id = %track.track_id, err = %e, "maybe_queue_gapless: queueing failed")
+                }
+            }
+        }
+    }
+
+    /// Build a fresh shuffle cycle over `queue_len` tracks, starting at `start`
+    /// so the track playing right now isn't immediately replayed.
+    ///
+    /// Fisher-Yates seeded the same way as the rest of the daemon's randomness
+    /// (hashed `Instant`) — the project has no `rand` dependency and this is
+    /// picking a play order, not anything that needs a real CSPRNG.
+    fn rebuild_shuffle_order(&mut self, queue_len: usize, start: usize) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        Instant::now().hash(&mut hasher);
+        self.shuffle_order = shuffled_indices(queue_len, start, hasher.finish());
+        self.shuffle_pos = 0;
+    }
+
+    /// Keep `shuffle_order` consistent with a queue that changed under it.
+    ///
+    /// A queue that grew (Flow/Mood continuation, "add to queue") keeps its
+    /// cycle and gets the new tracks appended, so continuation doesn't restart
+    /// the shuffle. Anything else — replaced, shrunk, or never built — starts a
+    /// fresh cycle from the current track.
+    fn sync_shuffle_order(&mut self, queue_len: usize, current: usize) {
+        if queue_len == 0 {
+            self.shuffle_order.clear();
+            self.shuffle_pos = 0;
+            return;
+        }
+        if self.shuffle_order.len() == queue_len {
+            return;
+        }
+        if queue_len > self.shuffle_order.len() && !self.shuffle_order.is_empty() {
+            self.shuffle_order
+                .extend(self.shuffle_order.len()..queue_len);
+            return;
+        }
+        self.rebuild_shuffle_order(queue_len, current);
+    }
+
+    fn play_next(&mut self) {
+        let status = self.player_state.lock().unwrap().status;
+        let was_paused = status == PlaybackStatus::Paused;
+        let queue_info = {
+            let state = self.player_state.lock().unwrap();
+            (
+                state.queue.len(),
+                state.queue_index,
+                state.shuffle,
+                state.repeat,
+            )
+        };
+        info!(
+            status = ?status,
+            queue_len = queue_info.0,
+            queue_index = queue_info.1,
+            shuffle = queue_info.2,
+            repeat = ?queue_info.3,
+            "play_next called"
+        );
+
+        let (queue_len, current, shuffle, repeat) = queue_info;
+        if queue_len == 0 {
+            info!("play_next: queue is empty, returning");
+            return;
+        }
+
+        // Shuffle walks a precomputed cycle, and the bookkeeping needs `&mut
+        // self`, so resolve it before taking the state lock.
+        let mut shuffled_next = None;
+        if shuffle {
+            self.sync_shuffle_order(queue_len, current);
+            let pos = self.shuffle_pos + 1;
+            if pos < self.shuffle_order.len() {
+                self.shuffle_pos = pos;
+                shuffled_next = Some(self.shuffle_order[pos]);
+            } else {
+                // Every track in the queue has played once this cycle.
+                if self.flow_active {
+                    self.player_state.lock().unwrap().status = PlaybackStatus::Loading;
+                    info!("play_next: end of shuffled Flow queue, fetching more tracks");
+                    self.start_flow();
+                    return;
+                }
+                if let Some(mood) = self.active_mood.clone() {
+                    self.player_state.lock().unwrap().status = PlaybackStatus::Loading;
+                    info!("play_next: end of shuffled Mood queue, fetching more tracks");
+                    self.start_play_mood(mood, true);
+                    return;
+                }
+                if repeat == RepeatMode::Queue {
+                    // Repeat all under shuffle: reshuffle and run the whole
+                    // queue again in a new random order.
+                    info!("play_next: shuffle cycle complete, reshuffling for repeat-all");
+                    self.rebuild_shuffle_order(queue_len, current);
+                    // rebuild_shuffle_order parks the current track at 0, so the
+                    // next track of the new cycle is at 1 (unless the queue holds
+                    // a single track, which just replays).
+                    self.shuffle_pos = if self.shuffle_order.len() > 1 { 1 } else { 0 };
+                    shuffled_next = self.shuffle_order.get(self.shuffle_pos).copied();
+                } else {
+                    // Shuffle exhausted with no repeat — stop here.
+                    info!("play_next: shuffle cycle complete, no repeat");
+                    if was_paused {
+                        self.resume_playback();
+                    }
+                    return;
+                }
+            }
+        }
+
+        let next_track = {
+            let mut state = self.player_state.lock().unwrap();
+
+            let next_idx = if let Some(idx) = shuffled_next {
+                idx
+            } else {
+                let next = state.queue_index + 1;
+                if next >= state.queue.len() {
+                    if self.flow_active {
+                        // Flow mode — fetch more tracks to continue playback.
+                        // Mark as Loading so on_tick's auto-advance (which fires on
+                        // every tick while status == Playing and the engine is
+                        // finished) doesn't re-enter here and fire duplicate Flow
+                        // fetches while this one is still in flight.
+                        state.status = PlaybackStatus::Loading;
+                        drop(state);
+                        info!("play_next: end of Flow queue, fetching more tracks");
+                        self.start_flow();
+                        return;
+                    }
+                    if let Some(mood) = self.active_mood.clone() {
+                        // Mood mode — same continuation dance as Flow above.
+                        state.status = PlaybackStatus::Loading;
+                        drop(state);
+                        info!("play_next: end of Mood queue, fetching more tracks");
+                        self.start_play_mood(mood, true);
+                        return;
+                    }
+                    match state.repeat {
+                        RepeatMode::Queue => 0,
+                        _ => {
+                            // End of queue, no repeat — resume current track if paused
+                            if was_paused {
+                                drop(state);
+                                self.resume_playback();
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    next
+                }
+            };
+
+            state.queue_index = next_idx;
+            state.queue.get(next_idx).cloned()
+        };
+
+        // Offline, the queue can hold tracks that were never downloaded: step
+        // over them instead of stopping on the first miss.
+        let next_track = match next_track {
+            Some(track) if self.is_offline && !self.offline_index.has_track(&track.track_id) => {
+                let found = self.advance_to_downloaded();
+                if found.is_none() {
+                    info!("play_next: offline, no downloaded track left in the queue");
+                    self.status_msg = Some(t().status_no_offline_track.into());
+                    if let Ok(mut state) = self.player_state.lock() {
+                        state.status = PlaybackStatus::Stopped;
+                    }
+                }
+                found
+            }
+            other => other,
+        };
+
+        if let Some(ref track) = next_track {
+            info!(track_id = %track.track_id, title = %track.title, "play_next: advancing to track");
+            self.start_play_track(track.clone());
+        } else if !self.is_offline {
+            warn!("play_next: next_track is None (queue_index out of bounds?)");
+        }
+    }
+
+    /// Walk forward from the current queue position to the first track that is
+    /// available on disk, and leave the queue pointing at it.
+    ///
+    /// Used while offline, where a queue built from an online playlist holds
+    /// tracks that were never downloaded. The queue is only moved once a
+    /// downloaded track is found, so a fruitless scan leaves the state alone.
+    fn advance_to_downloaded(&mut self) -> Option<TrackData> {
+        let (queue, queue_index, shuffle, repeat_queue) = {
+            let state = self.player_state.lock().unwrap();
+            (
+                state.queue.clone(),
+                state.queue_index,
+                state.shuffle,
+                state.repeat == RepeatMode::Queue,
+            )
+        };
+
+        let candidates = forward_candidates(
+            queue.len(),
+            queue_index,
+            &self.shuffle_order,
+            self.shuffle_pos,
+            shuffle,
+            repeat_queue,
+        );
+
+        for (pos, idx) in candidates {
+            let Some(track) = queue.get(idx) else {
+                continue;
+            };
+            if self.offline_index.has_track(&track.track_id) {
+                self.shuffle_pos = pos;
+                self.player_state.lock().unwrap().queue_index = idx;
+                return Some(track.clone());
+            }
+        }
+        None
+    }
+
+    fn play_prev(&mut self) {
+        let was_paused = self.player_state.lock().unwrap().status == PlaybackStatus::Paused;
+
+        let (queue_len, current, shuffle) = {
+            let state = self.player_state.lock().unwrap();
+            (state.queue.len(), state.queue_index, state.shuffle)
+        };
+        if queue_len == 0 {
+            return;
+        }
+
+        // Under shuffle, "previous" walks back through the cycle that was
+        // actually played, not to queue_index - 1 which is a track the user
+        // most likely never heard.
+        let mut shuffled_prev = None;
+        if shuffle {
+            self.sync_shuffle_order(queue_len, current);
+            if self.shuffle_pos > 0 {
+                self.shuffle_pos -= 1;
+                shuffled_prev = self.shuffle_order.get(self.shuffle_pos).copied();
+            } else {
+                // At the start of the cycle — nothing played before it.
+                if was_paused {
+                    self.resume_playback();
+                }
+                return;
+            }
+        }
+
+        let prev_track = {
+            let mut state = self.player_state.lock().unwrap();
+
+            let prev_idx = if let Some(idx) = shuffled_prev {
+                idx
+            } else if state.queue_index == 0 {
+                match state.repeat {
+                    RepeatMode::Queue => state.queue.len() - 1,
+                    _ => {
+                        // Already at start — resume current track if paused
+                        if was_paused {
+                            drop(state);
+                            self.resume_playback();
+                        }
+                        return;
+                    }
+                }
+            } else {
+                state.queue_index - 1
+            };
+
+            state.queue_index = prev_idx;
+            state.queue.get(prev_idx).cloned()
+        };
+
+        if let Some(track) = prev_track {
+            self.start_play_track(track);
+        }
+    }
+
+    /// Resume playback from pause.
+    fn resume_playback(&mut self) {
+        if let Some(ref engine) = self.engine {
+            engine.resume();
+        }
+    }
+
+    fn seek_absolute(&mut self, target_secs: u64) {
+        let current = self.player_state.lock().unwrap().position_secs;
+        self.seek_relative(target_secs as i64 - current as i64);
+    }
+
+    fn seek_relative(&mut self, delta_secs: i64) {
+        let Some(ref engine) = self.engine else {
+            return;
+        };
+        let (current_pos, duration) = {
+            let state = self.player_state.lock().unwrap();
+            if state.status != PlaybackStatus::Playing && state.status != PlaybackStatus::Paused {
+                return;
+            }
+            (state.position_secs, state.duration_secs)
+        };
+
+        let mut new_pos = (current_pos as i64 + delta_secs).clamp(0, duration as i64) as u64;
+
+        // The decoder reaches a forward target by reading up to it, and the
+        // seek blocks this loop until it is done: on a track still streaming,
+        // stay within what has already downloaded.
+        if let Some(progress) = engine.stream_progress() {
+            let reachable =
+                ((duration as f64 * progress) as u64).saturating_sub(SEEK_SAFETY_MARGIN_SECS);
+            if new_pos > reachable && new_pos > current_pos {
+                new_pos = reachable.max(current_pos);
+                self.status_msg = Some(t().status_seek_buffering.into());
+            }
+        }
+        if new_pos == current_pos {
+            return;
+        }
+
+        if engine.try_seek(Duration::from_secs(new_pos)).is_ok() {
+            self.player_state.lock().unwrap().position_secs = new_pos;
+        }
+    }
+
+    fn process_async_results(&mut self) {
+        while let Ok(result) = self.async_rx.try_recv() {
+            match result {
+                AsyncResult::LoginSuccess(name) => {
+                    // A successful login proves Deezer is reachable.
+                    self.is_offline = false;
+                    self.login_loading = false;
+                    self.screen = Screen::Main;
+                    self.user_name = Some(name.clone());
+                    self.status_msg = Some(t().fmt_connected_as(&name));
+                    self.start_fetch_master_key();
+                }
+                AsyncResult::LoginError(err) => {
+                    self.login_loading = false;
+                    self.screen = Screen::Login;
+                    self.login_error = Some(err);
+                }
+                AsyncResult::MasterKeyReady(key) => {
+                    self.master_key = Some(key);
+                    self.status_msg = Some(t().status_ready.into());
+                    match PlayerEngine::new(key, Arc::clone(&self.player_state), self.eq.clone()) {
+                        Ok(engine) => {
+                            engine.set_volume(self.config.volume);
+                            self.engine = Some(engine);
+                        }
+                        Err(e) => {
+                            self.status_msg =
+                                Some(t().fmt_error(t().status_audio_init_error, &e.to_string()));
+                        }
+                    }
+                    self.start_load_favorites_category();
+                    self.start_load_favorite_ids();
+                    self.start_load_radios();
+                    self.start_load_moods();
+                    self.start_load_genres();
+                }
+                AsyncResult::MasterKeyError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_key_error, &err));
+                }
+                AsyncResult::SearchResults(tracks) => {
+                    self.search_loading = false;
+                    self.status_msg = Some(t().fmt_results(tracks.len()));
+                    self.search_display = tracks.iter().map(DisplayItem::from_track).collect();
+                    self.search_results = tracks;
+                    self.search_selected = 0;
+                }
+                AsyncResult::SearchDisplayResults(items) => {
+                    self.search_loading = false;
+                    self.status_msg = Some(t().fmt_results(items.len()));
+                    self.search_results.clear();
+                    self.search_display = items;
+                    self.search_selected = 0;
+                }
+                AsyncResult::SearchError(err) => {
+                    self.search_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_search_error, &err));
+                }
+                AsyncResult::FavoritesLoaded(category, tracks) => {
+                    // Cache under the category that was requested, never the one
+                    // currently displayed — a late response must not overwrite
+                    // another category's cache entry.
+                    // RecentlyPlayed is never cached (changes after every play).
+                    if category == FavoritesCategory::Tracks {
+                        self.favorites_cache.tracks = Some(tracks.clone());
+                        self.favorites_cache.save();
+                        // Backing list for favorite indicators / shuffle favorites.
+                        self.favorites = tracks.clone();
+                        self.favorite_track_ids =
+                            tracks.iter().map(|t| t.track_id.clone()).collect();
+                    }
+                    if category == self.favorites_category {
+                        self.favorites_loading = false;
+                        self.status_msg = Some(t().fmt_loaded(tracks.len()));
+                        self.favorites_display =
+                            tracks.iter().map(DisplayItem::from_track).collect();
+                        self.favorites = tracks;
+                        self.favorites_selected = 0;
+                    }
+                }
+                AsyncResult::FavoritesDisplayLoaded(category, items) => {
+                    // Cache under the requested category (see FavoritesLoaded).
+                    match category {
+                        FavoritesCategory::Artists => {
+                            self.favorites_cache.artists = Some(items.clone());
+                        }
+                        FavoritesCategory::Albums => {
+                            self.favorites_cache.albums = Some(items.clone());
+                        }
+                        FavoritesCategory::Playlists => {
+                            self.favorites_cache.playlists = Some(items.clone());
+                        }
+                        FavoritesCategory::Following => {
+                            self.favorites_cache.following = Some(items.clone());
+                        }
+                        _ => {}
+                    }
+                    self.favorites_cache.save();
+                    if category == self.favorites_category {
+                        self.favorites_loading = false;
+                        self.status_msg = Some(t().fmt_loaded(items.len()));
+                        self.favorites.clear();
+                        self.favorites_display = items;
+                        self.favorites_selected = 0;
+                    }
+                }
+                AsyncResult::FavoritesError(category, err) => {
+                    if category == self.favorites_category {
+                        self.favorites_loading = false;
+                        self.favorites_display.clear();
+                        self.favorites.clear();
+                        self.favorites_selected = 0;
+                        self.status_msg = Some(t().fmt_error(t().status_favorites_error, &err));
+                    }
+                }
+                AsyncResult::FavoriteAdded(track_id) => {
+                    self.status_msg = Some(t().status_added_to_favorites.into());
+                    if !self.favorite_track_ids.contains(&track_id) {
+                        self.favorite_track_ids.push(track_id);
+                    }
+                    self.favorites_cache.invalidate_tracks();
+                    self.favorites_cache.save();
+                    self.start_load_favorites();
+                }
+                AsyncResult::FavoriteRemoved(track_id) => {
+                    self.status_msg = Some(t().status_removed_from_favorites.into());
+                    self.favorite_track_ids.retain(|id| id != &track_id);
+                    self.favorites_cache.invalidate_tracks();
+                    self.favorites_cache.save();
+                    self.start_load_favorites();
+                }
+                AsyncResult::FavoriteError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_favorite_error, &err));
+                }
+                AsyncResult::FavoriteArtistAdded(artist_id) => {
+                    self.status_msg = Some(t().status_added_to_favorites.into());
+                    if !self.favorite_artist_ids.contains(&artist_id) {
+                        self.favorite_artist_ids.push(artist_id);
+                    }
+                    self.favorites_cache.invalidate_artists();
+                    self.favorites_cache.save();
+                    self.start_load_favorites_category();
+                }
+                AsyncResult::FavoriteArtistRemoved(artist_id) => {
+                    self.status_msg = Some(t().status_removed_from_favorites.into());
+                    self.favorite_artist_ids.retain(|id| id != &artist_id);
+                    self.favorites_cache.invalidate_artists();
+                    self.favorites_cache.save();
+                    self.start_load_favorites_category();
+                }
+                AsyncResult::FavoriteArtistError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_favorite_error, &err));
+                }
+                AsyncResult::FavoriteAlbumAdded(album_id) => {
+                    self.status_msg = Some(t().status_added_to_favorites.into());
+                    if !self.favorite_album_ids.contains(&album_id) {
+                        self.favorite_album_ids.push(album_id);
+                    }
+                    self.favorites_cache.invalidate_albums();
+                    self.favorites_cache.save();
+                    self.start_load_favorites_category();
+                }
+                AsyncResult::FavoriteAlbumRemoved(album_id) => {
+                    self.status_msg = Some(t().status_removed_from_favorites.into());
+                    self.favorite_album_ids.retain(|id| id != &album_id);
+                    self.favorites_cache.invalidate_albums();
+                    self.favorites_cache.save();
+                    self.start_load_favorites_category();
+                }
+                AsyncResult::FavoriteAlbumError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_favorite_error, &err));
+                }
+                AsyncResult::FavoriteIdsLoaded {
+                    track_ids,
+                    artist_ids,
+                    album_ids,
+                } => {
+                    if !track_ids.is_empty() {
+                        self.favorite_track_ids = track_ids;
+                    }
+                    self.favorite_artist_ids = artist_ids;
+                    self.favorite_album_ids = album_ids;
+                }
+                AsyncResult::PlaylistsReady(playlists) => {
+                    self.playlists = playlists;
+                    self.status_msg = Some(t().fmt_playlists_loaded(self.playlists.len()));
+                }
+                AsyncResult::PlaylistsError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_playlists_error, &err));
+                }
+                AsyncResult::AddedToPlaylist(playlist_id) => {
+                    self.status_msg = Some(t().status_added_to_playlist.into());
+                    // Invalidate the playlists list and this specific playlist's detail
+                    self.favorites_cache
+                        .invalidate_playlists(Some(&playlist_id));
+                    self.favorites_cache.save();
+                    self.adjust_playlist_count(&playlist_id, 1);
+                }
+                AsyncResult::AddToPlaylistError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_add_to_playlist_error, &err));
+                }
+                AsyncResult::AlreadyInPlaylist => {
+                    self.status_msg = Some(t().status_already_in_playlist.into());
+                }
+                AsyncResult::RemovedFromPlaylist {
+                    playlist_id,
+                    track_id,
+                } => {
+                    self.status_msg = Some(t().status_removed_from_playlist.into());
+                    self.favorites_cache
+                        .invalidate_playlists(Some(&playlist_id));
+                    self.favorites_cache.save();
+                    if let Some(ref mut detail) = self.playlist_detail {
+                        if detail.playlist_id == playlist_id {
+                            detail.tracks.retain(|t| t.track_id != track_id);
+                            detail.nb_tracks = detail.tracks.len() as u64;
+                        }
+                    }
+                    self.adjust_playlist_count(&playlist_id, -1);
+                }
+                AsyncResult::RemoveFromPlaylistError(err) => {
+                    self.status_msg =
+                        Some(t().fmt_error(t().status_remove_from_playlist_error, &err));
+                }
+                AsyncResult::PlaylistCreatedAndAdded { playlist_id } => {
+                    self.status_msg = Some(t().status_playlist_created.into());
+                    self.favorites_cache
+                        .invalidate_playlists(Some(&playlist_id));
+                    self.favorites_cache.save();
+                    self.playlists.clear(); // force reload on next picker open
+                }
+                AsyncResult::PlaylistCreatedError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_playlist_create_error, &err));
+                }
+                AsyncResult::PlaylistRenamed {
+                    playlist_id,
+                    new_title,
+                } => {
+                    self.status_msg = Some(t().status_playlist_renamed.into());
+                    self.favorites_cache
+                        .invalidate_playlists(Some(&playlist_id));
+                    self.favorites_cache.save();
+                    for pl in self.playlists.iter_mut() {
+                        if pl.playlist_id == playlist_id {
+                            pl.title = new_title.clone();
+                        }
+                    }
+                    // Refresh title in any visible DisplayItem lists.
+                    let update = |items: &mut [DisplayItem]| {
+                        for it in items.iter_mut() {
+                            if it.playlist_id.as_deref() == Some(playlist_id.as_str()) {
+                                it.col1 = new_title.clone();
+                            }
+                        }
+                    };
+                    update(&mut self.search_display);
+                    update(&mut self.favorites_display);
+                    if let Some(ref mut detail) = self.playlist_detail {
+                        if detail.playlist_id == playlist_id {
+                            detail.title = new_title.clone();
+                        }
+                    }
+                }
+                AsyncResult::PlaylistRenameError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_playlist_rename_error, &err));
+                }
+                AsyncResult::PlaylistDeleted(playlist_id) => {
+                    self.status_msg = Some(t().status_playlist_deleted.into());
+                    self.favorites_cache
+                        .invalidate_playlists(Some(&playlist_id));
+                    self.favorites_cache.save();
+                    self.playlists.retain(|p| p.playlist_id != playlist_id);
+                    self.search_display
+                        .retain(|it| it.playlist_id.as_deref() != Some(playlist_id.as_str()));
+                    self.favorites_display
+                        .retain(|it| it.playlist_id.as_deref() != Some(playlist_id.as_str()));
+                    if let Some(ref detail) = self.playlist_detail {
+                        if detail.playlist_id == playlist_id {
+                            self.playlist_detail = None;
+                            self.playlist_detail_selected = 0;
+                            self.playlist_detail_loading = false;
+                        }
+                    }
+                }
+                AsyncResult::PlaylistDeleteError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_playlist_delete_error, &err));
+                }
+                AsyncResult::DislikeOk => {
+                    self.status_msg = Some(t().status_track_disliked.into());
+                }
+                AsyncResult::DislikeError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_dislike_error, &err));
+                }
+                AsyncResult::MixReady(tracks) => {
+                    if tracks.is_empty() {
+                        self.status_msg = Some(t().status_no_mix_tracks.into());
+                    } else {
+                        self.status_msg = Some(t().fmt_mix_tracks(tracks.len()));
+                        let first = tracks[0].clone();
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = tracks;
+                            state.queue_index = 0;
+                        }
+                        self.start_play_track(first);
+                    }
+                }
+                AsyncResult::SeededMixReady { seed_id, tracks } => {
+                    let mut appended = 0;
+                    if let Ok(mut state) = self.player_state.lock() {
+                        // Only if the queue is still the lone seed track: the
+                        // user may have started something else meanwhile.
+                        let untouched = state.queue.len() == 1
+                            && state.queue.first().is_some_and(|t| t.track_id == seed_id);
+                        if untouched {
+                            let mix: Vec<TrackData> = tracks
+                                .into_iter()
+                                .filter(|t| t.track_id != seed_id)
+                                .collect();
+                            appended = mix.len();
+                            state.queue.extend(mix);
+                        }
+                    }
+                    if appended > 0 {
+                        self.status_msg = Some(t().fmt_mix_tracks(appended));
+                    }
+                }
+                AsyncResult::MixError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_mix_error, &err));
+                }
+                AsyncResult::FlowReady(tracks) => {
+                    if tracks.is_empty() {
+                        self.status_msg = Some(t().status_no_flow_tracks.into());
+                    } else if self.flow_active {
+                        // Continuation — append new tracks to existing queue and advance
+                        let next_track = tracks[0].clone();
+                        let count = tracks.len();
+                        if let Ok(mut state) = self.player_state.lock() {
+                            let append_idx = state.queue.len();
+                            state.queue.extend(tracks);
+                            state.queue_index = append_idx;
+                        }
+                        self.status_msg = Some(t().fmt_flow_tracks(count));
+                        self.start_play_track(next_track);
+                    } else {
+                        // Initial Flow start — replace queue
+                        self.status_msg = Some(t().fmt_flow_tracks(tracks.len()));
+                        let first = tracks[0].clone();
+                        self.flow_active = true;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = tracks;
+                            state.queue_index = 0;
+                        }
+                        self.start_play_track(first);
+                    }
+                }
+                AsyncResult::FlowError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_flow_error, &err));
+                    // Clear the Loading state set before the fetch, otherwise
+                    // playback is stuck forever (on_tick only auto-advances
+                    // while status == Playing).
+                    if let Ok(mut state) = self.player_state.lock() {
+                        state.status = PlaybackStatus::Stopped;
+                    }
+                }
+                AsyncResult::AlbumDetailReady(detail) => {
+                    self.album_detail_loading = false;
+                    self.status_msg =
+                        Some(t().fmt_album_tracks_status(&detail.title, detail.tracks.len()));
+                    self.album_detail = Some(detail);
+                    self.album_detail_selected = 0;
+                }
+                AsyncResult::AlbumDetailError(err) => {
+                    self.album_detail_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_album_error, &err));
+                }
+                AsyncResult::ArtistDetailReady(detail) => {
+                    self.artist_detail_loading = false;
+                    self.status_msg = Some(format!(
+                        "{} — {} top {}",
+                        detail.name,
+                        detail.top_tracks.len(),
+                        t().header_tracks
+                    ));
+                    self.artist_detail = Some(detail);
+                    self.artist_detail_selected = 0;
+                }
+                AsyncResult::ArtistDetailError(err) => {
+                    self.artist_detail_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_artist_error, &err));
+                }
+                AsyncResult::PlaylistDetailReady { detail, background } => {
+                    // Persist the fresh copy for instant re-open, regardless of
+                    // whether the user is still looking at this playlist.
+                    self.favorites_cache
+                        .playlist_details
+                        .insert(detail.playlist_id.clone(), detail.clone());
+                    self.set_playlist_track_count(&detail.playlist_id, detail.tracks.len());
+                    self.favorites_cache.save();
+
+                    let still_viewing = self
+                        .playlist_detail
+                        .as_ref()
+                        .is_some_and(|d| d.playlist_id == detail.playlist_id);
+
+                    if background {
+                        // Silent refresh: only touch the view if the user hasn't
+                        // navigated away, and keep their selection on the same
+                        // track even if it moved places in the list.
+                        if still_viewing {
+                            let selected_track_id = self
+                                .playlist_detail
+                                .as_ref()
+                                .and_then(|d| d.tracks.get(self.playlist_detail_selected))
+                                .map(|t| t.track_id.clone());
+                            if let Some(new_idx) = selected_track_id
+                                .and_then(|id| detail.tracks.iter().position(|t| t.track_id == id))
+                            {
+                                self.playlist_detail_selected = new_idx;
+                            } else {
+                                self.playlist_detail_selected = self
+                                    .playlist_detail_selected
+                                    .min(detail.tracks.len().saturating_sub(1));
+                            }
+                            self.playlist_detail = Some(detail);
+                        }
+                    } else {
+                        self.playlist_detail_loading = false;
+                        self.status_msg = Some(
+                            t().fmt_playlist_tracks_status(&detail.title, detail.tracks.len()),
+                        );
+                        self.playlist_detail = Some(detail);
+                        self.playlist_detail_selected = 0;
+                    }
+                }
+                AsyncResult::PlaylistDetailError { err, background } => {
+                    if !background {
+                        self.playlist_detail_loading = false;
+                        self.status_msg = Some(t().fmt_error(t().status_playlist_error, &err));
+                    }
+                }
+                AsyncResult::ShowDetailReady(detail) => {
+                    self.playlist_detail_loading = false;
+                    self.status_msg =
+                        Some(t().fmt_playlist_tracks_status(&detail.title, detail.tracks.len()));
+                    self.playlist_detail_selected = 0;
+                    self.playlist_detail = Some(detail);
+                }
+                AsyncResult::ShowDetailError(err) => {
+                    self.playlist_detail_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_playlist_error, &err));
+                }
+                AsyncResult::RadiosReady(items) => {
+                    self.radios_loading = false;
+                    self.status_msg = Some(t().fmt_radios_loaded(items.len()));
+                    self.radios = items;
+                    self.radios_selected = 0;
+                }
+                AsyncResult::RadiosError(err) => {
+                    self.radios_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_radios_error, &err));
+                }
+                AsyncResult::RadioTracksReady(tracks) => {
+                    if tracks.is_empty() {
+                        self.status_msg = Some(t().status_no_radio_tracks.into());
+                    } else {
+                        self.status_msg = Some(t().fmt_radio_tracks(tracks.len()));
+                        let first = tracks[0].clone();
+                        self.flow_active = false;
+                        self.active_mood = None;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = tracks;
+                            state.queue_index = 0;
+                        }
+                        self.start_play_track(first);
+                    }
+                }
+                AsyncResult::RadioTracksError(err) => {
+                    self.status_msg = Some(t().fmt_error(t().status_radio_tracks_error, &err));
+                }
+                AsyncResult::MoodsReady(items) => {
+                    self.moods_loading = false;
+                    self.status_msg = Some(t().fmt_moods_loaded(items.len()));
+                    self.moods = items.clone();
+                    self.moods_selected = 0;
+                    self.favorites_cache.moods = Some(items);
+                    self.favorites_cache.save();
+                }
+                AsyncResult::MoodsError(err) => {
+                    self.moods_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_moods_error, &err));
+                }
+                AsyncResult::MoodTracksReady {
+                    tracks,
+                    continuation,
+                } => {
+                    if tracks.is_empty() {
+                        self.status_msg = Some(t().status_no_radio_tracks.into());
+                    } else if continuation {
+                        // Continuation — append new tracks to existing queue and advance,
+                        // mirroring Flow's continuation branch above.
+                        let next_track = tracks[0].clone();
+                        let count = tracks.len();
+                        if let Ok(mut state) = self.player_state.lock() {
+                            let append_idx = state.queue.len();
+                            state.queue.extend(tracks);
+                            state.queue_index = append_idx;
+                        }
+                        self.status_msg = Some(t().fmt_radio_tracks(count));
+                        self.start_play_track(next_track);
+                    } else {
+                        // Initial mood selection — replace queue
+                        self.status_msg = Some(t().fmt_radio_tracks(tracks.len()));
+                        let first = tracks[0].clone();
+                        self.flow_active = false;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.queue = tracks;
+                            state.queue_index = 0;
+                        }
+                        self.start_play_track(first);
+                    }
+                }
+                AsyncResult::MoodTracksError { err, continuation } => {
+                    self.status_msg = Some(t().fmt_error(t().status_radio_tracks_error, &err));
+                    if continuation {
+                        // Clear the Loading state set before the fetch, otherwise
+                        // playback is stuck forever (on_tick only auto-advances
+                        // while status == Playing).
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.status = PlaybackStatus::Stopped;
+                        }
+                    }
+                }
+                AsyncResult::GenresReady(items) => {
+                    self.genres_loading = false;
+                    self.status_msg = Some(t().fmt_genres_loaded(items.len()));
+                    self.genres = items;
+                    self.genres_selected = 0;
+                }
+                AsyncResult::GenresError(err) => {
+                    self.genres_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_genres_error, &err));
+                }
+                AsyncResult::GenreDetailReady(detail) => {
+                    self.genre_detail_loading = false;
+                    self.status_msg = Some(t().fmt_genre_detail_loaded(&detail.name));
+                    self.genre_detail = Some(detail);
+                }
+                AsyncResult::GenreDetailError(err) => {
+                    self.genre_detail_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_genre_detail_error, &err));
+                }
+                AsyncResult::OfflineTrackSaved { track, quality } => {
+                    self.offline_loading = false;
+                    self.offline_index.add_track(track, quality);
+                    let _ = self.offline_index.save();
+                    self.status_msg = Some(t().status_track_saved_offline.into());
+                }
+                AsyncResult::OfflineTrackSaveError(err) => {
+                    self.offline_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_offline_download_error, &err));
+                }
+                AsyncResult::OfflineAlbumSaved { album } => {
+                    self.offline_loading = false;
+                    // Add individual tracks to the index
+                    for track in &album.tracks {
+                        if !self.offline_index.has_track(&track.track_id) {
+                            self.offline_index
+                                .add_track(track.clone(), self.config.quality);
+                        }
+                    }
+                    self.offline_index.add_album(album);
+                    let _ = self.offline_index.save();
+                    self.status_msg = Some(t().status_album_saved_offline.into());
+                }
+                AsyncResult::OfflineAlbumSaveError(err) => {
+                    self.offline_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_offline_download_error, &err));
+                }
+                AsyncResult::OfflinePlaylistSaved { playlist } => {
+                    self.offline_loading = false;
+                    // Add individual tracks to the index
+                    for track in &playlist.tracks {
+                        if !self.offline_index.has_track(&track.track_id) {
+                            self.offline_index
+                                .add_track(track.clone(), self.config.quality);
+                        }
+                    }
+                    self.offline_index.add_playlist(playlist);
+                    let _ = self.offline_index.save();
+                    self.status_msg = Some(t().status_playlist_saved_offline.into());
+                }
+                AsyncResult::OfflinePlaylistSaveError(err) => {
+                    self.offline_loading = false;
+                    self.status_msg = Some(t().fmt_error(t().status_offline_download_error, &err));
+                }
+                AsyncResult::OfflineDownloadProgress { percent } => {
+                    self.status_msg = Some(t().fmt_download_progress(percent));
+                }
+                AsyncResult::TrackReady {
+                    audio_data,
+                    track,
+                    quality,
+                    generation,
+                } => {
+                    // Ignore stale results from a previous track request
+                    if generation != self.track_generation {
+                        info!(
+                            gen = generation,
+                            current_gen = self.track_generation,
+                            track_id = %track.track_id,
+                            title = %track.title,
+                            "process_async: TrackReady IGNORED (stale generation)"
+                        );
+                        continue;
+                    }
+                    info!(
+                        gen = generation,
+                        track_id = %track.track_id,
+                        title = %track.title,
+                        bytes = ?audio_data.known_len(),
+                        "process_async: TrackReady, calling play_decoded"
+                    );
+                    if let Some(ref mut engine) = self.engine {
+                        match engine.play_decoded(audio_data, &track, quality) {
+                            Ok(()) => {
+                                info!(gen = generation, track_id = %track.track_id, "process_async: play_decoded OK");
+                                self.consecutive_skip_count = 0;
+                                self.status_msg = None;
+                            }
+                            Err(e) => {
+                                warn!(gen = generation, track_id = %track.track_id, err = %e, "process_async: play_decoded FAILED");
+                                self.status_msg =
+                                    Some(t().fmt_error(t().status_playback_error, &e.to_string()));
+                            }
+                        }
+                    } else {
+                        warn!(gen = generation, track_id = %track.track_id, "process_async: TrackReady but engine is None!");
+                    }
+                }
+                AsyncResult::Prefetched { track_id, result } => {
+                    let Some(prefetch) = self
+                        .prefetch
+                        .as_mut()
+                        .filter(|p| p.track_id == track_id && p.ready.is_none())
+                    else {
+                        // Superseded: dropping the stream cancels its download.
+                        continue;
+                    };
+                    match result {
+                        Ok(ready) => {
+                            info!(track_id = %track_id, "process_async: next track prefetched");
+                            prefetch.ready = Some(ready);
+                        }
+                        Err(err) => {
+                            debug!(track_id = %track_id, err = %err, "process_async: prefetch failed");
+                        }
+                    }
+                }
+                AsyncResult::TrackFetchError { err, generation } => {
+                    // Ignore stale errors from a previous track request
+                    if generation != self.track_generation {
+                        info!(
+                            gen = generation,
+                            current_gen = self.track_generation,
+                            err = %err,
+                            "process_async: TrackFetchError IGNORED (stale generation)"
+                        );
+                        continue;
+                    }
+                    warn!(gen = generation, err = %err, consecutive_skips = self.consecutive_skip_count, "process_async: TrackFetchError, auto-skipping");
+                    // `is_offline` is computed once at startup, so a connection
+                    // lost mid-session still looks online. If the track is on
+                    // disk, play that instead of skipping it.
+                    let local = self
+                        .player_state
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.current_track.clone())
+                        .filter(|track| self.offline_index.has_track(&track.track_id));
+                    if let Some(track) = local {
+                        info!(track_id = %track.track_id, "process_async: falling back to the downloaded copy");
+                        self.consecutive_skip_count = 0;
+                        self.start_play_offline_track(track);
+                        continue;
+                    }
+                    self.status_msg = Some(t().fmt_error(t().status_track_error, &err));
+                    // Auto-skip to next track instead of stopping,
+                    // but limit consecutive skips to avoid infinite loop
+                    self.consecutive_skip_count += 1;
+                    if self.consecutive_skip_count <= 5 {
+                        self.play_next();
+                    } else {
+                        warn!("Too many consecutive track failures, stopping");
+                        self.consecutive_skip_count = 0;
+                        if let Ok(mut state) = self.player_state.lock() {
+                            state.status = PlaybackStatus::Stopped;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_download_offline(&mut self, track: TrackData) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        if self.offline_index.has_track(&track.track_id) {
+            self.status_msg = Some(t().status_track_saved_offline.into());
+            return;
+        }
+
+        let Some(master_key) = self.master_key else {
+            self.status_msg = Some(t().status_player_not_ready.into());
+            return;
+        };
+
+        self.offline_loading = true;
+        self.status_msg = Some(t().status_downloading_track.into());
+
+        let client = Arc::clone(&self.client);
+        let cdn_http = self.cdn_http.clone();
+        let tx = self.async_tx.clone();
+        let quality = self.config.quality;
+
+        tokio::spawn(async move {
+            // Ensure we have a track token
+            let track = {
+                let client = client.lock().await;
+                match client.ensure_track_token(&track).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::OfflineTrackSaveError(e.to_string()));
+                        return;
+                    }
+                }
+            };
+
+            // Get stream URL
+            let (url, actual_quality) = {
+                let client = client.lock().await;
+                match client.get_stream_url(&track, quality).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::OfflineTrackSaveError(e.to_string()));
+                        return;
+                    }
+                }
+            };
+
+            // Download and decrypt
+            match deezer_core::player::stream::download_and_decrypt(
+                &url,
+                &track.track_id,
+                &master_key,
+                &cdn_http,
+            )
+            .await
+            {
+                Ok(audio_data) => {
+                    // Save to disk
+                    if let Err(e) = OfflineIndex::save_track_audio(&track.track_id, &audio_data) {
+                        let _ = tx.send(AsyncResult::OfflineTrackSaveError(e.to_string()));
+                        return;
+                    }
+                    let _ = tx.send(AsyncResult::OfflineTrackSaved {
+                        track,
+                        quality: actual_quality,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::OfflineTrackSaveError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    fn start_download_album_offline(&mut self, album_id: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+        if self.offline_index.has_album(&album_id) {
+            self.status_msg = Some(t().status_album_saved_offline.into());
+            return;
+        }
+
+        let Some(master_key) = self.master_key else {
+            self.status_msg = Some(t().status_player_not_ready.into());
+            return;
+        };
+
+        self.offline_loading = true;
+        self.status_msg = Some(t().status_downloading_track.into());
+
+        let client = Arc::clone(&self.client);
+        let cdn_http = self.cdn_http.clone();
+        let tx = self.async_tx.clone();
+        let quality = self.config.quality;
+
+        tokio::spawn(async move {
+            // First fetch album detail
+            let detail = {
+                let client = client.lock().await;
+                match client.get_album_detail(&album_id).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::OfflineAlbumSaveError(e.to_string()));
+                        return;
+                    }
+                }
+            };
+
+            // Download each track
+            for track in &detail.tracks {
+                let track = {
+                    let client = client.lock().await;
+                    match client.ensure_track_token(track).await {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    }
+                };
+
+                let (url, _actual_quality) = {
+                    let client = client.lock().await;
+                    match client.get_stream_url(&track, quality).await {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    }
+                };
+
+                match deezer_core::player::stream::download_and_decrypt(
+                    &url,
+                    &track.track_id,
+                    &master_key,
+                    &cdn_http,
+                )
+                .await
+                {
+                    Ok(audio_data) => {
+                        let _ = OfflineIndex::save_track_audio(&track.track_id, &audio_data);
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            let _ = tx.send(AsyncResult::OfflineAlbumSaved { album: detail });
+        });
+    }
+
+    fn start_download_playlist_offline(&mut self, playlist_id: String) {
+        if self.is_offline {
+            self.status_msg = Some(t().no_internet.into());
+            return;
+        }
+
+        let Some(master_key) = self.master_key else {
+            self.status_msg = Some(t().status_player_not_ready.into());
+            return;
+        };
+
+        self.offline_loading = true;
+        self.status_msg = Some(t().fmt_download_progress(0));
+
+        let client = Arc::clone(&self.client);
+        let cdn_http = self.cdn_http.clone();
+        let tx = self.async_tx.clone();
+        let quality = self.config.quality;
+
+        tokio::spawn(async move {
+            // First fetch playlist detail (tracks list)
+            let detail = {
+                let client = client.lock().await;
+                match client.get_playlist_detail(&playlist_id).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = tx.send(AsyncResult::OfflinePlaylistSaveError(e.to_string()));
+                        return;
+                    }
+                }
+            };
+
+            // Download each track, reporting progress as a percentage. Tracks
+            // that fail are skipped but still count towards progress.
+            let total = detail.tracks.len();
+            for (i, track) in detail.tracks.iter().enumerate() {
+                'track: {
+                    let track = {
+                        let client = client.lock().await;
+                        match client.ensure_track_token(track).await {
+                            Ok(t) => t,
+                            Err(_) => break 'track,
+                        }
+                    };
+
+                    let (url, _actual_quality) = {
+                        let client = client.lock().await;
+                        match client.get_stream_url(&track, quality).await {
+                            Ok(r) => r,
+                            Err(_) => break 'track,
+                        }
+                    };
+
+                    if let Ok(audio_data) = deezer_core::player::stream::download_and_decrypt(
+                        &url,
+                        &track.track_id,
+                        &master_key,
+                        &cdn_http,
+                    )
+                    .await
+                    {
+                        let _ = OfflineIndex::save_track_audio(&track.track_id, &audio_data);
+                    }
+                }
+
+                let percent = ((i + 1) * 100 / total.max(1)) as u8;
+                let _ = tx.send(AsyncResult::OfflineDownloadProgress { percent });
+            }
+
+            let _ = tx.send(AsyncResult::OfflinePlaylistSaved { playlist: detail });
+        });
+    }
+
+    fn start_play_offline_track(&mut self, track: TrackData) {
+        self.track_generation += 1;
+        let generation = self.track_generation;
+        self.listen_logged_for = None;
+
+        if let Ok(mut state) = self.player_state.lock() {
+            state.status = PlaybackStatus::Loading;
+            state.current_track = Some(track.clone());
+            state.duration_secs = track.duration_secs();
+            state.position_secs = 0;
+        }
+
+        self.status_msg = Some(t().loading.into());
+
+        let tx = self.async_tx.clone();
+        let track_id = track.track_id.clone();
+
+        // Load audio from disk in a blocking task
+        tokio::spawn(async move {
+            match OfflineIndex::load_track_audio(&track_id) {
+                Ok(audio_data) => {
+                    let _ = tx.send(AsyncResult::TrackReady {
+                        audio_data: audio_data.into(),
+                        track,
+                        quality: AudioQuality::Mp3_128, // actual quality stored in index
+                        generation,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AsyncResult::TrackFetchError {
+                        err: e.to_string(),
+                        generation,
+                    });
+                }
+            }
+        });
+    }
+
+    fn on_tick(&mut self) {
+        // The queued track took over without a gap: move the queue along.
+        // play_next lands on that track, which start_play_track recognizes.
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|engine| engine.queued_has_started())
+        {
+            info!("on_tick: gapless transition");
+            self.play_next();
+        }
+
+        // A queued track that is no longer next (queue edited, shuffle or
+        // repeat toggled) is dropped before it can start.
+        let next_id = self.peek_next_track().map(|t| t.track_id);
+        if let Some(engine) = self.engine.as_mut() {
+            if engine
+                .queued_track_id()
+                .is_some_and(|id| next_id.as_deref() != Some(id))
+            {
+                info!("on_tick: queued track is no longer next, dropping it");
+                engine.cancel_queued();
+            }
+        }
+
+        // Update playback position from what the sink has actually played
+        if let (Some(engine), Ok(mut state)) = (self.engine.as_ref(), self.player_state.lock()) {
+            if state.status == PlaybackStatus::Playing {
+                state.position_secs = engine.position().as_secs();
+                if state.duration_secs > 0 && state.position_secs >= state.duration_secs {
+                    state.position_secs = state.duration_secs;
+                }
+            }
+        }
+
+        // Report play to Deezer once per track after ~30s — needed for the
+        // track to show up under Favorites > Recently Played.
+        self.maybe_log_listen();
+
+        self.maybe_prefetch_next();
+        self.maybe_queue_gapless();
+
+        // A streamed track that lost its connection ends early: report it, and
+        // finish it from the downloaded copy if there is one.
+        let stream_err = self
+            .engine
+            .as_mut()
+            .filter(|engine| engine.is_finished())
+            .and_then(|engine| engine.take_stream_error());
+        if let Some(err) = stream_err {
+            warn!(err = %err, "on_tick: stream failed mid-track");
+            let local = self
+                .player_state
+                .lock()
+                .ok()
+                .and_then(|state| state.current_track.clone())
+                .filter(|track| self.offline_index.has_track(&track.track_id));
+            if let Some(track) = local {
+                info!(track_id = %track.track_id, "on_tick: falling back to the downloaded copy");
+                self.start_play_offline_track(track);
+                return;
+            }
+            self.status_msg = Some(t().fmt_error(t().status_track_error, &err));
+        }
+
+        // Auto-advance when track finishes
+        if let Some(ref engine) = self.engine {
+            if engine.is_finished() {
+                let status = self.player_state.lock().unwrap().status;
+                if status == PlaybackStatus::Playing {
+                    let repeat = self.player_state.lock().unwrap().repeat;
+                    if repeat == RepeatMode::Track {
+                        let track = self.player_state.lock().unwrap().current_track.clone();
+                        if let Some(track) = track {
+                            self.start_play_track(track);
+                        }
+                    } else {
+                        self.play_next();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit MPRIS `PropertiesChanged` for any player state that changed since
+    /// the last refresh, so desktop now-playing widgets stay in sync. No-op if
+    /// the MPRIS server failed to register (e.g. no D-Bus session).
+    #[cfg(target_os = "linux")]
+    async fn mpris_refresh(&mut self) {
+        // Take the server out so we can mutate `self.mpris_last` without an
+        // aliasing borrow; put it back afterwards.
+        let Some(server) = self.mpris.take() else {
+            return;
+        };
+        let (current, props) = {
+            let state = match self.player_state.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    self.mpris = Some(server);
+                    return;
+                }
+            };
+            let current = crate::mpris::MprisSnapshot::capture(&state);
+            let props = current.changed_properties(&self.mpris_last, &state);
+            (current, props)
+        };
+        if !props.is_empty() {
+            self.mpris_last = current;
+            if let Err(e) = server.properties_changed(props).await {
+                debug!("MPRIS properties_changed failed: {e}");
+            }
+        }
+        self.mpris = Some(server);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn mpris_refresh(&mut self) {}
+
+    /// Report the current track to Deezer's `log.listen` endpoint once we've
+    /// played past 30 seconds. Required for the track to appear in the user's
+    /// listening history (Favorites > Recently Played).
+    fn maybe_log_listen(&mut self) {
+        const LISTEN_THRESHOLD_SECS: u64 = 30;
+
+        if self.is_offline {
+            return;
+        }
+        let (track, position) = {
+            let state = match self.player_state.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if state.status != PlaybackStatus::Playing {
+                return;
+            }
+            let Some(track) = state.current_track.clone() else {
+                return;
+            };
+            (track, state.position_secs)
+        };
+
+        if position < LISTEN_THRESHOLD_SECS {
+            return;
+        }
+        // User-uploaded tracks (negative SNG_ID) aren't part of Deezer's catalog
+        // and can't be logged. Neither are podcast episodes, whose IDs belong to
+        // a different namespace than songs.
+        if track.is_user_uploaded() || track.direct_stream_url().is_some() {
+            return;
+        }
+        if self.listen_logged_for.as_ref() == Some(&track.track_id) {
+            return;
+        }
+        self.listen_logged_for = Some(track.track_id.clone());
+
+        let client = Arc::clone(&self.client);
+        let format = self.config.quality.as_api_format();
+        let track_id = track.track_id.clone();
+        tokio::spawn(async move {
+            let client = client.lock().await;
+            if let Err(e) = client
+                .log_listen(&track_id, format, &track_id, "song_id")
+                .await
+            {
+                debug!(track_id = %track_id, err = %e, "log.listen failed");
+            } else {
+                debug!(track_id = %track_id, "log.listen sent");
+            }
+        });
+    }
+}
+
+/// Send a line-delimited JSON message over a write half.
+async fn send_line_writer<T: serde::Serialize>(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    msg: &T,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut json = serde_json::to_string(msg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.flush().await
+}
+
+/// Broadcast a snapshot to every connected client. Serializes once, writes to all.
+/// Dead clients (write errors) are removed from the map.
+async fn broadcast_snapshot(
+    clients: &Arc<
+        tokio::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>>>,
+    >,
+    snap: DaemonSnapshot,
+) {
+    let msg = ServerMessage::Snapshot(snap);
+    let mut json = match serde_json::to_string(&msg) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    json.push('\n');
+    let bytes = json.into_bytes();
+
+    // Collect writers outside the map lock to avoid holding it during I/O.
+    let writers: Vec<(
+        u64,
+        Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    )> = {
+        let g = clients.lock().await;
+        g.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+
+    let mut dead = Vec::new();
+    for (id, w) in writers {
+        use tokio::io::AsyncWriteExt;
+        let mut guard = w.lock().await;
+        if guard.write_all(&bytes).await.is_err() || guard.flush().await.is_err() {
+            dead.push(id);
+        }
+    }
+
+    if !dead.is_empty() {
+        let mut g = clients.lock().await;
+        for id in dead {
+            g.remove(&id);
+        }
+    }
+}
+
+/// A shuffle cycle over `len` tracks: every index exactly once, in random
+/// order, with `start` moved to the front so the track playing right now isn't
+/// immediately replayed.
+///
+/// Fisher-Yates over an xorshift64* stream. The project has no `rand`
+/// dependency and this picks a play order, not anything needing a real CSPRNG.
+fn shuffled_indices(len: usize, start: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..len).collect();
+    let mut seed = seed | 1;
+    for i in (1..order.len()).rev() {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        let j = (seed.wrapping_mul(0x2545_f491_4f6c_dd1d) as usize) % (i + 1);
+        order.swap(i, j);
+    }
+    if let Some(pos) = order.iter().position(|&i| i == start) {
+        order.swap(0, pos);
+    }
+    order
+}
+
+/// Queue positions to try after the current one, in playback order, as
+/// `(shuffle_pos, queue_index)` pairs.
+///
+/// Shuffle walks the remainder of the current cycle; sequential playback walks
+/// to the end of the queue and wraps once when repeat-all is on. The list is
+/// always shorter than the queue, so scanning it always terminates.
+fn forward_candidates(
+    queue_len: usize,
+    queue_index: usize,
+    shuffle_order: &[usize],
+    shuffle_pos: usize,
+    shuffle: bool,
+    repeat_queue: bool,
+) -> Vec<(usize, usize)> {
+    if queue_len == 0 {
+        return Vec::new();
+    }
+    if shuffle {
+        return shuffle_order
+            .iter()
+            .enumerate()
+            .skip(shuffle_pos + 1)
+            .map(|(pos, &idx)| (pos, idx))
+            .collect();
+    }
+    let mut out = Vec::new();
+    let mut idx = queue_index;
+    for _ in 0..queue_len - 1 {
+        let next = idx + 1;
+        idx = if next >= queue_len {
+            if repeat_queue {
+                0
+            } else {
+                break;
+            }
+        } else {
+            next
+        };
+        out.push((shuffle_pos, idx));
+    }
+    out
+}
+
+/// Queue for a track started from the playlist detail, and the started
+/// track's position in it.
+///
+/// `order` is the sorted display order sent by the client. It is honoured only
+/// when it is a permutation of the playlist: a stale order (playlist reloaded
+/// in between) falls back to the playlist's own order rather than dropping or
+/// duplicating tracks.
+fn playlist_queue(tracks: &[TrackData], index: usize, order: &[usize]) -> (Vec<TrackData>, usize) {
+    let mut seen = vec![false; tracks.len()];
+    let is_permutation = order.len() == tracks.len()
+        && order
+            .iter()
+            .all(|&i| i < tracks.len() && !std::mem::replace(&mut seen[i], true));
+    match order.iter().position(|&i| i == index) {
+        Some(pos) if is_permutation => (order.iter().map(|&i| tracks[i].clone()).collect(), pos),
+        _ => (tracks.to_vec(), index),
+    }
+}
+
+/// Resolve a track's CDN URL (token refresh and FALLBACK included) and start
+/// streaming it. Returns the stream, the track as served (keeping the identity
+/// that was requested) and the quality obtained.
+async fn fetch_stream(
+    client: Arc<tokio::sync::Mutex<DeezerClient>>,
+    cdn_http: deezer_core::CdnClient,
+    track: TrackData,
+    quality: AudioQuality,
+    master_key: Option<[u8; 16]>,
+    generation: u64,
+    not_ready_msg: &'static str,
+) -> Result<(StreamReader, TrackData, AudioQuality), String> {
+    let start = Instant::now();
+    // Lock the client only for the short API calls (token + stream URL),
+    // then release it before the potentially long CDN download.
+    info!(gen = generation, track_id = %track.track_id, "fetch_task: waiting for client lock");
+    // Kept so a FALLBACK substitution below stays invisible to the UI:
+    // the played track keeps the id and credits the user picked.
+    let requested = track.clone();
+    let (track, url, actual_quality) = {
+        let lock_wait = Instant::now();
+        let client = client.lock().await;
+        info!(gen = generation, track_id = %track.track_id, lock_ms = lock_wait.elapsed().as_millis(), "fetch_task: got client lock");
+
+        info!(gen = generation, track_id = %track.track_id, "fetch_task: ensure_track_token");
+        let token_start = Instant::now();
+        let track = match client.ensure_track_token(&track).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(gen = generation, track_id = %track.track_id, err = %e, elapsed_ms = token_start.elapsed().as_millis(), "fetch_task: ensure_track_token FAILED");
+                return Err(e.to_string());
+            }
+        };
+        info!(gen = generation, track_id = %track.track_id, elapsed_ms = token_start.elapsed().as_millis(), "fetch_task: ensure_track_token OK");
+
+        info!(gen = generation, track_id = %track.track_id, quality = quality.as_api_format(), "fetch_task: get_stream_url");
+        let url_start = Instant::now();
+        match client.get_stream_url(&track, quality).await {
+            Ok((url, actual_quality)) => {
+                info!(gen = generation, track_id = %track.track_id, actual_quality = actual_quality.as_api_format(), elapsed_ms = url_start.elapsed().as_millis(), "fetch_task: get_stream_url OK");
+                (track, url, actual_quality)
+            }
+            Err(first_err) => {
+                // Token may be expired — re-fetch track data with a fresh token and retry
+                warn!(gen = generation, track_id = %track.track_id, err = %first_err, elapsed_ms = url_start.elapsed().as_millis(), "fetch_task: get_stream_url failed, refreshing token");
+                let refresh_start = Instant::now();
+                let refreshed = match client.get_track(&track.track_id).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(gen = generation, track_id = %track.track_id, err = %e, "fetch_task: token refresh (get_track) FAILED");
+                        return Err(e.to_string());
+                    }
+                };
+                info!(gen = generation, track_id = %track.track_id, elapsed_ms = refresh_start.elapsed().as_millis(), "fetch_task: token refreshed, retrying get_stream_url");
+                match client.get_stream_url(&refreshed, quality).await {
+                    Ok((url, actual_quality)) => {
+                        info!(gen = generation, track_id = %track.track_id, actual_quality = actual_quality.as_api_format(), "fetch_task: get_stream_url OK after refresh");
+                        (refreshed, url, actual_quality)
+                    }
+                    Err(_) => {
+                        // Try FALLBACK track if available
+                        if let Some(ref fb) = refreshed.fallback {
+                            info!(gen = generation, track_id = %track.track_id, fallback_id = %fb.track_id, "fetch_task: trying FALLBACK track");
+                            match client.get_track(&fb.track_id).await {
+                                Ok(fb_track) => {
+                                    match client.get_stream_url(&fb_track, quality).await {
+                                        Ok((url, actual_quality)) => {
+                                            info!(gen = generation, fallback_id = %fb_track.track_id, actual_quality = actual_quality.as_api_format(), "fetch_task: FALLBACK get_stream_url OK");
+                                            (fb_track, url, actual_quality)
+                                        }
+                                        Err(e) => {
+                                            warn!(gen = generation, track_id = %track.track_id, fallback_id = %fb_track.track_id, err = %e, "fetch_task: FALLBACK also failed");
+                                            return Err(e.to_string());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(gen = generation, fallback_id = %fb.track_id, err = %e, "fetch_task: FALLBACK get_track failed");
+                                    return Err(e.to_string());
+                                }
+                            }
+                        } else {
+                            warn!(gen = generation, track_id = %track.track_id, "fetch_task: get_stream_url FAILED, no FALLBACK available");
+                            return Err(first_err.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // client lock is dropped here
+    };
+    info!(gen = generation, track_id = %track.track_id, api_ms = start.elapsed().as_millis(), "fetch_task: client lock released, starting download");
+
+    // Stream + decrypt without holding the client lock: playback starts
+    // after a short prebuffer while the rest keeps downloading.
+    let dl_start = Instant::now();
+    let Some(master_key) = master_key else {
+        return Err(not_ready_msg.to_string());
+    };
+    match deezer_core::player::stream::stream_and_decrypt(
+        &url,
+        &track.track_id,
+        &master_key,
+        &cdn_http,
+    )
+    .await
+    {
+        Ok(reader) => {
+            info!(
+                gen = generation,
+                track_id = %track.track_id,
+                prebuffer_ms = dl_start.elapsed().as_millis(),
+                total_ms = start.elapsed().as_millis(),
+                "fetch_task: stream prebuffered"
+            );
+            Ok((reader, track.with_identity_of(&requested), actual_quality))
+        }
+        Err(e) => {
+            warn!(
+                gen = generation,
+                track_id = %track.track_id,
+                err = %e,
+                dl_ms = dl_start.elapsed().as_millis(),
+                total_ms = start.elapsed().as_millis(),
+                "fetch_task: stream+decrypt FAILED"
+            );
+            Err(e.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{forward_candidates, playlist_queue, shuffled_indices};
+    use deezer_core::api::models::TrackData;
+
+    fn track(id: &str) -> TrackData {
+        serde_json::from_value(serde_json::json!({
+            "SNG_ID": id,
+            "SNG_TITLE": id,
+            "ART_NAME": "artist",
+        }))
+        .unwrap()
+    }
+
+    fn ids(queue: &[TrackData]) -> Vec<&str> {
+        queue.iter().map(|t| t.track_id.as_str()).collect()
+    }
+
+    #[test]
+    fn playlist_queue_follows_the_sorted_order() {
+        let tracks = vec![track("a"), track("b"), track("c")];
+        let (queue, pos) = playlist_queue(&tracks, 0, &[2, 0, 1]);
+        assert_eq!(ids(&queue), vec!["c", "a", "b"]);
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn playlist_queue_keeps_the_playlist_order_without_sort() {
+        let tracks = vec![track("a"), track("b"), track("c")];
+        let (queue, pos) = playlist_queue(&tracks, 1, &[]);
+        assert_eq!(ids(&queue), vec!["a", "b", "c"]);
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn playlist_queue_ignores_a_stale_order() {
+        let tracks = vec![track("a"), track("b"), track("c")];
+        // Wrong length, out of range, duplicate.
+        for order in [&[1, 0][..], &[0, 1, 5], &[0, 0, 1]] {
+            let (queue, pos) = playlist_queue(&tracks, 2, order);
+            assert_eq!(ids(&queue), vec!["a", "b", "c"]);
+            assert_eq!(pos, 2);
+        }
+    }
+
+    #[test]
+    fn forward_candidates_stop_at_the_end_without_repeat() {
+        let got = forward_candidates(5, 2, &[], 0, false, false);
+        assert_eq!(got, vec![(0, 3), (0, 4)]);
+    }
+
+    #[test]
+    fn forward_candidates_wrap_once_with_repeat_all() {
+        let got: Vec<usize> = forward_candidates(5, 3, &[], 0, false, true)
+            .into_iter()
+            .map(|(_, idx)| idx)
+            .collect();
+        // Every other position exactly once, never back to the starting one.
+        assert_eq!(got, vec![4, 0, 1, 2]);
+    }
+
+    #[test]
+    fn forward_candidates_never_outlive_the_queue() {
+        for len in [0usize, 1, 2, 7, 64] {
+            for start in 0..len.max(1) {
+                for repeat in [false, true] {
+                    let got = forward_candidates(len, start, &[], 0, false, repeat);
+                    assert!(got.len() < len.max(1), "len={len} start={start}");
+                    assert!(got.iter().all(|&(_, idx)| idx < len || len == 0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_candidates_follow_the_shuffle_cycle() {
+        let order = vec![4, 1, 3, 0, 2];
+        let got = forward_candidates(5, 4, &order, 1, true, false);
+        assert_eq!(got, vec![(2, 3), (3, 0), (4, 2)]);
+    }
+
+    /// The whole point of a cycle: "repeat all" can only repeat *the shuffle*
+    /// if the shuffle is a full pass that plays each track exactly once.
+    #[test]
+    fn a_shuffle_cycle_covers_every_track_exactly_once() {
+        for len in [1usize, 2, 5, 50, 500] {
+            for start in [0, len / 2, len.saturating_sub(1)] {
+                let order = shuffled_indices(len, start, 0x9E37_79B9_7F4A_7C15);
+                assert_eq!(order.len(), len, "len={len} start={start}");
+                let mut seen = order.clone();
+                seen.sort_unstable();
+                assert_eq!(
+                    seen,
+                    (0..len).collect::<Vec<_>>(),
+                    "every index exactly once (len={len} start={start})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_playing_track_leads_the_cycle() {
+        for start in 0..20usize {
+            let order = shuffled_indices(20, start, 0xDEAD_BEEF_CAFE_1234);
+            assert_eq!(order[0], start, "cycle must open on the current track");
+        }
+    }
+
+    #[test]
+    fn the_order_is_actually_shuffled() {
+        // Not a randomness test — just a guard against returning 0..len as-is.
+        let order = shuffled_indices(100, 0, 0x1234_5678_9ABC_DEF0);
+        assert_ne!(order, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_empty_queue_yields_an_empty_cycle() {
+        assert!(shuffled_indices(0, 0, 42).is_empty());
+    }
+}
