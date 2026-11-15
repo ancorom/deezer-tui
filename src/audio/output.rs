@@ -1,65 +1,44 @@
-//! CPAL 0.18 real-time output stream.
+//! Реалтаймовый аудиовывод на базе `cpal` 0.18.
 //!
-//! # Design
-//!
-//! - Opens the host's default output device.
-//! - Explicitly selects a **44.1 kHz** configuration
-//!   (`cpal::SAMPLE_RATE_CD`). The 0.18 default now prefers 48 kHz, so the
-//!   CD sample rate must be requested by hand.
-//! - The real-time callback reads from the interleaved-stereo rtrb
-//!   `AudioRingBuffer` via `Consumer::pop()` (non-blocking, wait-free). Empty
-//!   slots are filled with silence (`0.0`) so the callback never blocks.
-//! - Every sample is multiplied by an **atomic volume knob** — an `AtomicU32`
-//!   whose bits are a packed `f32` in [0.0, 1.0] (`1.0` = full gain). The
-//!   knob is set once at startup and updated atomically on the UI thread; the
-//!   callback reads it with a relaxed atomic load.
-//!
-//! The consumer is **moved into the real-time callback**, so the callback owns
-//! it and never blocks on it.
+//! Особенности (`AGENT.md`, п. 2.1–2.2):
+//! - В `cpal` 0.18 `default_output_config()` по умолчанию выбирает 48 000 Гц, поэтому мы
+//!   явно запрашиваем стерео-конфигурацию `f32` с частотой `cpal::SAMPLE_RATE_CD` (44 100 Гц).
+//! - Внутри callback-функции нет ни одной блокировки или аллокации памяти: сэмплы читаются
+//!   из `rtrb::Consumer<f32>`, умножаются на атомарный коэффициент громкости (`AtomicU32`)
+//!   и при нехватке данных (underrun) заполняются нулями (`0.0f32`).
+
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use cpal::OutputCallbackInfo;
-use cpal::traits::{DeviceTrait, HostTrait};
+use anyhow::{Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{OutputCallbackInfo, SampleFormat};
 use rtrb::{Consumer, PopError};
 
-/// The sample rate explicitly requested for the output stream.
-///
-/// `cpal::SAMPLE_RATE_CD` is `44_100`. It is requested by hand because the
-/// 0.18 default sample rate is now 48 kHz.
-#[allow(dead_code)]
+/// Стандартная частота дискретизации Deezer FLAC (44 100 Гц).
 pub const SAMPLE_RATE_HZ: u32 = 44_100;
 
-/// Default (full-gain) volume in packed `f32` bits.
-#[allow(dead_code)]
+/// Битовое представление громкости `1.0f32` для `AtomicU32`.
 pub fn default_volume_bits() -> u32 {
     f32::to_bits(1.0)
 }
 
-/// Zero (mute) in packed `f32` bits.
-#[allow(dead_code)]
+/// Битовое представление тишины `0.0f32` для `AtomicU32`.
 pub fn muted_volume_bits() -> u32 {
     f32::to_bits(0.0)
 }
 
-/// Fill `buffer` from `consumer`, multiplying each sample by the atomic
-/// `volume` (a packed `f32` in [0.0, 1.0], via `f32::from_bits`).
-///
-/// Empty consumer slots are filled with silence (`0.0`) so the function never
-/// blocks — safe to call from a real-time audio callback.
-///
-/// # Returns
-///
-/// The number of slots that received a non-empty sample (i.e. the number of
-/// `pop()` successes).
-#[allow(dead_code)]
+/// Заполняет выходной буфер звуковой карты из `rtrb::Consumer<f32>` без блокировок и аллокаций.
+/// При опустошении кольцевого буфера оставшиеся сэмплы заполняются тишиной (`0.0`).
+#[inline]
 pub fn fill_buffer_from_consumer(
     buffer: &mut [f32],
     consumer: &mut Consumer<f32>,
     volume: &AtomicU32,
 ) -> usize {
-    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+    let vol = f32::from_bits(volume.load(Ordering::Relaxed)).clamp(0.0, 1.0);
     let mut filled = 0;
     for slot in buffer.iter_mut() {
         match consumer.pop() {
@@ -75,189 +54,172 @@ pub fn fill_buffer_from_consumer(
     filled
 }
 
-/// Holds the CPAL output stream and the atomic volume knob.
-///
-/// The rtrb consumer is moved into the real-time callback (see `new`), so the
-/// callback owns it and never blocks on it.
-#[allow(dead_code)]
+/// Управляет потоком вывода `cpal::Stream` и атомарным регулятором громкости.
 pub struct AudioOutput {
-    /// The stream; it keeps the consumer alive via the callback.
     stream: cpal::Stream,
-    /// The atomic volume knob (packed `f32` bits).
     volume: Arc<AtomicU32>,
+    sample_rate: u32,
 }
 
-#[allow(dead_code)]
 impl AudioOutput {
-    /// Open the output stream and move `consumer` into the real-time callback.
-    ///
-    /// # Errors
-    ///
-    /// Returns the CPAL error on device or stream failure.
-    pub fn new(consumer: Consumer<f32>, volume_bits: u32) -> Result<Self, cpal::Error> {
-        let volume = Arc::new(AtomicU32::new(volume_bits));
+    /// Открывает аудиопоток (предпочтительно 44 100 Гц, 2 канала, `f32`), перемещает
+    /// `consumer` внутрь real-time callback и запускает воспроизведение.
+    pub fn new(consumer: Consumer<f32>, initial_volume: f32) -> Result<Self> {
+        let clamped_vol = initial_volume.clamp(0.0, 1.0);
+        let volume = Arc::new(AtomicU32::new(f32::to_bits(clamped_vol)));
+
         let host = cpal::Host::default();
         let device = host
             .default_output_device()
-            .ok_or(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable))?;
+            .context("аудиоустройство вывода по умолчанию не найдено")?;
 
-        // Explicit 44.1 kHz (SAMPLE_RATE_CD). The 0.18 default now prefers 48 kHz.
+        // Ищем стерео F32 конфигурацию с частотой 44 100 Гц (SAMPLE_RATE_CD)
         let config: cpal::StreamConfig = device
             .supported_output_configs()
-            .expect("error while querying configs")
-            .find_map(|r| r.try_with_sample_rate(cpal::SAMPLE_RATE_CD))
-            .expect("device does not support 44.1 kHz")
-            .into();
+            .ok()
+            .and_then(|configs| {
+                configs
+                    .filter(|r| r.channels() == 2 && r.sample_format() == SampleFormat::F32)
+                    .find_map(|r| r.try_with_sample_rate(cpal::SAMPLE_RATE_CD))
+            })
+            .map(Into::into)
+            .or_else(|| device.default_output_config().ok().map(Into::into))
+            .context("не удалось подобрать конфигурацию аудиопотока")?;
 
-        debug_assert!(config.sample_rate == cpal::SAMPLE_RATE_CD, "sample rate mismatch");
+        let actual_sample_rate = config.sample_rate;
+        tracing::info!(
+            sample_rate = actual_sample_rate,
+            channels = config.channels,
+            "аудиопоток CPAL сконфигурирован"
+        );
 
-        let volume_for_cb = volume.clone();
-        // The consumer is moved into the callback, so the callback owns it and
-        // never blocks on it.
+        let volume_for_cb = Arc::clone(&volume);
         let mut consumer_for_cb = consumer;
-        let error_callback = move |e: cpal::Error| {
-            tracing::warn!(target = "audio_output", "stream error: {e:?}");
+
+        let error_callback = move |err: cpal::Error| {
+            tracing::warn!(target: "audio_output", "ошибка потока CPAL: {err:?}");
         };
 
-        let stream = device.build_output_stream(
-            config,
-            move |buffer: &mut [f32], _info: &OutputCallbackInfo| {
-                // Non-blocking: read `buffer.len()` samples from the consumer
-                // (silence on empty) and multiply by the atomic volume.
-                fill_buffer_from_consumer(buffer, &mut consumer_for_cb, &volume_for_cb);
-            },
-            error_callback,
-            None,
-        )?;
+        let stream = device
+            .build_output_stream(
+                config,
+                move |buffer: &mut [f32], _info: &OutputCallbackInfo| {
+                    fill_buffer_from_consumer(buffer, &mut consumer_for_cb, &volume_for_cb);
+                },
+                error_callback,
+                None,
+            )
+            .context("не удалось создать выходной поток CPAL")?;
 
-        Ok(AudioOutput {
+        stream
+            .play()
+            .context("не удалось запустить воспроизведение потока CPAL")?;
+
+        Ok(Self {
             stream,
             volume,
+            sample_rate: actual_sample_rate,
         })
     }
 
-    /// The atomic volume knob (packed `f32` bits).
-    pub fn volume(&self) -> &AtomicU32 {
+    /// Возвращает ссылку на атомарный регулятор громкости.
+    pub fn volume_atomic(&self) -> &Arc<AtomicU32> {
         &self.volume
+    }
+
+    /// Устанавливает громкость в диапазоне `0.0..=1.0` атомарно без блокировок.
+    pub fn set_volume(&self, vol: f32) {
+        let clamped = vol.clamp(0.0, 1.0);
+        self.volume.store(f32::to_bits(clamped), Ordering::Relaxed);
+    }
+
+    /// Возвращает текущее значение громкости `0.0..=1.0`.
+    pub fn get_volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    /// Возвращает фактическую частоту дискретизации открытого потока (Гц).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::ring_buffers::{ AudioRing, VisRing };
     use crate::audio::decoder::write_interleaved_stereo_to_rings;
-    use rtrb::PopError;
+    use crate::audio::ring_buffers::{AudioRing, VisRing};
     use rtrb::RingBuffer;
 
-    /// Drain a consumer into a `Vec<f32>`; used to verify ring contents.
-    fn drain(consumer: &mut Consumer<f32>) -> Vec<f32> {
-        let mut out = Vec::new();
-        loop {
-            match consumer.pop() {
-                Ok(s) => out.push(s),
-                Err(PopError::Empty) => break,
-            }
-        }
-        out
-    }
-
-    /// A fresh consumer seeded with the given samples.
     fn consumer_with(samples: &[f32]) -> Consumer<f32> {
-        let (mut producer, consumer) = RingBuffer::<f32>::new(samples.len());
+        let (mut producer, consumer) = RingBuffer::<f32>::new(samples.len().max(1));
         for &s in samples {
             producer.push(s).unwrap();
         }
         consumer
     }
 
-    /// The output callback must fill the buffer from the rtrb consumer
-    /// (non-blocking) and apply the atomic volume.
     #[test]
     fn fill_buffer_applies_volume_and_silence_on_empty() {
-        let mut consumer = consumer_with(&[0.5f32, -0.5f32, 0.25f32, 1.0, 0.0, -1.0]);
+        let mut consumer = consumer_with(&[0.5, -0.5, 0.25, 1.0, 0.0, -1.0]);
         let mut buffer = [0.0f32; 6];
-        let volume = Arc::new(AtomicU32::new(f32::to_bits(1.0)));
+        let volume = AtomicU32::new(default_volume_bits());
+
         let filled = fill_buffer_from_consumer(&mut buffer, &mut consumer, &volume);
         assert_eq!(filled, 6);
-        assert!((buffer[0] - 0.5f32).abs() < 1e-6);
-        assert!((buffer[1] + 0.5f32).abs() < 1e-6);
-        assert!((buffer[2] - 0.25f32).abs() < 1e-6);
-        assert!((buffer[3] - 1.0f32).abs() < 1e-6);
-        assert!((buffer[4] - 0.0f32).abs() < 1e-6);
-        assert!((buffer[5] + 1.0f32).abs() < 1e-6);
+        assert!((buffer[0] - 0.5).abs() < 1e-6);
+        assert!((buffer[1] + 0.5).abs() < 1e-6);
+        assert!((buffer[2] - 0.25).abs() < 1e-6);
+        assert!((buffer[3] - 1.0).abs() < 1e-6);
+        assert!((buffer[4] - 0.0).abs() < 1e-6);
+        assert!((buffer[5] + 1.0).abs() < 1e-6);
     }
 
-    /// Half gain (0.5) halves every sample.
     #[test]
     fn fill_buffer_halves_with_half_gain() {
-        let mut consumer = consumer_with(&[1.0f32, -1.0f32, 0.0]);
+        let mut consumer = consumer_with(&[1.0, -1.0, 0.4]);
         let mut buffer = [0.0f32; 3];
-        let volume = Arc::new(AtomicU32::new(f32::to_bits(0.5f32)));
-        fill_buffer_from_consumer(&mut buffer, &mut consumer, &volume);
-        assert!((buffer[0] - 0.5f32).abs() < 1e-6);
-        assert!((buffer[1] + 0.5f32).abs() < 1e-6);
-        assert!((buffer[2] - 0.0f32).abs() < 1e-6);
-    }
+        let volume = AtomicU32::new(f32::to_bits(0.5));
 
-    /// An empty consumer fills every slot with silence and never blocks.
-    #[test]
-    fn fill_buffer_empty_consumer_fills_silence() {
-        let mut consumer = consumer_with(&[0.0f32]);
-        let mut buffer = [0.0f32; 16];
-        let volume = Arc::new(AtomicU32::new(f32::to_bits(1.0f32)));
         let filled = fill_buffer_from_consumer(&mut buffer, &mut consumer, &volume);
-        assert_eq!(filled, 1);
-        assert_eq!(buffer[0], 0.0f32);
-        for s in buffer.iter().skip(1) {
-            assert_eq!(*s, 0.0f32);
-        }
+        assert_eq!(filled, 3);
+        assert!((buffer[0] - 0.5).abs() < 1e-6);
+        assert!((buffer[1] + 0.5).abs() < 1e-6);
+        assert!((buffer[2] - 0.2).abs() < 1e-6);
     }
 
-    /// A partially-filled consumer fills the available samples and
-    /// silences the rest.
     #[test]
-    fn fill_buffer_partial_fills_available_then_silence() {
-        let mut consumer = consumer_with(&[0.3f32, 0.7f32]);
-        let mut buffer = [0.0f32; 4];
-        let volume = Arc::new(AtomicU32::new(f32::to_bits(1.0f32)));
+    fn fill_buffer_underrun_fills_silence_without_blocking() {
+        let mut consumer = consumer_with(&[0.3, 0.7]);
+        let mut buffer = [1.0f32; 6];
+        let volume = AtomicU32::new(default_volume_bits());
+
         let filled = fill_buffer_from_consumer(&mut buffer, &mut consumer, &volume);
         assert_eq!(filled, 2);
-        assert!((buffer[0] - 0.3f32).abs() < 1e-6);
-        assert!((buffer[1] - 0.7f32).abs() < 1e-6);
-        assert_eq!(buffer[2], 0.0f32);
-        assert_eq!(buffer[3], 0.0f32);
+        assert!((buffer[0] - 0.3).abs() < 1e-6);
+        assert!((buffer[1] - 0.7).abs() < 1e-6);
+        assert_eq!(&buffer[2..], &[0.0, 0.0, 0.0, 0.0]);
     }
 
-    /// End-to-end: write a generated stereo buffer into the rtrb audio ring,
-    /// drain it into a `Consumer`, then feed it to `fill_buffer_from_consumer`
-    /// at full gain — the output buffer must match the input exactly.
     #[test]
     fn end_to_end_rtrb_to_output_buffer() {
         let frames = 1_000usize;
-        let mut stereo: Vec<f32> = Vec::with_capacity(frames * 2);
+        let mut stereo = Vec::with_capacity(frames * 2);
         for i in 0..frames {
-            let t = (i as f64) * 2.0 * std::f64::consts::PI * 440.0 / 44_100.0;
-            let s = t.sin() as f32;
+            let s = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44_100.0).sin();
             stereo.push(s);
             stereo.push(s);
         }
+
         let mut audio = AudioRing::new();
         let mut vis = VisRing::new();
         write_interleaved_stereo_to_rings(&stereo, audio.producer(), vis.producer());
-        let drained = drain(&mut audio.consumer());
-        assert_eq!(drained, stereo);
 
-        // The CPAL callback reads the ring one buffer at a time; feed the
-        // drained stereo through the consumer at full gain and check the
-        // output matches the input.
-        let mut consumer = consumer_with(&drained);
-        let mut buffer = vec![0.0f32; drained.len()];
-        fill_buffer_from_consumer(
-            &mut buffer,
-            &mut consumer,
-            &Arc::new(AtomicU32::new(f32::to_bits(1.0f32))),
-        );
-        assert_eq!(buffer, drained, "full-gain output must match input");
+        let mut output_buf = vec![0.0f32; stereo.len()];
+        let volume = AtomicU32::new(default_volume_bits());
+        let filled = fill_buffer_from_consumer(&mut output_buf, audio.consumer(), &volume);
+
+        assert_eq!(filled, stereo.len());
+        assert_eq!(output_buf, stereo);
     }
 }

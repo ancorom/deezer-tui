@@ -179,8 +179,8 @@ mod tests {
         assert_eq!(dec, original, "decrypt_stream(encrypt_stream(P)) == P");
         // Чанки 1, 2, 4, 5 (не кратные 3) не менялись при шифровании:
         assert_eq!(
-            enc[(1 * CHUNK_SIZE)..(1 * CHUNK_SIZE + CHUNK_SIZE)],
-            original[(1 * CHUNK_SIZE)..(1 * CHUNK_SIZE + CHUNK_SIZE)],
+            enc[(CHUNK_SIZE)..(2 * CHUNK_SIZE)],
+            original[(CHUNK_SIZE)..(2 * CHUNK_SIZE)],
         );
         assert_eq!(
             enc[(2 * CHUNK_SIZE)..(2 * CHUNK_SIZE + CHUNK_SIZE)],

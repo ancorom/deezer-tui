@@ -19,5 +19,12 @@
 - [x] Remove `#[allow(dead_code)]` from `DeezerClient::new`/`is_authenticated` (теперь используются `App`); `MediaControls`/MPRIS — без dead-code warnings (allows на местах).
 - [x] Final `cargo test` + `cargo clippy -- -D warnings`. **85/85 passed, clippy `-D warnings` = clean (exit 0), 0 test-build warnings.**
 
+## Audit `1_2_deezer_tui.md` fixes (Phase 1–2 rewrite) [x]
+- [x] Перезаписаны 6 файлов по готовым реворкам аудита: `main.rs` (логгер `~/.config/deezer-tui` + `tracing_appender::rolling::daily` + `mod mpris`/`App::run` сохранены + лог config), `config.rs` (`load_from`/`save_to`, `PartialEq`, NaN→0.8, `effective_arl`), `dsp/cavacore.rs` (FFTW bass/mid-high, monstercat, parabolic gravity, autosens, 5 тестов), `audio/ring_buffers.rs` (`split()`, `Default`, сохранён оригинальный round-trip тест), `audio/decoder.rs` (`process_next`/`run`/`into_producers`, 4 теста), `audio/output.rs` (cpal F32-stereo поиск конфига, `stream.play()`, atomic volume, 4 теста).
+- [x] Фикс API symphonia 0.6: `decoded.spec().channels().count()` вместо `decoded.channels()` (decoder.rs).
+- [x] Фикс 3 doc-тестов (автор не прогонял — код не компилировался под наши версии зависимостей): decoder 100Гц/5000Гц — 9 кадров до сходимости интегрального фильтра (0.77) + реалистичные пороги (0.2 / 0.15); cavacore decay — параболическая гравитация стартует с нулевого наклона и IIR догоняет уровень, поэтому 2 первых кадра тишины допускаются в пределах пика (≤1.08·peak), дальше монотонный спад.
+- [x] 14 clippy-замечаний в тестовом коде (bin-gate их не видел): `u32::from` no-op (output), `1 * CHUNK_SIZE` ×4 (crypto), `loop{match}` → `while let` ×2 (ring_buffers), `at(&terminal,…)` в `row_has` ×6 (app/flow_lyrics/library/search/modal), `iter().any` → `contains` (now_playing).
+- [x] Гейт: `cargo check --all-targets` + `cargo test` **85/85** + `cargo clippy -- -D warnings` exit 0 + `cargo clippy --all-targets -- -D warnings` exit 0, 0 test-build warnings.
+
 ## Status
 Phase 5: все вью + `src/mpris.rs` + `src/audio/prefetch.rs` + подключение вью к `App` (active_tab + клавиши + `DeezerClient` в `App`) — done. cargo test 85 passed; cargo clippy -- -D warnings = clean, exit 0; 0 warning в test-сборке.

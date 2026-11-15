@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(at(&terminal, 0, 0), '▀');
         // Track text present in row 1 (first non-space is 'B').
         let track_row: Vec<char> = (0..120).map(|x| at(&terminal, x, 1)).collect();
-        assert!(track_row.iter().any(|c| *c == 'B'));
+        assert!(track_row.contains(&'B'));
         // Progress bar contains the `●` cursor (progress row = 18 for h=40).
         let mut found_cursor = false;
         for x in 0..120 {

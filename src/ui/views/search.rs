@@ -519,7 +519,7 @@ mod tests {
     fn row_has(terminal: &Terminal<TestBackend>, y: u16, needle: &str) -> bool {
         let width = terminal.size().unwrap().width;
         let row: String = (0..width)
-            .map(|x| at(&terminal, x, y))
+            .map(|x| at(terminal, x, y))
             .collect();
         row.contains(needle)
     }

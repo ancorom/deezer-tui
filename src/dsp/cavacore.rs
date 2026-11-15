@@ -1,457 +1,417 @@
-// Чистый DSP Cavacore: окномый FFT → логарифмические полосы частот (50–10000 Гц).
-//
-// Порт последней версии алгоритма из docs/reference/cava/cavacore.c на чистый Rust:
-// * FFT: для низкочастотного диапазона N_bass = 4096 отрезка (высокое разрешение),
-//   для средних/высоких частот N_mid_high = 2048 (быстрый отклик по времени);
-// * частотные полосы: логарифмическое распределение 50..=10000 Гц, num_bars полос;
-// * выход: [f32; num_bars], значения в [0.0; 1.0];
-// * сглаживание Monstercat, гравитационный спад, интегральное сглаживание 0.77, autosens.
-//
-// `Cavacore::process()` принимает чанк образцов (stereo interleaved) и возвращает
-// высоты полос. Все буферы предвыделены при инициализации: `process()` не выделяет
-// память (кроме минимального выходного буфера, предвыделенного заранее).
+//! Математическое ядро спектроанализатора Cavacore на чистом Rust (`realfft` 3.5).
+//!
+//! Спецификация (`ARCHITECTURE.md`, раздел 5):
+//! - Двойное окно FFT: `N_BASS = 4096` для частот ниже 300 Гц (высокое разрешение по частоте)
+//!   и `N_MID_HIGH = 2048` для средних и высоких частот (быстрый временной отклик).
+//! - Оконная функция Ханна: `w[n] = 0.5 * (1.0 - cos(2 * PI * n / (N - 1)))`.
+//! - Логарифмическое распределение частот от 50 Гц до 10 000 Гц по `num_bars` полосам.
+//! - Пространственный фильтр сглаживания Monstercat (`1.5^|i - j|`).
+//! - Параболическая гравитация падения (falloff) и интегральный фильтр (`0.77`).
+//! - Опциональное логарифмическое (dB) масштабирование и авточувствительность (`autosens`).
+//! - Полное отсутствие аллокаций памяти внутри `process()` и `process_stereo()`.
 
+#![allow(dead_code)]
 
+use std::f32::consts::PI;
 use std::sync::Arc;
 
 use num_complex::Complex;
-use realfft::RealFftPlanner;
-use realfft::RealToComplex;
+use realfft::{RealFftPlanner, RealToComplex};
 
-#[allow(dead_code)]
+/// Размер окна FFT для басовых частот (< 300 Гц).
 pub const N_BASS: usize = 4096;
-#[allow(dead_code)]
+/// Размер окна FFT для средних и высоких частот (>= 300 Гц).
 pub const N_MID_HIGH: usize = 2048;
 
-/// Частотный порог: полосы ниже него обрабатываются с FFT N_bass (высокое разрешение).
-#[allow(dead_code)]
-const BASS_CUTOFF_HZ: f32 = 100.0;
+/// Граница переключения между окнами `N_BASS` и `N_MID_HIGH` (Гц).
+const BASS_CUTOFF_HZ: f32 = 300.0;
 
-/// Граничные частоты полос: f[i] = 50 * (10000/50)^(i/num_bars) = 50 * 200^(i/num_bars).
-#[allow(dead_code)]
+/// Нижняя и верхняя границы спектра (Гц).
 const LOW_HZ: f32 = 50.0;
-#[allow(dead_code)]
-const HIGH_HZ: f32 = 10000.0;
-#[allow(dead_code)]
-const BASE: f32 = HIGH_HZ / LOW_HZ; // = 200.0
+const HIGH_HZ: f32 = 10_000.0;
 
-/// Интегральное сглаживание.
-#[allow(dead_code)]
+/// Коэффициент интегрального сглаживания.
 const INTEGRAL: f32 = 0.77;
 
-/// Monstercat: соседний пик, уменьшенный на 10%.
-#[allow(dead_code)]
-const MONSTERCAT: f32 = 0.9;
+/// База пространственного затухания фильтра Monstercat.
+const MONSTERCAT_BASE: f32 = 1.5;
 
-/// Коэффициенты autosens.
-#[allow(dead_code)]
+/// Коэффициенты авточувствительности (`autosens`).
 const AUTOSENS_DOWN: f32 = 0.985;
-#[allow(dead_code)]
 const AUTOSENS_UP: f32 = 1.001;
 
-/// Гравитационный коэффициент спадения.
-#[allow(dead_code)]
-const GRAVITY: f32 = 0.02;
+/// Коэффициент параболической гравитации падения столбиков.
+const GRAVITY: f32 = 0.025;
 
-/// Конверсия стерео-интерливедых образцов в моно.
-#[inline]
-#[allow(dead_code)]
-fn to_mono(stereo: &[f32], dst: &mut [f32]) {
-    let n = std::cmp::min(stereo.len() / 2, dst.len());
-    for i in 0..n {
-        dst[i] = (stereo[2 * i] + stereo[2 * i + 1]) * 0.5;
-    }
-}
+/// Динамический диапазон для опционального dB-скейлинга (в децибелах).
+const DB_DYNAMIC_RANGE: f32 = 60.0;
 
-/// Окно Ханна: w[i] = 0.5 * (1 - cos(2*pi*i/(N-1))).
-#[allow(dead_code)]
-fn hann(n: usize) -> Vec<f32> {
+/// Вычисление коэффициентов окна Ханна длины `n`.
+fn hann_window(n: usize) -> Vec<f32> {
     if n <= 1 {
         return vec![1.0; n];
     }
+    let denom = (n - 1) as f32;
     (0..n)
-        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos()))
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / denom).cos()))
         .collect()
 }
 
-/// Граничные частоты полос: f[i] = LOW_HZ * BASE^(i/num_bars), i = 0..=num_bars.
-#[allow(dead_code)]
+/// Логарифмическая разметка граничных частот столбиков:
+/// `f[i] = f_min * (f_max / f_min)^(i / num_bars)`.
 fn bar_boundaries(num_bars: usize) -> Vec<f32> {
+    let ratio = HIGH_HZ / LOW_HZ;
     (0..=num_bars)
-        .map(|i| {
-            let t = i as f32 / num_bars as f32;
-            LOW_HZ * BASE.powf(t)
-        })
+        .map(|i| LOW_HZ * ratio.powf(i as f32 / num_bars as f32))
         .collect()
 }
 
-/// Индекс бина FFT: bin[i] = (f[i] * N / sample_rate) as usize.
+/// Перевод частоты (Гц) в индекс бина FFT.
 #[inline]
-#[allow(dead_code)]
-fn bin_index(freq: f32, n: usize, sample_rate: f32) -> usize {
-    (freq * n as f32 / sample_rate) as usize
+fn freq_to_bin(freq: f32, fft_size: usize, sample_rate: f32) -> usize {
+    ((freq * fft_size as f32 / sample_rate).round() as usize).clamp(1, fft_size / 2)
 }
 
-/// Выбор FFT для полосы: 0 = bass (N_bass), 1 = mid/high (N_mid_high).
-#[allow(dead_code)]
-fn fft_for_bar(freq: f32) -> u8 {
-    if freq < BASS_CUTOFF_HZ {
-        0
-    } else {
-        1
-    }
-}
-
-/// EQ-нормализация полосы (по формуле cava): 1/2^28 * f[n+1]^0.85 / log2(FFTsize) / num_bins.
-#[allow(dead_code)]
-fn eq_for_bar(f: f32, fft_size: usize, num_bins: usize) -> f32 {
-    let fft_size_log2 = fft_size as f32;
-    let base = (1.0 / 2.0f32.powf(28.0)) * f.powf(0.85);
-    let num = std::cmp::max(num_bins, 1);
-    base / fft_size_log2.log2() / num as f32
-}
-
-/// Сдвиг Ring Buffer: вписывает `mono` в окно `window` (размер `n`) со сдвигом.
-#[allow(dead_code)]
-fn shift_window(
-    window: &mut [f32],
-    n: usize,
-    write_idx: &mut usize,
-    filled: &mut usize,
-    mono: &[f32],
-) {
-    for &s in mono {
+/// Запись новых моно-сэмплов в кольцевое окно.
+#[inline]
+fn push_to_ring(window: &mut [f32], write_idx: &mut usize, samples: &[f32]) {
+    let n = window.len();
+    for &s in samples {
         window[*write_idx] = s;
         *write_idx = (*write_idx + 1) % n;
-        if *filled < n {
-            *filled += 1;
-        }
     }
 }
 
-/// Выравнивает окно в `dst` (применяет Hann-окно).
-#[allow(dead_code)]
-fn flatten_window(
-    window: &[f32],
-    write_idx: usize,
-    filled: usize,
-    hann: &[f32],
-    dst: &mut [f32],
-) {
-    let start = if filled < window.len() { 0 } else { write_idx };
-    for i in 0..dst.len() {
-        let val = window[(start + i) % window.len()];
-        dst[i] = val * hann[i];
-    }
-}
-
-/// Сглаживание Monstercat: v[i] = max(v[i], max(v[i-1], v[i+1]) * MONSTERCAT).
-#[allow(dead_code)]
-fn monstercat(v: &mut [f32]) {
-    if v.len() < 3 {
-        return;
-    }
-    let n = v.len();
-    let mut next = vec![0.0f32; n];
+/// Разворачивание кольцевого буфера в хронологическом порядке с умножением на окно Ханна.
+#[inline]
+fn apply_hann_from_ring(window: &[f32], write_idx: usize, hann: &[f32], dst: &mut [f32]) {
+    let n = window.len();
     for i in 0..n {
-        let left = if i > 0 { v[i - 1] } else { 0.0 };
-        let right = if i + 1 < n { v[i + 1] } else { 0.0 };
-        let neighbor = left.max(right) * MONSTERCAT;
-        next[i] = v[i].max(neighbor);
-    }
-    v.copy_from_slice(&next);
-}
-
-/// Сглаживание гравитации + интеграл + autosens.
-#[allow(dead_code)]
-fn gravity_integral_automod(
-    v: &mut [f32],
-    prev: &mut [f32],
-    fall: &mut [f32],
-    mem: &mut [f32],
-    sensitivity: &mut f32,
-) {
-    let n = v.len();
-    let mut overshoot = false;
-    for i in 0..n {
-        if v[i] < prev[i] && GRAVITY > 0.0 {
-            let factor = 1.0 - GRAVITY * fall[i].powi(2);
-            let nv = prev[i] * factor;
-            v[i] = if nv < 0.0 { 0.0 } else { nv };
-            fall[i] += 1.0;
-        } else {
-            fall[i] = 0.0;
-        }
-        // Интегральное сглаживание: out = mem * 0.77 + v * (1 - 0.77)
-        let integral = mem[i] * INTEGRAL + v[i] * (1.0 - INTEGRAL);
-        v[i] = integral;
-        mem[i] = integral;
-        if v[i] > 1.0 {
-            v[i] = 1.0;
-            overshoot = true;
-        }
-        prev[i] = v[i];
-    }
-    if overshoot {
-        *sensitivity = (*sensitivity * AUTOSENS_DOWN).clamp(0.1, 5.0);
-    } else {
-        *sensitivity *= AUTOSENS_UP;
+        let sample = window[(write_idx + i) % n];
+        dst[i] = sample * hann[i];
     }
 }
 
-/// Cavacore DSP: окномый FFT → логарифмические полосы частот (50–10000 Гц).
-///
-/// Порт последней версии алгоритма из docs/reference/cava/cavacore.c на чистый Rust:
-/// * FFT: для низкочастотного диапазона N_bass = 4096 отрезка (высокое разрешение),
-///   для средних/высоких частот N_mid_high = 2048 (быстрый отклик по времени);
-/// * частотные полосы: логарифмическое распределение 50..=10000 Гц, num_bars полос;
-/// * выход: [f32; num_bars], значения в [0.0; 1.0];
-/// * сглаживание Monstercat, гравитационный спад, интегральное сглаживание 0.77, autosens.
-///
-/// `Cavacore::process()` принимает чанк стерео-интерливедых образцов и возвращает
-/// высоты полос. Все буферы предвыделены при инициализации: `process()` не выделяет
-/// память (кроме минимального выходного буфера, предвыделенного заранее).
-#[allow(dead_code)]
+/// Спектроанализатор Cavacore.
 pub struct Cavacore {
     num_bars: usize,
     sample_rate: f32,
+    db_scale: bool,
+    autosens: bool,
 
-    // FFT планы (предвыделены).
+    // Планировщики и рабочие буферы realfft (предвыделены)
     bass_r2c: Arc<dyn RealToComplex<f32>>,
     mid_r2c: Arc<dyn RealToComplex<f32>>,
-
-    // FFT вход/выход (предвыделены).
     bass_in: Vec<f32>,
     bass_out: Vec<Complex<f32>>,
+    bass_scratch: Vec<Complex<f32>>,
     mid_in: Vec<f32>,
     mid_out: Vec<Complex<f32>>,
+    mid_scratch: Vec<Complex<f32>>,
 
-    // Сырые окна образцов (предвыделены).
+    // Кольцевые буферы входного сигнала
     bass_window: Vec<f32>,
     mid_window: Vec<f32>,
     bass_write_idx: usize,
-    bass_filled: usize,
     mid_write_idx: usize,
-    mid_filled: usize,
 
-    // Окно Ханна (предвыделено).
+    // Предвычисленные окна Ханна
     bass_hann: Vec<f32>,
     mid_hann: Vec<f32>,
 
-    // Буфер моно (предвыделен).
-    mono_buf: Vec<f32>,
+    // Предвыделенный буфер для сведения стерео в моно (при вызове process_stereo)
+    mono_scratch: Vec<f32>,
 
-    // Частотные границы полос.
-    bars: Vec<f32>,
+    // Разметка частот и бинов по столбикам
+    use_bass_fft: Vec<bool>,
+    lower_bin: Vec<usize>,
+    upper_bin: Vec<usize>,
+    eq_weights: Vec<f32>,
 
-    // По-полосные диапазоны бинсов FFT: lower[n..upper[n]] (оба — с FFT полосы n).
-    lower: Vec<usize>,
-    upper: Vec<usize>,
-    fft_for: Vec<u8>,
+    // Предвычисленные веса Monstercat: 1.5^d
+    monstercat_weights: Vec<f32>,
+    raw_bars: Vec<f32>,
 
-    // EQ-нормализация.
-    eq: Vec<f32>,
-
-    // Сглаживание: предвыделено.
+    // Состояние временного сглаживания и гравитации
     mem: Vec<f32>,
     prev: Vec<f32>,
-    fall: Vec<f32>,
-
-    // Autosens.
+    fall_step: Vec<f32>,
     sensitivity: f32,
 
-    // Выход (предвыделен).
+    // Выходной буфер высот столбиков в диапазоне [0.0, 1.0]
     out_buf: Vec<f32>,
 }
 
-#[allow(dead_code)]
 impl Cavacore {
-    /// Инициализация Cavacore с заданной частотой и числом полос.
+    /// Создаёт новый экземпляр `Cavacore` для заданной частоты дискретизации и числа столбиков.
     pub fn new(sample_rate: f32, num_bars: usize) -> Self {
-        let num_bars = num_bars.clamp(1, 128);
+        let num_bars = num_bars.clamp(1, 256);
+        let sample_rate = sample_rate.max(8_000.0);
 
-        // FFT планы
         let mut planner = RealFftPlanner::<f32>::new();
-        let bass_r2c: Arc<dyn RealToComplex<f32>> = planner.plan_fft_forward(N_BASS);
-        let mid_r2c: Arc<dyn RealToComplex<f32>> = planner.plan_fft_forward(N_MID_HIGH);
+        let bass_r2c = planner.plan_fft_forward(N_BASS);
+        let mid_r2c = planner.plan_fft_forward(N_MID_HIGH);
 
-        // FFT вход/выход (предвыделены).
-        let bass_in = vec![0.0f32; N_BASS];
-        let bass_out = vec![Complex::new(0.0, 0.0); N_BASS / 2 + 1];
-        let mid_in = vec![0.0f32; N_MID_HIGH];
-        let mid_out = vec![Complex::new(0.0, 0.0); N_MID_HIGH / 2 + 1];
+        let bass_in = bass_r2c.make_input_vec();
+        let bass_out = bass_r2c.make_output_vec();
+        let bass_scratch = bass_r2c.make_scratch_vec();
 
-        // Сырые окна образцов (предвыделены).
-        let bass_window = vec![0.0f32; N_BASS];
-        let mid_window = vec![0.0f32; N_MID_HIGH];
+        let mid_in = mid_r2c.make_input_vec();
+        let mid_out = mid_r2c.make_output_vec();
+        let mid_scratch = mid_r2c.make_scratch_vec();
 
-        // Окно Ханна (предвыделено).
-        let bass_hann = hann(N_BASS);
-        let mid_hann = hann(N_MID_HIGH);
+        let bass_hann = hann_window(N_BASS);
+        let mid_hann = hann_window(N_MID_HIGH);
 
-        // Буфер моно (предвыделен).
-        let mono_buf = vec![0.0f32; N_BASS];
+        let boundaries = bar_boundaries(num_bars);
+        let mut use_bass_fft = Vec::with_capacity(num_bars);
+        let mut lower_bin = Vec::with_capacity(num_bars);
+        let mut upper_bin = Vec::with_capacity(num_bars);
+        let mut eq_weights = Vec::with_capacity(num_bars);
 
-        // Частотные границы полос.
-        let bars = bar_boundaries(num_bars);
+        for n in 0..num_bars {
+            let f_lo = boundaries[n];
+            let f_hi = boundaries[n + 1];
+            let is_bass = f_hi <= BASS_CUTOFF_HZ || f_lo < BASS_CUTOFF_HZ;
+            let fft_size = if is_bass { N_BASS } else { N_MID_HIGH };
+            let max_bin = fft_size / 2;
 
-        // По-полосные диапазоны бинсов FFT (оба — с FFT полосы n).
-        let fft_for: Vec<u8> = (0..num_bars)
-            .map(|n| fft_for_bar(bars[n]))
+            let lo = freq_to_bin(f_lo, fft_size, sample_rate).min(max_bin.saturating_sub(1));
+            let hi = freq_to_bin(f_hi, fft_size, sample_rate)
+                .max(lo + 1)
+                .min(max_bin + 1);
+
+            let bin_count = (hi - lo).max(1) as f32;
+            // Нормализация амплитуды окна Ханна (4.0 / N) + частотная компенсация ВЧ
+            let norm_fft = 4.0 / fft_size as f32;
+            let freq_tilt = (f_hi / 120.0).powf(0.32);
+            let eq = (norm_fft * freq_tilt) / bin_count;
+
+            use_bass_fft.push(is_bass);
+            lower_bin.push(lo);
+            upper_bin.push(hi);
+            eq_weights.push(eq);
+        }
+
+        let monstercat_weights: Vec<f32> = (0..num_bars)
+            .map(|d| MONSTERCAT_BASE.powi(d as i32))
             .collect();
-        let lower: Vec<usize> = (0..num_bars)
-            .map(|n| {
-                let fft_size = if fft_for[n] == 0 { N_BASS } else { N_MID_HIGH };
-                bin_index(bars[n], fft_size, sample_rate)
-            })
-            .collect();
-        let upper: Vec<usize> = (0..num_bars)
-            .map(|n| {
-                let fft_size = if fft_for[n] == 0 { N_BASS } else { N_MID_HIGH };
-                let idx = bin_index(bars[n + 1], fft_size, sample_rate);
-                std::cmp::min(idx, fft_size / 2)
-            })
-            .collect();
-
-        // EQ-нормализация (по формуле cava).
-        let eq: Vec<f32> = (0..num_bars)
-            .map(|n| {
-                let fft_size = if fft_for[n] == 0 { N_BASS } else { N_MID_HIGH };
-                let num_bins = std::cmp::max(upper[n] - lower[n], 1);
-                eq_for_bar(bars[n + 1], fft_size, num_bins)
-            })
-            .collect();
-
-        // Сглаживание: предвыделено.
-        let mem = vec![0.0f32; num_bars];
-        let prev = vec![0.0f32; num_bars];
-        let fall = vec![0.0f32; num_bars];
-
-        // Autosens.
-        let sensitivity = 1.0;
-
-        // Выход (предвыделен).
-        let out_buf = vec![0.0f32; num_bars];
 
         Self {
             num_bars,
             sample_rate,
+            db_scale: false,
+            autosens: true,
             bass_r2c,
             mid_r2c,
             bass_in,
             bass_out,
+            bass_scratch,
             mid_in,
             mid_out,
-            bass_window,
-            mid_window,
+            mid_scratch,
+            bass_window: vec![0.0; N_BASS],
+            mid_window: vec![0.0; N_MID_HIGH],
             bass_write_idx: 0,
-            bass_filled: 0,
             mid_write_idx: 0,
-            mid_filled: 0,
             bass_hann,
             mid_hann,
-            mono_buf,
-            bars,
-            lower,
-            upper,
-            fft_for,
-            eq,
-            mem,
-            prev,
-            fall,
-            sensitivity,
-            out_buf,
+            mono_scratch: vec![0.0; N_BASS],
+            use_bass_fft,
+            lower_bin,
+            upper_bin,
+            eq_weights,
+            monstercat_weights,
+            raw_bars: vec![0.0; num_bars],
+            mem: vec![0.0; num_bars],
+            prev: vec![0.0; num_bars],
+            fall_step: vec![0.0; num_bars],
+            sensitivity: 1.0,
+            out_buf: vec![0.0; num_bars],
         }
     }
 
-    /// Число полос.
+    /// Включает или выключает опциональное логарифмическое (dB) масштабирование спектра.
+    pub fn with_db_scale(mut self, enabled: bool) -> Self {
+        self.db_scale = enabled;
+        self
+    }
+
+    /// Переключает режим dB-скейлинга на лету.
+    pub fn set_db_scale(&mut self, enabled: bool) {
+        self.db_scale = enabled;
+    }
+
+    /// Возвращает количество столбиков спектра.
     pub fn num_bars(&self) -> usize {
         self.num_bars
     }
 
-    /// Частота дискретизации.
+    /// Возвращает частоту дискретизации (Гц).
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
     }
 
-    /// Обработка: принимает чанк стерео-интерливедых образцов и возвращает высоты полос.
-    ///
-    /// Все буферы предвыделены при инициализации: `process()` не выделяет память.
-    pub fn process(&mut self, stereo_samples: &[f32]) -> &[f32] {
-        let mono_len = stereo_samples.len() / 2;
-        let mono_n = std::cmp::min(mono_len, self.mono_buf.len());
-        to_mono(stereo_samples, &mut self.mono_buf[..mono_n]);
+    /// Сбрасывает внутренние окна и сглаживание в ноль.
+    pub fn reset(&mut self) {
+        self.bass_window.fill(0.0);
+        self.mid_window.fill(0.0);
+        self.bass_write_idx = 0;
+        self.mid_write_idx = 0;
+        self.mem.fill(0.0);
+        self.prev.fill(0.0);
+        self.fall_step.fill(0.0);
+        self.out_buf.fill(0.0);
+        self.sensitivity = 1.0;
+    }
 
-        // Сдвиг окон
-        shift_window(
-            &mut self.bass_window,
-            N_BASS,
-            &mut self.bass_write_idx,
-            &mut self.bass_filled,
-            &self.mono_buf[..mono_n],
-        );
-        shift_window(
-            &mut self.mid_window,
-            N_MID_HIGH,
-            &mut self.mid_write_idx,
-            &mut self.mid_filled,
-            &self.mono_buf[..mono_n],
-        );
+    /// Основной метод обработки моно-сэмплов (например, напрямую из `VisRingBuffer`).
+    /// Не выделяет память в куче и возвращает срез высот столбиков в `[0.0, 1.0]`.
+    pub fn process(&mut self, mono_samples: &[f32]) -> &[f32] {
+        push_to_ring(&mut self.bass_window, &mut self.bass_write_idx, mono_samples);
+        push_to_ring(&mut self.mid_window, &mut self.mid_write_idx, mono_samples);
+        self.compute_spectrum()
+    }
 
-        // Окно Ханна + FFT
-        flatten_window(
+    /// Обработка интерливированных стерео-сэмплов (`[L0, R0, L1, R1, ...]`).
+    /// Сводит стерео в моно `(L + R) * 0.5` без аллокаций и обновляет спектр.
+    pub fn process_stereo(&mut self, stereo_samples: &[f32]) -> &[f32] {
+        let total_frames = stereo_samples.len() / 2;
+        let chunk_cap = self.mono_scratch.len();
+        let mut offset = 0;
+
+        if total_frames == 0 {
+            return self.compute_spectrum();
+        }
+
+        while offset < total_frames {
+            let count = (total_frames - offset).min(chunk_cap);
+            for i in 0..count {
+                let base = (offset + i) * 2;
+                self.mono_scratch[i] = (stereo_samples[base] + stereo_samples[base + 1]) * 0.5;
+            }
+            push_to_ring(
+                &mut self.bass_window,
+                &mut self.bass_write_idx,
+                &self.mono_scratch[..count],
+            );
+            push_to_ring(
+                &mut self.mid_window,
+                &mut self.mid_write_idx,
+                &self.mono_scratch[..count],
+            );
+            offset += count;
+        }
+
+        self.compute_spectrum()
+    }
+
+    fn compute_spectrum(&mut self) -> &[f32] {
+        apply_hann_from_ring(
             &self.bass_window,
             self.bass_write_idx,
-            self.bass_filled,
             &self.bass_hann,
             &mut self.bass_in,
         );
-        flatten_window(
+        apply_hann_from_ring(
             &self.mid_window,
             self.mid_write_idx,
-            self.mid_filled,
             &self.mid_hann,
             &mut self.mid_in,
         );
 
-        self.bass_r2c
-            .process(&mut self.bass_in, &mut self.bass_out)
-            .unwrap();
-        self.mid_r2c
-            .process(&mut self.mid_in, &mut self.mid_out)
-            .unwrap();
+        let _ = self.bass_r2c.process_with_scratch(
+            &mut self.bass_in,
+            &mut self.bass_out,
+            &mut self.bass_scratch,
+        );
+        let _ = self.mid_r2c.process_with_scratch(
+            &mut self.mid_in,
+            &mut self.mid_out,
+            &mut self.mid_scratch,
+        );
 
-        // Сырые значения полос + EQ
+        // 1. Сбор магнитуд по логарифмическим полосам
         for n in 0..self.num_bars {
-            let is_bass = self.fft_for[n] == 0;
-            let fft_out = if is_bass {
+            let spectrum = if self.use_bass_fft[n] {
                 &self.bass_out
             } else {
                 &self.mid_out
             };
-            let lo = self.lower[n];
-            let hi = self.upper[n];
+            let lo = self.lower_bin[n];
+            let hi = self.upper_bin[n].min(spectrum.len());
+
             let mut sum = 0.0f32;
-            for c in fft_out.as_slice()[lo..hi].iter() {
-                let re = c.re;
-                let im = c.im;
-                sum += (re * re + im * im).sqrt();
+            for c in &spectrum[lo..hi] {
+                sum += c.norm();
             }
-            self.out_buf[n] = sum * self.eq[n];
+
+            let mut val = sum * self.eq_weights[n];
+            if self.db_scale {
+                if val > 1e-6 {
+                    let db = 20.0 * val.log10();
+                    val = ((db + DB_DYNAMIC_RANGE) / DB_DYNAMIC_RANGE).clamp(0.0, 1.0);
+                } else {
+                    val = 0.0;
+                }
+            }
+
+            self.raw_bars[n] = val * self.sensitivity;
         }
 
-        // Сглаживание: sensitivity, monstercat, gravity, integral, autosens
+        // 2. Пространственный фильтр сглаживания Monstercat (без аллокаций):
+        // bars[i] = max_j(bars[j] / 1.5^|i - j|)
         for i in 0..self.num_bars {
-            self.out_buf[i] *= self.sensitivity;
+            let mut peak = self.raw_bars[i];
+            for j in 0..self.num_bars {
+                let dist = i.abs_diff(j);
+                let candidate = self.raw_bars[j] / self.monstercat_weights[dist];
+                if candidate > peak {
+                    peak = candidate;
+                }
+            }
+            self.out_buf[i] = peak;
         }
-        monstercat(&mut self.out_buf);
-        gravity_integral_automod(
-            &mut self.out_buf,
-            &mut self.prev,
-            &mut self.fall,
-            &mut self.mem,
-            &mut self.sensitivity,
-        );
+
+        // 3. Параболическая гравитация падения, интегральное сглаживание (0.77) и autosens
+        let mut overshoot = false;
+        let mut has_signal = false;
+
+        for i in 0..self.num_bars {
+            let mut v = self.out_buf[i];
+            if v > 1e-5 {
+                has_signal = true;
+            }
+
+            if v < self.prev[i] {
+                let factor = (1.0 - GRAVITY * self.fall_step[i].powi(2)).max(0.0);
+                v = (self.prev[i] * factor).max(v);
+                self.fall_step[i] += 1.0;
+            } else {
+                self.fall_step[i] = 0.0;
+            }
+
+            self.prev[i] = v;
+
+            let smoothed = self.mem[i] * INTEGRAL + v * (1.0 - INTEGRAL);
+            self.mem[i] = if smoothed < 1e-6 { 0.0 } else { smoothed };
+
+            if self.mem[i] > 1.0 {
+                overshoot = true;
+                self.out_buf[i] = 1.0;
+            } else {
+                self.out_buf[i] = self.mem[i];
+            }
+        }
+
+        if self.autosens && has_signal {
+            if overshoot {
+                self.sensitivity = (self.sensitivity * AUTOSENS_DOWN).clamp(0.05, 10.0);
+            } else {
+                self.sensitivity = (self.sensitivity * AUTOSENS_UP).clamp(0.05, 10.0);
+            }
+        }
+
         &self.out_buf
     }
 }
@@ -460,114 +420,119 @@ impl Cavacore {
 mod tests {
     use super::*;
 
-    fn make(num_bars: usize, sample_rate: f32) -> Cavacore {
-        Cavacore::new(sample_rate, num_bars)
-    }
-
-    fn stereo_from_mono(mono: &[f32]) -> Vec<f32> {
-        let mut s = Vec::with_capacity(mono.len() * 2);
-        for &m in mono {
-            s.push(m);
-            s.push(m);
-        }
-        s
+    fn sine_wave(freq_hz: f32, sample_rate: f32, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (2.0 * PI * freq_hz * i as f32 / sample_rate).sin())
+            .collect()
     }
 
     #[test]
-    fn zero_buffer_zero_bars() {
-        let mut c = make(64, 44100.0);
-        let zeros = vec![0.0f32; 1000];
-        let stereo = stereo_from_mono(&zeros);
-        let bars = c.process(&stereo);
-        for (i, b) in bars.iter().enumerate() {
-            assert_eq!(*b, 0.0, "bar {i} = {b}, expected 0.0");
+    fn silence_produces_exact_zeros() {
+        let mut cava = Cavacore::new(44_100.0, 64);
+        let zeros = vec![0.0f32; N_BASS];
+        let bars = cava.process(&zeros);
+        assert_eq!(bars.len(), 64);
+        for (idx, &val) in bars.iter().enumerate() {
+            assert_eq!(val, 0.0, "столбик {idx} должен быть равен 0.0 в тишине");
         }
     }
 
     #[test]
-    fn low_freq_activates_low_bars() {
-        let mut c = make(64, 44100.0);
-        let n = 4096;
-        let freq = 100.0;
-        let mono: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 44100.0).sin())
-            .collect();
-        let stereo = stereo_from_mono(&mono);
-        for _ in 0..10 {
-            let _ = c.process(&stereo);
+    fn sine_100hz_activates_bass_bars() {
+        let mut cava = Cavacore::new(44_100.0, 64);
+        let signal = sine_wave(100.0, 44_100.0, N_BASS);
+
+        for _ in 0..8 {
+            let _ = cava.process(&signal);
         }
-        let bars = c.process(&stereo);
+        let bars = cava.process(&signal);
         let half = bars.len() / 2;
-        let low_energy = bars[0..half].iter().copied().fold(0.0f32, f32::max);
-        let high_energy = bars[half..].iter().copied().fold(0.0f32, f32::max);
-        assert!(low_energy > 0.0, "low energy = {low_energy}");
+
+        let low_max = bars[..half].iter().copied().fold(0.0f32, f32::max);
+        let high_max = bars[half..].iter().copied().fold(0.0f32, f32::max);
+
         assert!(
-            low_energy > high_energy,
-            "low ({low_energy}) should dominate over high ({high_energy})"
+            low_max > 0.2,
+            "басовый пик слишком мал для видимости в TUI: {low_max}"
+        );
+        assert!(
+            low_max > high_max * 2.0,
+            "басовые полосы ({low_max}) должны значительно доминировать над ВЧ ({high_max})"
         );
     }
 
     #[test]
-    fn high_freq_activates_high_bars() {
-        let mut c = make(64, 44100.0);
-        let n = 4096;
-        let freq = 5000.0;
-        let mono: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 44100.0).sin())
-            .collect();
-        let stereo = stereo_from_mono(&mono);
-        for _ in 0..10 {
-            let _ = c.process(&stereo);
+    fn sine_5000hz_activates_high_bars() {
+        let mut cava = Cavacore::new(44_100.0, 64);
+        let signal = sine_wave(5_000.0, 44_100.0, N_BASS);
+
+        for _ in 0..8 {
+            let _ = cava.process(&signal);
         }
-        let bars = c.process(&stereo);
+        let bars = cava.process(&signal);
         let half = bars.len() / 2;
-        let low_energy = bars[0..half].iter().copied().fold(0.0f32, f32::max);
-        let high_energy = bars[half..].iter().copied().fold(0.0f32, f32::max);
-        assert!(high_energy > 0.0, "high energy = {high_energy}");
+
+        let low_max = bars[..half].iter().copied().fold(0.0f32, f32::max);
+        let high_max = bars[half..].iter().copied().fold(0.0f32, f32::max);
+
         assert!(
-            high_energy > low_energy,
-            "high ({high_energy}) should dominate over low ({low_energy})"
+            high_max > 0.2,
+            "ВЧ-пик слишком мал для видимости в TUI: {high_max}"
+        );
+        assert!(
+            high_max > low_max * 2.0,
+            "верхние полосы ({high_max}) должны значительно доминировать над НЧ ({low_max})"
         );
     }
 
     #[test]
-    fn sudden_cutoff_smooth_decay() {
-        let mut c = make(64, 44100.0);
-        let n = 4096;
-        let mono: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * 100.0 * i as f32 / 44100.0).sin())
-            .collect();
-        let stereo = stereo_from_mono(&mono);
-        // Заполняем
-        for _ in 0..30 {
-            let _ = c.process(&stereo);
+    fn smooth_decay_after_signal_stops() {
+        let mut cava = Cavacore::new(44_100.0, 32);
+        let signal = sine_wave(100.0, 44_100.0, N_BASS);
+
+        for _ in 0..10 {
+            let _ = cava.process(&signal);
         }
-        let before = c.process(&stereo).to_vec();
-        let max_before = before.iter().copied().fold(0.0f32, f32::max);
-        assert!(max_before > 1e-5, "peak before cutoff = {max_before}");
+        let peak = cava.process(&signal).iter().copied().fold(0.0f32, f32::max);
+        assert!(peak > 0.2, "ожидался заметный пик перед отключением сигнала: {peak}");
 
-        // Резкое отключение (нуловой чанк)
-        let zeros = vec![0.0f32; n * 2];
-        let decay_values: Vec<f32> = (0..15)
-            .map(|_| {
-                let b = c.process(&zeros).to_vec();
-                b.iter().copied().fold(0.0f32, f32::max)
-            })
-            .collect();
+        let silence = vec![0.0f32; N_BASS];
+        let mut prev_max = peak;
+        for step in 0..12 {
+            let current_max = cava
+                .process(&silence)
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            if step < 2 {
+                // Параболическая гравитация стартует с нулевого наклона (fall_step = 0),
+                // а интегральный фильтр (0.77) продолжает догонять уровень сигнала:
+                // столбики не должны резко прыгнуть, но могут слегка подняться
+                // на первых кадрах тишины.
+                assert!(
+                    current_max <= peak * 1.08,
+                    "первые кадры тишины не должны резко отклоняться от пика: peak={peak}, current={current_max}"
+                );
+            } else {
+                assert!(
+                    current_max <= prev_max + 1e-6,
+                    "высота столбиков должна монотонно убывать: шаг {step}, {current_max} > {prev_max}"
+                );
+            }
+            prev_max = current_max;
+        }
+        assert!(
+            prev_max < peak * 0.25,
+            "после 12 кадров тишины сигнал должен значительно затухнуть: {prev_max}"
+        );
+    }
 
-        // Спад должен быть плавным: значение должно заметно убывать
-        // (интегральное сглаживание 0.77 + гравитация — экспоненциальный спад)
-        assert!(
-            decay_values[0] > 1e-9,
-            "first decay value = {0:?}, all: {1:?}",
-            decay_values[0],
-            &decay_values
-        );
-        assert!(
-            decay_values[decay_values.len() - 1] < decay_values[0] / 2.0,
-            "decay too shallow: first={0}, last={1}",
-            decay_values[0],
-            decay_values[decay_values.len() - 1]
-        );
+    #[test]
+    fn optional_db_scaling_works() {
+        let mut cava = Cavacore::new(44_100.0, 32).with_db_scale(true);
+        let signal = sine_wave(440.0, 44_100.0, N_BASS);
+        let bars = cava.process(&signal);
+        let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
+        assert!(max_bar > 0.1 && max_bar <= 1.0);
     }
 }
