@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Конфигурация приложения: arl-токен, громкость и базовые аудио-настройки.
+use crate::api::models::AudioQuality;
+
+/// Конфигурация приложения: arl-токен, громкость, качество потока и параметры UI/DSP.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
     /// Аутентификационная кука Deezer (`arl`).
@@ -22,6 +24,18 @@ pub struct AppConfig {
     /// Частота дискретизации (Гц). `44100.0` — стандарт Deezer HiFi FLAC.
     #[serde(default = "default_sample_rate_hz")]
     pub sample_rate_hz: f32,
+    /// Предпочитаемое качество потока: `"FLAC"`, `"MP3_320"`, `"MP3_128"`.
+    #[serde(default = "default_preferred_quality")]
+    pub preferred_quality: String,
+    /// Отображать ли глобальный спектроанализатор снизу (переключается по `v`).
+    #[serde(default = "default_show_spectrum")]
+    pub show_spectrum: bool,
+    /// Использовать ли логарифмическую шкалу децибел (`dB`) для спектра.
+    #[serde(default)]
+    pub db_scale: bool,
+    /// Свёрнут ли левый сайдбар навигации (переключается по `s`).
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }
 
 fn default_volume() -> f32 {
@@ -32,12 +46,24 @@ fn default_sample_rate_hz() -> f32 {
     44_100.0
 }
 
+fn default_preferred_quality() -> String {
+    "FLAC".to_string()
+}
+
+fn default_show_spectrum() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             arl: None,
             volume: default_volume(),
             sample_rate_hz: default_sample_rate_hz(),
+            preferred_quality: default_preferred_quality(),
+            show_spectrum: default_show_spectrum(),
+            db_scale: false,
+            sidebar_collapsed: false,
         }
     }
 }
@@ -122,6 +148,16 @@ impl AppConfig {
                     .filter(|s| !s.is_empty())
             })
     }
+
+    /// Конвертирует строковую настройку `preferred_quality` в `AudioQuality`.
+    pub fn preferred_audio_quality(&self) -> AudioQuality {
+        match self.preferred_quality.trim().to_uppercase().as_str() {
+            "MP3_320" => AudioQuality::Mp3_320,
+            "MP3_128" => AudioQuality::Mp3_128,
+            "MP3_64" => AudioQuality::Mp3_64,
+            _ => AudioQuality::Flac,
+        }
+    }
 }
 
 /// Нормализация громкости в диапазон `0.0..=1.0`.
@@ -146,6 +182,10 @@ mod tests {
         assert_eq!(config.volume, 0.8);
         assert_eq!(config.arl, None);
         assert_eq!(config.sample_rate_hz, 44_100.0);
+        assert_eq!(config.preferred_quality, "FLAC");
+        assert!(config.show_spectrum);
+        assert!(!config.db_scale);
+        assert!(!config.sidebar_collapsed);
     }
 
     #[test]
@@ -165,10 +205,15 @@ mod tests {
             arl: Some("test-arl-token".into()),
             volume: 0.65,
             sample_rate_hz: 44_100.0,
+            preferred_quality: "MP3_320".into(),
+            show_spectrum: false,
+            db_scale: true,
+            sidebar_collapsed: true,
         };
         config.save_to(&cfg_path).expect("save_to failed");
 
         let loaded = AppConfig::load_from(&cfg_path);
         assert_eq!(loaded, config);
+        assert_eq!(loaded.preferred_audio_quality(), AudioQuality::Mp3_320);
     }
 }

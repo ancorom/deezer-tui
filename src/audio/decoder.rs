@@ -1,7 +1,5 @@
-//! Декодер аудиопотока на базе `symphonia` 0.6 с разветвлением в два lock-free буфера `rtrb`.
-//!
-//! Записывает интерливированные стерео-сэмплы в `AudioRingBuffer` (65 536 сэмплов)
-//! и сведённые моно-сэмплы `(L + R) * 0.5` в `VisRingBuffer` (16 384 сэмпла).
+ //! Декодер аудиопотока на базе `symphonia` 0.6 с поддержкой аппаратного `Seek` 
+//! и извлечением технических параметров потока (`StreamTechInfo`).
 
 #![allow(dead_code)]
 
@@ -9,15 +7,85 @@ use std::io::Read;
 
 use anyhow::{Context, Result};
 use rtrb::Producer;
-use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_FLAC, CODEC_ID_MP3};
+use symphonia::core::codecs::audio::{AudioCodecId, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
-use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::{Time, Timestamp};
+
+/// Команды управления потоком декодера из UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderCommand {
+    /// Перемотка потока на указанную секунду.
+    Seek(u64),
+}
+
+/// Реальные технические параметры аудиопотока, извлечённые из заголовков `Symphonia`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamTechInfo {
+    pub codec_name: String,
+    pub sample_rate: u32,
+    pub bits_per_sample: u32,
+    pub total_frames: u64,
+    pub duration_secs: u64,
+    pub bitrate_kbps: u32,
+    pub file_size_bytes: u64,
+}
+
+impl Default for StreamTechInfo {
+    fn default() -> Self {
+        Self {
+            codec_name: "FLAC".into(),
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            total_frames: 0,
+            duration_secs: 30,
+            bitrate_kbps: 1411,
+            file_size_bytes: 0,
+        }
+    }
+}
+
+impl StreamTechInfo {
+    /// Форматирует бейдж качества для нижней панели плеера и экрана Now Playing.
+    pub fn badge(&self, is_preview: bool) -> String {
+        let khz = self.sample_rate as f32 / 1000.0;
+        if is_preview {
+            format!(
+                "{} {:.1}kHz | {} kbps (PREVIEW)",
+                self.codec_name, khz, self.bitrate_kbps
+            )
+        } else if self.codec_name == "FLAC" {
+            format!(
+                "FLAC {}-bit/{:.1}kHz | {} kbps",
+                self.bits_per_sample, khz, self.bitrate_kbps
+            )
+        } else {
+            format!(
+                "{} {:.1}kHz | {} kbps",
+                self.codec_name, khz, self.bitrate_kbps
+            )
+        }
+    }
+}
+
+fn codec_display_name(codec: AudioCodecId) -> String {
+    if codec == CODEC_ID_FLAC {
+        "FLAC".to_string()
+    } else if codec == CODEC_ID_MP3 {
+        "MP3".to_string()
+    } else if codec == CODEC_ID_AAC {
+        "AAC".to_string()
+    } else {
+        "PCM".to_string()
+    }
+}
 
 /// Записывает все сэмплы `src` в `dst`, уступая квант времени потоку-потребителю при заполнении.
-fn push_all_blocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
+pub fn push_all_blocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
     let mut remaining = src;
     let mut written = 0;
     while !remaining.is_empty() {
@@ -32,8 +100,7 @@ fn push_all_blocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
     written
 }
 
-/// Неблокирующая запись в `VisRingBuffer`: записывает столько моно-сэмплов, сколько помещается
-/// прямо сейчас, чтобы визуализация никогда не блокировала декодирование звука.
+/// Неблокирующая запись в `VisRingBuffer`.
 fn push_vis_nonblocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
     if dst.is_full() || src.is_empty() {
         return 0;
@@ -42,9 +109,7 @@ fn push_vis_nonblocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
     pushed.len()
 }
 
-/// Записывает чанк интерливированного стерео `[L0, R0, L1, R1, ...]` в оба кольцевых буфера:
-/// - стерео целиком в `audio`;
-/// - сведённое моно `(L + R) * 0.5` в `vis`.
+/// Записывает чанк интерливированного стерео `[L0, R0, L1, R1, ...]` в оба кольцевых буфера.
 pub fn write_interleaved_stereo_to_rings(
     stereo: &[f32],
     audio: &mut Producer<f32>,
@@ -62,19 +127,19 @@ pub fn write_interleaved_stereo_to_rings(
     (audio_written, vis_written)
 }
 
-/// Декодер `symphonia` 0.6, подключённый к двум `rtrb::Producer<f32>`.
+/// Декодер `symphonia` 0.6.
 pub struct Decoder {
     format: Box<dyn FormatReader>,
     track_id: u32,
+    sample_rate: u32,
     decoder: Box<dyn AudioDecoder>,
-    audio_producer: Producer<f32>,
-    vis_producer: Producer<f32>,
+    pub audio_producer: Producer<f32>,
+    vis_producer: Option<Producer<f32>>,
     interleaved_buf: Vec<f32>,
 }
 
 impl Decoder {
-    /// Инициализирует декодер для произвольного потока чтения `reader` и пары `Producer<f32>`.
-    /// Вызывающая сторона сохраняет оба `Consumer<f32>` (для потока `cpal` и потока UI/DSP).
+    /// Инициализирует декодер для произвольного `Read` и пары `Producer<f32>` (для совместимости с тестами).
     pub fn new(
         reader: Box<dyn Read + Send + Sync>,
         audio_producer: Producer<f32>,
@@ -84,6 +149,29 @@ impl Decoder {
             Box::new(ReadOnlySource::new(reader)),
             Default::default(),
         );
+        let (mut dec, _) = Self::from_mss(mss, 0, audio_producer, 30)?;
+        dec.vis_producer = Some(vis_producer);
+        Ok(dec)
+    }
+
+    /// Инициализирует декодер для `MediaSource` с поддержкой `Seek` (например, `DeezerStream`)
+    /// и возвращает `(Decoder, StreamTechInfo)`. Запись в `VisRingBuffer` при этом выполняет `CPAL`.
+    pub fn new_seekable(
+        source: Box<dyn MediaSource>,
+        audio_producer: Producer<f32>,
+        fallback_duration_secs: u64,
+    ) -> Result<(Self, StreamTechInfo)> {
+        let file_size_bytes = source.byte_len().unwrap_or(0);
+        let mss = MediaSourceStream::new(source, Default::default());
+        Self::from_mss(mss, file_size_bytes, audio_producer, fallback_duration_secs)
+    }
+
+    fn from_mss(
+        mss: MediaSourceStream<'static>,
+        file_size_bytes: u64,
+        audio_producer: Producer<f32>,
+        fallback_duration_secs: u64,
+    ) -> Result<(Self, StreamTechInfo)> {
         let format = symphonia::default::get_probe()
             .probe(
                 &Hint::new(),
@@ -97,6 +185,7 @@ impl Decoder {
             .default_track(TrackType::Audio)
             .context("в медиапотоке не найдено аудиодорожек")?;
         let track_id = track.id;
+        let total_frames = track.num_frames.unwrap_or(0);
 
         let audio_params = track
             .codec_params
@@ -105,21 +194,72 @@ impl Decoder {
             .audio()
             .context("дорожка не является аудиокодеком")?;
 
+        let sample_rate = audio_params.sample_rate.unwrap_or(44_100).max(1);
+        let bits_per_sample = audio_params.bits_per_sample.unwrap_or(16);
+        let codec_name = codec_display_name(audio_params.codec);
+
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
             .context("неподдерживаемый аудиокодек")?;
 
-        Ok(Self {
-            format,
-            track_id,
-            decoder,
-            audio_producer,
-            vis_producer,
-            interleaved_buf: Vec::with_capacity(8192),
-        })
+        let computed_duration = if total_frames > 0 {
+            (total_frames / u64::from(sample_rate)).max(1)
+        } else {
+            fallback_duration_secs.max(1)
+        };
+
+        let bitrate_kbps = if file_size_bytes > 0 && computed_duration > 0 {
+            ((file_size_bytes * 8) / (computed_duration * 1000)).max(32) as u32
+        } else if codec_name == "FLAC" {
+            1411
+        } else {
+            128
+        };
+
+        let tech_info = StreamTechInfo {
+            codec_name,
+            sample_rate,
+            bits_per_sample,
+            total_frames,
+            duration_secs: computed_duration,
+            bitrate_kbps,
+            file_size_bytes,
+        };
+
+        Ok((
+            Self {
+                format,
+                track_id,
+                sample_rate,
+                decoder,
+                audio_producer,
+                vis_producer: None,
+                interleaved_buf: Vec::with_capacity(8192),
+            },
+            tech_info,
+        ))
     }
 
-    /// Декодирует следующий пакет и записывает сэмплы в оба кольцевых буфера.
+    /// Выполняет аппаратный `Seek` к целевой секунде и сбрасывает внутреннее состояние декодера.
+    /// Возвращает новую позицию в фреймах.
+    pub fn seek(&mut self, target_secs: u64) -> Result<u64, SymphoniaError> {
+        let seeked = self.format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time: Time::from(u32::try_from(target_secs).unwrap_or(u32::MAX)),
+                track_id: Some(self.track_id),
+            },
+        )?;
+        self.decoder.reset();
+        let actual_frames = if seeked.actual_ts > Timestamp::ZERO {
+            seeked.actual_ts.get().max(0) as u64
+        } else {
+            target_secs.saturating_mul(u64::from(self.sample_rate))
+        };
+        Ok(actual_frames)
+    }
+
+    /// Декодирует следующий пакет и записывает сэмплы в кольцевой буфер.
     /// Возвращает `Ok(Some(frames))` или `Ok(None)` при достижении конца потока (EOF).
     pub fn process_next(&mut self) -> Result<Option<usize>, SymphoniaError> {
         loop {
@@ -138,26 +278,29 @@ impl Decoder {
             decoded.copy_to_slice_interleaved(&mut self.interleaved_buf);
 
             if channels == 1 {
-                // Если поток монофонический — дублируем каждый сэмпл в L и R
                 let frames = total_samples;
                 let mut stereo = Vec::with_capacity(frames * 2);
                 for &s in &self.interleaved_buf[..frames] {
                     stereo.push(s);
                     stereo.push(s);
                 }
-                write_interleaved_stereo_to_rings(
-                    &stereo,
-                    &mut self.audio_producer,
-                    &mut self.vis_producer,
-                );
+                if let Some(ref mut vp) = self.vis_producer {
+                    write_interleaved_stereo_to_rings(&stereo, &mut self.audio_producer, vp);
+                } else {
+                    push_all_blocking(&mut self.audio_producer, &stereo);
+                }
                 return Ok(Some(frames));
             } else {
                 let frames = total_samples / 2;
-                write_interleaved_stereo_to_rings(
-                    &self.interleaved_buf,
-                    &mut self.audio_producer,
-                    &mut self.vis_producer,
-                );
+                if let Some(ref mut vp) = self.vis_producer {
+                    write_interleaved_stereo_to_rings(
+                        &self.interleaved_buf,
+                        &mut self.audio_producer,
+                        vp,
+                    );
+                } else {
+                    push_all_blocking(&mut self.audio_producer, &self.interleaved_buf);
+                }
                 return Ok(Some(frames));
             }
         }
@@ -172,9 +315,8 @@ impl Decoder {
         Ok(total_frames)
     }
 
-    /// Извлекает оба `Producer<f32>` обратно из декодера.
-    pub fn into_producers(self) -> (Producer<f32>, Producer<f32>) {
-        (self.audio_producer, self.vis_producer)
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }
 
@@ -207,6 +349,23 @@ mod tests {
     }
 
     #[test]
+    fn tech_info_badge_formats_correctly() {
+        let flac_info = StreamTechInfo::default();
+        assert_eq!(flac_info.badge(false), "FLAC 16-bit/44.1kHz | 1411 kbps");
+
+        let mp3_preview = StreamTechInfo {
+            codec_name: "MP3".into(),
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            total_frames: 44_100 * 30,
+            duration_secs: 30,
+            bitrate_kbps: 128,
+            file_size_bytes: 480_000,
+        };
+        assert_eq!(mp3_preview.badge(true), "MP3 44.1kHz | 128 kbps (PREVIEW)");
+    }
+
+    #[test]
     fn generated_buffer_fills_both_rings_without_blocking() {
         let stereo = stereo_sine(440.0, 1_000);
         let (audio, vis) = create_rings();
@@ -236,12 +395,10 @@ mod tests {
 
         write_interleaved_stereo_to_rings(&stereo, audio.producer(), vis.producer());
 
-        // Читаем именно из VisRingBuffer (моно), как это делает UI-поток в ARCHITECTURE.md!
         let mono_vis = drain(vis.consumer());
         assert_eq!(mono_vis.len(), N_BASS * 2);
 
         let mut cava = Cavacore::new(44_100.0, 32);
-        // 9 кадров: интегральный фильтр (0.77) сходится к установившемуся уровню.
         let mut bars = cava.process(&mono_vis);
         for _ in 0..8 {
             bars = cava.process(&mono_vis);
@@ -268,7 +425,6 @@ mod tests {
 
         let mono_vis = drain(vis.consumer());
         let mut cava = Cavacore::new(44_100.0, 32);
-        // 9 кадров: интегральный фильтр (0.77) сходится к установившемуся уровню.
         let mut bars = cava.process(&mono_vis);
         for _ in 0..8 {
             bars = cava.process(&mono_vis);
@@ -278,8 +434,6 @@ mod tests {
         let low_max = bars[..half].iter().copied().fold(0.0f32, f32::max);
         let high_max = bars[half..].iter().copied().fold(0.0f32, f32::max);
 
-        // Для 32 полос (широкий верхний диапазон) установившийся уровень ВЧ ~0.17-0.19;
-        // порог ниже, чем у 64-полосного теста в cavacore, но явно выше нуля.
         assert!(high_max > 0.15, "верхние полосы должны активироваться на 5000 Гц: {high_max}");
         assert!(
             high_max > low_max * 2.0,
@@ -289,9 +443,6 @@ mod tests {
 
     #[test]
     fn vis_ring_overflow_never_deadlocks_audio_ring() {
-        // Подаём больше фреймов (20 000), чем ёмкость VisRingBuffer (16 384),
-        // но меньше, чем ёмкость AudioRingBuffer (32 768 фреймов).
-        // Запись не должна блокироваться!
         let frames = 20_000;
         let stereo = vec![0.0f32; frames * 2];
         let mut audio = AudioRing::new();

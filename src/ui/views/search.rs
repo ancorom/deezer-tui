@@ -1,5 +1,5 @@
-//! Экран 02 (Search & Discover): левый сайдбар `NAVIGATION` с мини-спектром из 10 столбиков,
-//! поле ввода `Search:`, 3 колонки (`ARTISTS`, `ALBUMS`, `TRACKS`) и нижний мини-плеер.
+//! Экран 02 (Search & Discover): поле ввода `Search:` и 3 колонки (`ARTISTS`, `ALBUMS`, `TRACKS`).
+//! Сайдбар `NAVIGATION`, нижний плеер и спектр в v2.0 рендерятся глобально в `App::render`.
 
 #![allow(dead_code)]
 
@@ -87,18 +87,7 @@ impl Search {
 
 impl Widget for &Search {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let w = area.width;
-        let h = area.height;
-        if w == 0 || h == 0 {
-            return;
-        }
-        let sidebar_w = 20u16;
-        if w >= sidebar_w + 28 {
-            self.draw_sidebar(buf, Rect::new(area.x, area.y, sidebar_w, h));
-            self.draw_content(buf, Rect::new(area.x + sidebar_w, area.y, w - sidebar_w, h));
-        } else {
-            self.draw_content(buf, area);
-        }
+        self.draw_content(buf, area);
     }
 }
 
@@ -110,69 +99,12 @@ impl Search {
             return;
         }
         let query_y = area.y;
-        let mini_player_start = area.bottom().saturating_sub(2);
-        let mini_player_end = area.bottom();
-
         self.draw_query(buf, area, query_y);
 
         let table_start = area.y + 1;
-        let table_end = mini_player_start;
+        let table_end = area.bottom();
         if table_start < table_end {
             self.draw_table(buf, area, table_start, table_end, w);
-        }
-
-        if mini_player_end > mini_player_start {
-            self.draw_mini_player(buf, area, mini_player_start, mini_player_end, w);
-        }
-    }
-
-    fn draw_sidebar(&self, buf: &mut Buffer, area: Rect) {
-        let w = area.width;
-        let h = area.height;
-        if w == 0 || h == 0 {
-            return;
-        }
-        let spec_h = 3u16.min(h.saturating_sub(1));
-        let spec_top = area.bottom() - spec_h;
-
-        let header_style = Style::default()
-            .fg(theme::color_from_hex(theme::GRAD_END))
-            .bold();
-        buf.set_string(
-            area.x,
-            area.y,
-            Self::truncate("NAVIGATION", w as usize),
-            header_style,
-        );
-
-        let items: [(&str, bool); 4] = [
-            ("HOME", false),
-            ("SEARCH", true),
-            ("LIBRARY", false),
-            ("FLOW", false),
-        ];
-        for (i, (label, active)) in items.iter().enumerate() {
-            let y = area.y + 1 + i as u16;
-            if y >= spec_top {
-                break;
-            }
-            let text = if *active {
-                format!("▶  {label}")
-            } else {
-                format!("   {label}")
-            };
-            let style = if *active {
-                Style::default()
-                    .fg(theme::color_from_hex(theme::GRAD_START))
-                    .bold()
-            } else {
-                Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
-            };
-            buf.set_string(area.x, y, Self::truncate(&text, w as usize), style);
-        }
-
-        if spec_h > 0 {
-            (&self.spectrum).render(Rect::new(area.x, spec_top, w, spec_h), buf);
         }
     }
 
@@ -319,84 +251,6 @@ impl Search {
         let start_x = area.x + area.width.saturating_sub(msg_w) / 2;
         buf.set_string(start_x, y, Self::truncate(msg, area.width as usize), style);
     }
-
-    fn draw_mini_player(
-        &self,
-        buf: &mut Buffer,
-        area: Rect,
-        start: u16,
-        end: u16,
-        width: u16,
-    ) {
-        if start >= end || start < area.top() || end > area.bottom() {
-            return;
-        }
-        let x0 = area.x;
-        if end - start < 2 {
-            self.draw_mini_player_compact(buf, area, start);
-            return;
-        }
-        {
-            let y = start;
-            let style = Style::default()
-                .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
-                .bold();
-            let label = format!("Now playing: {}", self.player.track);
-            buf.set_string(x0, y, Self::truncate(&label, width as usize), style);
-            if !self.player.artist.is_empty() {
-                let offset = (label.chars().count() + 2).min(width as usize) as u16;
-                let x = x0 + offset;
-                if x < area.right() {
-                    let dim = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
-                    buf.set_string(
-                        x,
-                        y,
-                        Self::truncate(&self.player.artist, (area.right() - x) as usize),
-                        dim,
-                    );
-                }
-            }
-        }
-        {
-            let y = start + 1;
-            let bar_w = (width * 60) / 100;
-            if bar_w > 0 {
-                let bar_style = Style::default().bg(theme::color_from_hex(theme::BG_TERMINAL));
-                for x in 0..bar_w {
-                    buf.set_string(x0 + x, y, "░", bar_style);
-                }
-                let col = (self.player.progress.clamp(0.0, 1.0) * (bar_w.saturating_sub(1) as f32))
-                    as u16;
-                let fill_style = Style::default().fg(theme::color_from_hex(theme::GRAD_START));
-                for x in 0..col {
-                    buf.set_string(x0 + x, y, "■", fill_style);
-                }
-                buf.set_string(x0 + col, y, "●", fill_style);
-            }
-            let control_style = Style::default()
-                .fg(theme::color_from_hex(theme::GRAD_END))
-                .bold();
-            if x0 + bar_w + 4 < area.right() {
-                buf.set_string(x0 + bar_w + 4, y, "▶", control_style);
-            }
-        }
-    }
-
-    fn draw_mini_player_compact(&self, buf: &mut Buffer, area: Rect, y: u16) {
-        if y >= area.bottom() {
-            return;
-        }
-        let x0 = area.x;
-        let label = format!("● {}", self.player.track);
-        let style = Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY));
-        let text = if self.player.paused {
-            format!("{label}  [Paused]")
-        } else {
-            format!("{label}  [Playing]")
-        };
-        let available = (area.right() - x0) as usize;
-        buf.set_string(x0, y, Self::truncate(&text, available).as_str(), style);
-    }
 }
 
 #[cfg(test)]
@@ -428,12 +282,7 @@ mod tests {
                     favorite: false,
                 },
             ],
-            player: MiniPlayer {
-                track: "Bohemian Rhapsody".into(),
-                artist: "Queen".into(),
-                progress: 0.5,
-                paused: false,
-            },
+            player: MiniPlayer::default(),
             spectrum,
         }
     }
@@ -476,36 +325,15 @@ mod tests {
         assert!(row_has(&terminal, 1, "ALBUMS"));
         assert!(row_has(&terminal, 1, "TRACKS"));
         assert!(row_has(&terminal, 2, "Queen"));
-        assert!(row_has(&terminal, 38, "Bohemian"));
-    }
-
-    #[test]
-    fn sidebar_has_navigation_and_mini_spectrum() {
-        let screen = make_search();
-        let terminal = render(&screen, 120, 40);
-        assert!(row_has(&terminal, 0, "NAVIGATION"));
-        assert!(row_has(&terminal, 1, "HOME"));
-        assert!(row_has(&terminal, 2, "SEARCH"));
-        assert!(row_has(&terminal, 3, "LIBRARY"));
-        assert!(row_has(&terminal, 4, "FLOW"));
-        let has_bars = (37..40).any(|y| {
-            (0..20).any(|x| {
-                matches!(
-                    at(&terminal, x, y),
-                    '█' | '▇' | '▆' | '▅' | '▄' | '▃' | '▂' | '▁' | '▪'
-                )
-            })
-        });
-        assert!(has_bars);
+        assert!(row_has(&terminal, 2, "Bohemian Rhapsody"));
     }
 
     #[test]
     fn renders_in_narrow_size() {
         let screen = make_search();
         let terminal = render(&screen, 40, 12);
-        assert!(!row_has(&terminal, 0, "NAVIGATION"));
         assert!(row_has(&terminal, 0, "queen"));
-        assert!(row_has(&terminal, 10, "Bohemian"));
+        assert!(row_has(&terminal, 2, "Queen"));
     }
 
     #[test]
@@ -529,7 +357,6 @@ mod tests {
     fn tiny_area_does_not_panic() {
         let screen = make_search();
         let terminal = render(&screen, 15, 8);
-        // No panic; query still drawn.
         assert!(row_has(&terminal, 0, "queen"));
     }
 }

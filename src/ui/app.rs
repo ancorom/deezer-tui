@@ -1,9 +1,10 @@
-//! Глобальное состояние `deezer-tui`: связывает TUI (60 FPS), фоновый рантайм `tokio`,
-//! декодер `Symphonia`, аудиовывод `CPAL` и спектроанализатор `Cavacore`.
+//! Глобальное состояние `deezer-tui v2.0`: связывает TUI (60 FPS), фоновый рантайм `tokio`,
+//! декодер `Symphonia` (с `Seek` и `StreamTechInfo`), синхронный аудиовывод `CPAL`,
+//! очередь `PlaybackQueue` и спектроанализатор `Cavacore`.
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,11 +16,13 @@ use rtrb::Consumer;
 use tokio::sync::mpsc;
 
 use crate::api::client::DeezerClient;
-use crate::api::models::{AudioQuality, LyricLine, PlaylistData, TrackData};
-use crate::audio::decoder::{write_interleaved_stereo_to_rings, Decoder};
+use crate::api::models::{LyricLine, PlaylistData, TrackData};
+use crate::audio::decoder::{
+    push_all_blocking, Decoder, DecoderCommand, StreamTechInfo,
+};
 use crate::audio::output::AudioOutput;
 use crate::audio::prefetch::{GaplessPolicy, PrefetchSlot};
-use crate::audio::ring_buffers::create_rings;
+use crate::audio::ring_buffers::{create_rings, AUDIO_RING_BUFFER_CAPACITY};
 use crate::audio::stream::DeezerStream;
 use crate::config::AppConfig;
 use crate::dsp::cavacore::Cavacore;
@@ -29,7 +32,50 @@ use crate::ui::views::flow_lyrics::{FlowLyrics, FlowRow};
 use crate::ui::views::library::{Library, PlaylistEntry};
 use crate::ui::views::now_playing::NowPlaying;
 use crate::ui::views::search::{Search, SearchRow};
-use crate::ui::widgets::{CoverArt, Modal};
+use crate::ui::widgets::{CoverArt, Modal, Spectrum};
+
+/// Очередь воспроизведения для автоматического и ручного (`n`/`p`) переключения треков.
+#[derive(Debug, Clone, Default)]
+pub struct PlaybackQueue {
+    pub tracks: Vec<TrackData>,
+    pub current_index: usize,
+}
+
+impl PlaybackQueue {
+    pub fn set_queue(&mut self, tracks: Vec<TrackData>, index: usize) -> Option<TrackData> {
+        if tracks.is_empty() {
+            self.tracks.clear();
+            self.current_index = 0;
+            return None;
+        }
+        let clamped = index.min(tracks.len() - 1);
+        self.tracks = tracks;
+        self.current_index = clamped;
+        self.tracks.get(clamped).cloned()
+    }
+
+    pub fn next_track(&mut self) -> Option<TrackData> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        if self.current_index + 1 < self.tracks.len() {
+            self.current_index += 1;
+            self.tracks.get(self.current_index).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub fn prev_track(&mut self) -> Option<TrackData> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        if self.current_index > 0 {
+            self.current_index -= 1;
+        }
+        self.tracks.get(self.current_index).cloned()
+    }
+}
 
 /// События, приходящие из фонового пула `tokio` и потока декодера в TUI.
 #[allow(clippy::large_enum_variant)]
@@ -46,10 +92,13 @@ pub enum BgEvent {
     TrackStarted {
         track: TrackData,
         badge: String,
+        tech_info: StreamTechInfo,
         vis_consumer: Consumer<f32>,
         cover: Option<CoverArt>,
         lyrics: Vec<LyricLine>,
+        decoder_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
     },
+    TrackEnded,
     PlaybackError(String),
 }
 
@@ -58,6 +107,7 @@ pub struct App {
     pub search: Search,
     pub library: Library,
     pub flow_lyrics: FlowLyrics,
+    pub global_spectrum: Spectrum,
     pub active_tab: u8,
     pub running: bool,
     pub volume: f32,
@@ -66,23 +116,27 @@ pub struct App {
     pub user_label: Option<String>,
     pub status_message: Option<String>,
 
-    // Живые коллекции треков для запуска воспроизведения по Enter
+    // Живые коллекции треков и активная очередь воспроизведения
     pub search_tracks: Vec<TrackData>,
     pub library_tracks: Vec<TrackData>,
     pub flow_tracks: Vec<TrackData>,
+    pub queue: PlaybackQueue,
 
     // Модальное окно ввода ARL-токена (клавиша L)
     pub show_arl_modal: bool,
     pub arl_input: String,
 
-    // DSP и аудиодвижок
+    // DSP, синхронизация прогресса и аудиодвижок
     pub cavacore: Cavacore,
     pub vis_consumer: Option<Consumer<f32>>,
     pub audio_output: Option<AudioOutput>,
     pub stop_decode: Arc<AtomicBool>,
     pub paused_flag: Arc<AtomicBool>,
-    pub track_started_at: Option<Instant>,
+    pub played_frames: Arc<AtomicU64>,
+    pub current_sample_rate: u32,
     pub current_duration_secs: u64,
+    pub current_tech_info: Option<StreamTechInfo>,
+    pub decoder_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
 
     // Асинхронные фоновые задачи
     pub rt: Arc<tokio::runtime::Runtime>,
@@ -116,11 +170,23 @@ impl App {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let mpris = Mpris::new().ok();
 
+        let mut global_spectrum = Spectrum::new(64);
+        let demo: Vec<f32> = (0..64)
+            .map(|i| {
+                let x = i as f32 / 64.0;
+                ((x * std::f32::consts::PI * 3.0).sin().abs() * 0.65 + 0.1).clamp(0.0, 1.0)
+            })
+            .collect();
+        global_spectrum.set_bars(&demo);
+
+        let cavacore = Cavacore::new(cfg.sample_rate_hz, 64).with_db_scale(cfg.db_scale);
+
         let app = Self {
             now_playing: NowPlaying::default(),
             search: Search::default(),
             library: Library::default(),
             flow_lyrics: FlowLyrics::default(),
+            global_spectrum,
             active_tab: 1,
             running: true,
             volume: cfg.volume.clamp(0.0, 1.0),
@@ -131,15 +197,19 @@ impl App {
             search_tracks: Vec::new(),
             library_tracks: Vec::new(),
             flow_tracks: Vec::new(),
+            queue: PlaybackQueue::default(),
             show_arl_modal: false,
             arl_input: cfg.effective_arl().unwrap_or_default(),
-            cavacore: Cavacore::new(cfg.sample_rate_hz, 64),
+            cavacore,
             vis_consumer: None,
             audio_output: None,
             stop_decode: Arc::new(AtomicBool::new(false)),
             paused_flag: Arc::new(AtomicBool::new(true)),
-            track_started_at: None,
+            played_frames: Arc::new(AtomicU64::new(0)),
+            current_sample_rate: 44_100,
             current_duration_secs: 30,
+            current_tech_info: None,
+            decoder_tx: None,
             rt,
             bg_tx,
             bg_rx,
@@ -191,7 +261,18 @@ impl App {
         self.vis_consumer = Some(consumer);
     }
 
-    /// Обновляет спектр 60 FPS и прогресс воспроизведения.
+    ///Текущая позиция воспроизведения в секундах из реально сыгранных `CPAL` фреймов.
+    pub fn elapsed_secs(&self) -> u64 {
+        let frames = self.played_frames.load(Ordering::Relaxed);
+        let sr = u64::from(self.current_sample_rate.max(1));
+        frames / sr
+    }
+
+    pub fn format_mm_ss(secs: u64) -> String {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
+    }
+
+    /// Обновляет спектр 60 FPS и прогресс воспроизведения строго по `played_frames / sample_rate`.
     pub fn step_dsp(&mut self) {
         let mut samples = Vec::new();
         if let Some(ref mut consumer) = self.vis_consumer {
@@ -205,35 +286,35 @@ impl App {
 
         if !samples.is_empty() {
             let bars = self.cavacore.process(&samples);
+            self.global_spectrum.set_bars(bars);
             self.now_playing.spectrum.set_bars(bars);
             self.flow_lyrics.spectrum.set_bars(bars);
             let mini_len = bars.len().min(10);
             self.search.spectrum.set_bars(&bars[..mini_len]);
-        } else if self.now_playing.paused {
+        } else if self.now_playing.paused && self.vis_consumer.is_some() {
             let silence = [0.0f32; 512];
-            if self.vis_consumer.is_some() {
-                let bars = self.cavacore.process(&silence);
-                self.now_playing.spectrum.set_bars(bars);
-                self.flow_lyrics.spectrum.set_bars(bars);
-                let mini_len = bars.len().min(10);
-                self.search.spectrum.set_bars(&bars[..mini_len]);
-            }
+            let bars = self.cavacore.process(&silence);
+            self.global_spectrum.set_bars(bars);
+            self.now_playing.spectrum.set_bars(bars);
+            self.flow_lyrics.spectrum.set_bars(bars);
+            let mini_len = bars.len().min(10);
+            self.search.spectrum.set_bars(&bars[..mini_len]);
         }
 
-        if !self.now_playing.paused
-            && let Some(started) = self.track_started_at
-        {
-            let elapsed = started.elapsed();
-            let total = Duration::from_secs(self.current_duration_secs.max(1));
-            let prog = (elapsed.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0);
+        if !self.now_playing.paused && self.vis_consumer.is_some() {
+            let frames = self.played_frames.load(Ordering::Relaxed);
+            let sr = f64::from(self.current_sample_rate.max(1));
+            let elapsed_s = frames as f64 / sr;
+            let total_s = (self.current_duration_secs.max(1)) as f64;
+            let prog = (elapsed_s / total_s).clamp(0.0, 1.0) as f32;
             self.now_playing.progress = prog;
             self.search.player.progress = prog;
             self.library.player.progress = prog;
-            self.flow_lyrics.position_ms = elapsed.as_millis() as u64;
+            self.flow_lyrics.position_ms = (elapsed_s * 1000.0) as u64;
         }
     }
 
-    /// Обрабатывает события, пришедшие из фонового потока `tokio`.
+    /// Обрабатывает события, пришедшие из фонового потока `tokio` и декодера.
     fn poll_bg_events(&mut self) {
         while let Ok(ev) = self.bg_rx.try_recv() {
             match ev {
@@ -342,9 +423,11 @@ impl App {
                 BgEvent::TrackStarted {
                     track,
                     badge,
+                    tech_info,
                     vis_consumer,
                     cover,
                     lyrics,
+                    decoder_tx,
                 } => {
                     self.now_playing.badge = badge;
                     self.now_playing.track = track.title.clone();
@@ -355,9 +438,9 @@ impl App {
                         self.now_playing.cover = Some(c.clone());
                         self.flow_lyrics.cover = Some(c);
                     }
-                    if !lyrics.is_empty() {
-                        self.flow_lyrics.lyrics = lyrics;
-                    }
+                    // Всегда перезаписываем lyrics (очищая старый текст, если трек инструментальный)
+                    self.flow_lyrics.lyrics = lyrics;
+                    self.flow_lyrics.position_ms = 0;
                     self.search.player.track = track.title.clone();
                     self.search.player.artist = track.artist.clone();
                     self.search.player.paused = false;
@@ -365,9 +448,20 @@ impl App {
                     self.library.player.artist = track.artist.clone();
                     self.library.player.paused = false;
                     self.flow_lyrics.paused = false;
-                    self.current_duration_secs = track.duration_secs();
-                    self.track_started_at = Some(Instant::now());
+
+                    self.current_sample_rate = tech_info.sample_rate.max(1);
+                    self.current_duration_secs = tech_info.duration_secs.max(1);
+                    self.current_tech_info = Some(tech_info);
+                    self.decoder_tx = decoder_tx;
                     self.vis_consumer = Some(vis_consumer);
+                }
+                BgEvent::TrackEnded => {
+                    if let Some(next_track) = self.queue.next_track() {
+                        self.start_track_playback(next_track);
+                    } else {
+                        self.now_playing.paused = true;
+                        self.paused_flag.store(true, Ordering::SeqCst);
+                    }
                 }
                 BgEvent::PlaybackError(msg) => {
                     self.status_message = Some(msg);
@@ -376,34 +470,52 @@ impl App {
         }
     }
 
-    /// Запускает реальное воспроизведение выбранного трека (ARL HiFi поток, либо 30с превью, либо синтезатор).
+    /// Запускает воспроизведение выбранного трека с синхронизацией через `CPAL`.
     fn start_track_playback(&mut self, track: TrackData) {
         self.stop_decode.store(true, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_decode = Arc::clone(&stop_flag);
+
         self.paused_flag.store(false, Ordering::SeqCst);
         let paused_flag = Arc::clone(&self.paused_flag);
 
+        let played_frames = Arc::new(AtomicU64::new(0));
+        self.played_frames = Arc::clone(&played_frames);
+
+        // Немедленно очищаем старый текст песни перед стартом нового трека
+        self.flow_lyrics.lyrics.clear();
+        self.flow_lyrics.position_ms = 0;
+        self.now_playing.progress = 0.0;
+        self.decoder_tx = None;
+
         let (audio_ring, vis_ring) = create_rings();
         let (mut audio_prod, audio_cons) = audio_ring.split();
-        let (mut vis_prod, vis_cons) = vis_ring.split();
+        let (vis_prod, vis_cons) = vis_ring.split();
 
-        // Открываем реальный звуковой вывод CPAL 44.1 kHz
-        match AudioOutput::new(audio_cons, self.volume) {
+        match AudioOutput::new_with_sync(
+            audio_cons,
+            Some(vis_prod),
+            self.volume,
+            Arc::clone(&paused_flag),
+            Arc::clone(&played_frames),
+        ) {
             Ok(out) => {
+                self.current_sample_rate = out.sample_rate();
                 self.audio_output = Some(out);
             }
             Err(e) => {
                 tracing::warn!("Не удалось открыть аудиоустройство CPAL: {e}");
+                self.audio_output = None;
             }
         }
 
         let tx = self.bg_tx.clone();
         let arl_opt = self.config.effective_arl();
+        let preferred_quality = self.config.preferred_audio_quality();
 
         self.rt.spawn(async move {
             let mut client = DeezerClient::new().unwrap();
-            let mut stream_opt: Option<(DeezerStream, String)> = None;
+            let mut stream_opt: Option<(DeezerStream, bool)> = None;
             let mut lyrics = Vec::new();
 
             if let Some(arl) = arl_opt
@@ -419,24 +531,22 @@ impl App {
                     client.get_track(&track.track_id).await
                 };
                 if let Ok(ft) = full_track
-                    && let Ok((url, q)) = client.get_stream_url(&ft, AudioQuality::Flac).await
+                    && let Ok((url, _q)) = client.get_stream_url(&ft, preferred_quality).await
                     && let Ok(s) = DeezerStream::fetch(client.http(), &url, &ft.track_id).await
                 {
-                    stream_opt = Some((s, q.label().to_string()));
+                    stream_opt = Some((s, false));
                 }
             }
 
-            // Если нет ARL или трек из гостевого режима — качаем 30-секундное MP3-превью с CDN Deezer
             if stream_opt.is_none()
                 && let Some(ref preview_url) = track.preview_url
                 && let Ok(resp) = client.http().get(preview_url).send().await
                 && let Ok(bytes) = resp.bytes().await
                 && let Ok(s) = DeezerStream::try_from_decrypted(&bytes)
             {
-                stream_opt = Some((s, "MP3 PREVIEW | 128 kbps (GUEST)".to_string()));
+                stream_opt = Some((s, true));
             }
 
-            // Скачиваем JPEG-обложку альбома
             let cover_url = track
                 .cover_url_direct
                 .clone()
@@ -449,38 +559,97 @@ impl App {
                 cover = CoverArt::from_bytes(&bytes).ok();
             }
 
-            let badge = stream_opt
-                .as_ref()
-                .map(|(_, b)| b.clone())
-                .unwrap_or_else(|| "SYNTH DEMO | 44.1 kHz".to_string());
-
-            let _ = tx.send(BgEvent::TrackStarted {
-                track: track.clone(),
-                badge,
-                vis_consumer: vis_cons,
-                cover,
-                lyrics,
-            });
-
-            // Запускаем поток декодирования Symphonia (или гармонический демо-синтезатор при оффлайне)
             thread::spawn(move || {
                 match stream_opt {
-                    Some((stream, _)) => {
-                        if let Ok(mut dec) = Decoder::new(Box::new(stream), audio_prod, vis_prod) {
+                    Some((stream, is_preview)) => {
+                        let fallback_dur = if is_preview {
+                            30
+                        } else {
+                            track.duration_secs()
+                        };
+                        if let Ok((mut dec, mut tech_info)) = Decoder::new_seekable(
+                            Box::new(stream),
+                            audio_prod,
+                            fallback_dur,
+                        ) {
+                            if is_preview {
+                                tech_info.duration_secs = tech_info.duration_secs.min(30);
+                            }
+                            let badge = tech_info.badge(is_preview);
+                            let sample_rate = u64::from(tech_info.sample_rate.max(1));
+                            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DecoderCommand>();
+
+                            let _ = tx.send(BgEvent::TrackStarted {
+                                track: track.clone(),
+                                badge,
+                                tech_info,
+                                vis_consumer: vis_cons,
+                                cover,
+                                lyrics,
+                                decoder_tx: Some(cmd_tx),
+                            });
+
                             while !stop_flag.load(Ordering::Relaxed) {
+                                while let Ok(DecoderCommand::Seek(target_sec)) = cmd_rx.try_recv() {
+                                    if let Ok(actual_frames) = dec.seek(target_sec) {
+                                        played_frames.store(actual_frames, Ordering::SeqCst);
+                                    } else {
+                                        played_frames.store(
+                                            target_sec.saturating_mul(sample_rate),
+                                            Ordering::SeqCst,
+                                        );
+                                    }
+                                }
+
                                 if paused_flag.load(Ordering::Relaxed) {
-                                    thread::sleep(Duration::from_millis(20));
+                                    thread::sleep(Duration::from_millis(15));
                                     continue;
                                 }
+
                                 match dec.process_next() {
                                     Ok(Some(_)) => {}
-                                    _ => break,
+                                    Ok(None) => {
+                                        // Ждём, пока CPAL доиграет оставшиеся сэмплы в буфере
+                                        while !stop_flag.load(Ordering::Relaxed)
+                                            && dec.audio_producer.slots()
+                                                < AUDIO_RING_BUFFER_CAPACITY
+                                        {
+                                            if paused_flag.load(Ordering::Relaxed) {
+                                                thread::sleep(Duration::from_millis(20));
+                                                continue;
+                                            }
+                                            thread::sleep(Duration::from_millis(20));
+                                        }
+                                        if !stop_flag.load(Ordering::Relaxed) {
+                                            let _ = tx.send(BgEvent::TrackEnded);
+                                        }
+                                        break;
+                                    }
+                                    Err(_) => break,
                                 }
                             }
                         }
                     }
                     None => {
-                        // Fallback: музыкальный аккорд, чтобы звук и спектр работали даже без интернета
+                        let tech_info = StreamTechInfo {
+                            codec_name: "SYNTH".into(),
+                            sample_rate: 44_100,
+                            bits_per_sample: 32,
+                            total_frames: 44_100 * 30,
+                            duration_secs: 30,
+                            bitrate_kbps: 1411,
+                            file_size_bytes: 0,
+                        };
+                        let _ = tx.send(BgEvent::TrackStarted {
+                            track: track.clone(),
+                            badge: "SYNTH DEMO | 44.1 kHz".to_string(),
+                            tech_info,
+                            vis_consumer: vis_cons,
+                            cover,
+                            lyrics,
+                            decoder_tx: None,
+                        });
+
                         let mut phase = 0usize;
                         let chunk_frames = 1024usize;
                         let mut stereo = vec![0.0f32; chunk_frames * 2];
@@ -493,25 +662,35 @@ impl App {
                                 let t = (phase + i) as f32 / 44_100.0;
                                 let env = (t * 2.5).sin().abs();
                                 let bass = (2.0 * std::f32::consts::PI * 110.0 * t).sin() * 0.45;
-                                let mid = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.25 * env;
-                                let high = (2.0 * std::f32::consts::PI * 2200.0 * t).sin() * 0.15
+                                let mid =
+                                    (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.25 * env;
+                                let high = (2.0 * std::f32::consts::PI * 2200.0 * t).sin()
+                                    * 0.15
                                     * (1.0 - env);
                                 let s = (bass + mid + high).clamp(-1.0, 1.0);
                                 stereo[2 * i] = s;
                                 stereo[2 * i + 1] = s;
                             }
                             phase = phase.wrapping_add(chunk_frames);
-                            write_interleaved_stereo_to_rings(
-                                &stereo,
-                                &mut audio_prod,
-                                &mut vis_prod,
-                            );
+                            push_all_blocking(&mut audio_prod, &stereo);
                             thread::sleep(Duration::from_millis(20));
                         }
                     }
                 }
             });
         });
+    }
+
+    pub fn play_next_in_queue(&mut self) {
+        if let Some(next) = self.queue.next_track() {
+            self.start_track_playback(next);
+        }
+    }
+
+    pub fn play_prev_in_queue(&mut self) {
+        if let Some(prev) = self.queue.prev_track() {
+            self.start_track_playback(prev);
+        }
     }
 
     fn trigger_search(&mut self) {
@@ -568,7 +747,7 @@ impl App {
 
         buf.set_string(area.left(), y, "DEEZER-TUI", title_style);
 
-        let tabs = ["Now Playing", "Search", "Library", "Flow"];
+        let tabs = ["Now Playing", "Search", "Library", "Flow", "Settings"];
         let mut x = (area.left() as usize) + 12;
         for (i, name) in tabs.iter().enumerate() {
             let tab_num = (i + 1) as u8;
@@ -585,11 +764,11 @@ impl App {
         }
 
         let status = if let Some(ref u) = self.user_label {
-            format!("CONNECTED ({u})")
+            format!("ONLINE ({u})")
         } else if self.client.is_authenticated() {
-            "CONNECTED".to_string()
+            "ONLINE".to_string()
         } else {
-            "GUEST [press L for ARL]".to_string()
+            "GUEST".to_string()
         };
         let vol_pct = (self.volume * 100.0).round() as i32;
         let clock = Self::current_clock_hhmm();
@@ -601,18 +780,149 @@ impl App {
         }
     }
 
+    fn draw_global_sidebar(&self, buf: &mut Buffer, area: Rect) {
+        if area.width < 4 || area.height < 2 {
+            return;
+        }
+        let header_style = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_END))
+            .bold();
+        let active_style = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_START))
+            .bold();
+        let normal_style = Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY));
+        let dim_style = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
+
+        let max_w = area.width.saturating_sub(1) as usize;
+        buf.set_string(
+            area.x,
+            area.y,
+            "NAVIGATION [S]".chars().take(max_w).collect::<String>(),
+            header_style,
+        );
+
+        let nav_items: [(u8, &str); 5] = [
+            (1, "[1] Now Playing"),
+            (2, "[2] Search"),
+            (3, "[3] Library"),
+            (4, "[4] Flow"),
+            (5, "[5] Settings"),
+        ];
+
+        let mut y = area.y + 1;
+        for (tab_id, label) in nav_items {
+            if y >= area.bottom() {
+                break;
+            }
+            let is_active = self.active_tab == tab_id;
+            let line = format!("{} {}", if is_active { "▶" } else { " " }, label);
+            buf.set_string(
+                area.x,
+                y,
+                line.chars().take(max_w).collect::<String>(),
+                if is_active { active_style } else { normal_style },
+            );
+            y += 1;
+
+            if tab_id == 3 {
+                for (idx, pl) in self.library.playlists.iter().take(4).enumerate() {
+                    if y >= area.bottom() {
+                        break;
+                    }
+                    let prefix = if idx + 1 == self.library.playlists.len().min(4) {
+                        "    └─ "
+                    } else {
+                        "    ├─ "
+                    };
+                    let pl_line = format!("{prefix}{}", pl.title);
+                    buf.set_string(
+                        area.x,
+                        y,
+                        pl_line.chars().take(max_w).collect::<String>(),
+                        dim_style,
+                    );
+                    y += 1;
+                }
+            }
+        }
+
+        // Вертикальный разделитель справа от сайдбара
+        let sep_x = area.right().saturating_sub(1);
+        for ry in area.top()..area.bottom() {
+            buf.set_string(sep_x, ry, "│", dim_style);
+        }
+    }
+
+    fn draw_global_player_bar(&self, buf: &mut Buffer, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let y = area.y;
+        let cur_str = Self::format_mm_ss(self.elapsed_secs());
+        let tot_str = Self::format_mm_ss(self.current_duration_secs);
+        let play_icon = if self.now_playing.paused {
+            "[▶ Play]"
+        } else {
+            "[⏸ Pause]"
+        };
+        let vol_pct = (self.volume * 100.0).round() as i32;
+        let right_info = format!(
+            " [⏮] {play_icon} [⏭]  {}  Vol: {vol_pct}%",
+            self.now_playing.badge
+        );
+
+        let left_time = format!("{cur_str} ");
+        let right_time = format!(" {tot_str}");
+        let fixed_chars =
+            left_time.chars().count() + right_time.chars().count() + right_info.chars().count();
+
+        let text_style = Style::default()
+            .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL));
+        let accent_style = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_START))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL))
+            .bold();
+        let dim_style = Style::default()
+            .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL));
+
+        if (area.width as usize) > fixed_chars + 8 {
+            let bar_w = (area.width as usize - fixed_chars) as u16;
+            let mut x = area.x;
+            buf.set_string(x, y, &left_time, text_style);
+            x += left_time.chars().count() as u16;
+
+            let cursor =
+                (self.now_playing.progress.clamp(0.0, 1.0) * bar_w.saturating_sub(1) as f32) as u16;
+            for bx in 0..bar_w {
+                if bx < cursor {
+                    buf.set_string(x + bx, y, "━", accent_style);
+                } else if bx == cursor {
+                    buf.set_string(x + bx, y, "●", accent_style);
+                } else {
+                    buf.set_string(x + bx, y, "─", dim_style);
+                }
+            }
+            x += bar_w;
+
+            buf.set_string(x, y, &right_time, text_style);
+            x += right_time.chars().count() as u16;
+            buf.set_string(x, y, &right_info, accent_style);
+        } else {
+            let compact = format!("{cur_str}/{tot_str} {play_icon} {}", self.now_playing.badge);
+            let truncated: String = compact.chars().take(area.width as usize).collect();
+            buf.set_string(area.x, y, &truncated, accent_style);
+        }
+    }
+
     fn draw_bottom_bar(&self, buf: &mut Buffer, area: Rect) {
         let y = area.bottom() - 1;
         let style = Style::default()
             .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
             .bg(theme::color_from_hex(theme::BG_TERMINAL));
-        let hotkeys = if self.active_tab == 2 {
-            "type to search | Enter search/play | Up/Down select | F1-F4/Tab screen | L login ARL | Esc back"
-        } else if self.active_tab == 3 {
-            "q quit | 1-4/Tab screen | Enter play | a add to playlist | Up/Down select | L login ARL"
-        } else {
-            "q quit | 1-4/Tab screen | space play/pause | Enter play | <- -> seek | + - vol | L login ARL"
-        };
+        let hotkeys =
+            "q quit | 1-5/Tab screen | Space play/pause | n/p next/prev | <- -> seek | s sidebar | v spectrum | + - vol";
         let truncated: String = hotkeys.chars().take(area.width as usize).collect();
         buf.set_string(area.left(), y, &truncated, style);
     }
@@ -621,7 +931,6 @@ impl App {
         if area.is_empty() {
             return;
         }
-        // Заливаем весь экран фирменным тёмным фоном #13151F
         let bg_style = Style::default()
             .bg(theme::color_from_hex(theme::BG_TERMINAL))
             .fg(theme::color_from_hex(theme::TEXT_PRIMARY));
@@ -629,22 +938,66 @@ impl App {
 
         self.draw_top_bar(buf, area);
         self.draw_bottom_bar(buf, area);
+
         if area.height >= 3 {
-            let screen_area = Rect::new(area.left(), area.top() + 1, area.width, area.height - 2);
-            if !screen_area.is_empty() {
-                match self.active_tab {
-                    1 => (&self.now_playing).render(screen_area, buf),
-                    2 => (&self.search).render(screen_area, buf),
-                    3 => (&self.library).render(screen_area, buf),
-                    4 => (&self.flow_lyrics).render(screen_area, buf),
-                    _ => {}
+            let inner = Rect::new(area.left(), area.top() + 1, area.width, area.height - 2);
+            if !inner.is_empty() {
+                let spec_rows = if self.config.show_spectrum && inner.height >= 10 {
+                    3u16
+                } else {
+                    0u16
+                };
+                let player_rows = if inner.height >= 5 { 1u16 } else { 0u16 };
+                let footer_h = spec_rows + player_rows;
+                let viewport_h = inner.height.saturating_sub(footer_h);
+
+                let main_area = Rect::new(inner.x, inner.y, inner.width, viewport_h);
+
+                // Отрисовываем глобальный сворачиваемый сайдбар слева (если не свёрнут и хватает ширины)
+                let content_area = if !self.config.sidebar_collapsed && main_area.width >= 64 {
+                    let sb_w = 22u16;
+                    let sb_rect = Rect::new(main_area.x, main_area.y, sb_w, main_area.height);
+                    self.draw_global_sidebar(buf, sb_rect);
+                    Rect::new(
+                        main_area.x + sb_w,
+                        main_area.y,
+                        main_area.width - sb_w,
+                        main_area.height,
+                    )
+                } else {
+                    main_area
+                };
+
+                if !content_area.is_empty() {
+                    match self.active_tab {
+                        1 => (&self.now_playing).render(content_area, buf),
+                        2 => (&self.search).render(content_area, buf),
+                        3 => (&self.library).render(content_area, buf),
+                        4 => (&self.flow_lyrics).render(content_area, buf),
+                        _ => {}
+                    }
+                }
+
+                if player_rows > 0 {
+                    let player_rect = Rect::new(inner.x, inner.y + viewport_h, inner.width, 1);
+                    self.draw_global_player_bar(buf, player_rect);
+                }
+
+                if spec_rows > 0 {
+                    let spec_rect = Rect::new(
+                        inner.x,
+                        inner.y + viewport_h + player_rows,
+                        inner.width,
+                        spec_rows,
+                    );
+                    (&self.global_spectrum).render(spec_rect, buf);
                 }
 
                 if self.show_arl_modal {
-                    let mw = 60.min(screen_area.width).max(3);
-                    let mh = 6.min(screen_area.height).max(3);
-                    let mx = screen_area.x + (screen_area.width - mw) / 2;
-                    let my = screen_area.y + (screen_area.height - mh) / 2;
+                    let mw = 60.min(inner.width).max(3);
+                    let mh = 6.min(inner.height).max(3);
+                    let mx = inner.x + (inner.width - mw) / 2;
+                    let my = inner.y + (inner.height - mh) / 2;
                     let m_area = Rect::new(mx, my, mw, mh);
                     let display_arl = if self.arl_input.is_empty() {
                         "<paste your Deezer ARL cookie here & press Enter>".to_string()
@@ -680,7 +1033,8 @@ impl App {
                 let area = frame.area();
                 let desired_bars = ((area.width as usize) / 2).clamp(16, 96);
                 if self.cavacore.num_bars() != desired_bars && area.width >= 40 {
-                    self.cavacore = Cavacore::new(self.config.sample_rate_hz, desired_bars);
+                    self.cavacore = Cavacore::new(self.config.sample_rate_hz, desired_bars)
+                        .with_db_scale(self.config.db_scale);
                 }
                 self.render(frame.buffer_mut(), area);
             });
@@ -701,7 +1055,6 @@ impl App {
             && let Ok(Event::Key(k)) = event::read()
             && k.kind == KeyEventKind::Press
         {
-            // 1. Если открыто окно ввода ARL-куки
             if self.show_arl_modal {
                 match k.code {
                     KeyCode::Esc => self.show_arl_modal = false,
@@ -719,9 +1072,7 @@ impl App {
                         let _ = self.config.save();
                         self.spawn_initial_load();
                     }
-                    KeyCode::Char(c)
-                        if !k.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.arl_input.push(c);
                     }
                     _ => {}
@@ -729,7 +1080,6 @@ impl App {
                 return Ok(());
             }
 
-            // 2. Глобальные функциональные клавиши переключения экранов (работают даже при вводе в Search)
             match k.code {
                 KeyCode::F(1) => {
                     self.active_tab = 1;
@@ -747,13 +1097,17 @@ impl App {
                     self.active_tab = 4;
                     return Ok(());
                 }
+                KeyCode::F(5) => {
+                    self.active_tab = 5;
+                    return Ok(());
+                }
                 KeyCode::Tab => {
-                    self.active_tab = (self.active_tab % 4) + 1;
+                    self.active_tab = (self.active_tab % 5) + 1;
                     return Ok(());
                 }
                 KeyCode::BackTab => {
                     self.active_tab = if self.active_tab <= 1 {
-                        4
+                        5
                     } else {
                         self.active_tab - 1
                     };
@@ -762,7 +1116,6 @@ impl App {
                 _ => {}
             }
 
-            // 3. На вкладке 2 (Search) печатаемые символы и Backspace идут в поисковую строку
             if self.active_tab == 2 {
                 match k.code {
                     KeyCode::Backspace => {
@@ -777,8 +1130,9 @@ impl App {
                         if !k.modifiers.contains(KeyModifiers::CONTROL)
                             && !k.modifiers.contains(KeyModifiers::ALT) =>
                     {
-                        // Если строка поиска пуста и нажата цифра 1..4 — переключаем вкладку
-                        if self.search.query.is_empty() && matches!(c, '1' | '2' | '3' | '4') {
+                        if self.search.query.is_empty()
+                            && matches!(c, '1' | '2' | '3' | '4' | '5')
+                        {
                             self.active_tab = c as u8 - b'0';
                             return Ok(());
                         }
@@ -809,21 +1163,25 @@ impl App {
                 }
             }
 
-            // 4. Стандартные хоткеи на вкладках 1, 3, 4
             match k.code {
                 KeyCode::Char('q') => self.running = false,
                 KeyCode::Char('1') => self.active_tab = 1,
                 KeyCode::Char('2') => self.active_tab = 2,
                 KeyCode::Char('3') => self.active_tab = 3,
                 KeyCode::Char('4') => self.active_tab = 4,
+                KeyCode::Char('5') => self.active_tab = 5,
                 KeyCode::Char('l') | KeyCode::Char('L') => {
                     self.show_arl_modal = true;
                 }
-                KeyCode::Char('a') | KeyCode::Char('p') if self.active_tab == 3 => {
+                KeyCode::Char('a') if self.active_tab == 3 => {
                     self.library.modal_selected = self.library.selected_playlist;
                     self.library.show_choose_modal = !self.library.show_choose_modal;
                 }
                 KeyCode::Char(' ') => self.toggle_play_pause(),
+                KeyCode::Char('n') | KeyCode::Char('>') => self.play_next_in_queue(),
+                KeyCode::Char('p') | KeyCode::Char('<') => self.play_prev_in_queue(),
+                KeyCode::Char('v') | KeyCode::Char('V') => self.toggle_spectrum(),
+                KeyCode::Char('s') | KeyCode::Char('S') => self.toggle_sidebar(),
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     self.volume = (self.volume + 0.05).min(1.0);
                     if let Some(ref out) = self.audio_output {
@@ -854,7 +1212,7 @@ impl App {
         Ok(())
     }
 
-    fn toggle_play_pause(&mut self) {
+    pub fn toggle_play_pause(&mut self) {
         let new_paused = !self.now_playing.paused;
         self.now_playing.paused = new_paused;
         self.search.player.paused = new_paused;
@@ -863,15 +1221,40 @@ impl App {
         self.paused_flag.store(new_paused, Ordering::SeqCst);
     }
 
-    fn seek(&mut self, forward: bool) {
-        let delta = if forward { 0.05 } else { -0.05 };
-        let next_prog = (self.now_playing.progress + delta).clamp(0.0, 1.0);
+    pub fn toggle_spectrum(&mut self) {
+        self.config.show_spectrum = !self.config.show_spectrum;
+        let _ = self.config.save();
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.config.sidebar_collapsed = !self.config.sidebar_collapsed;
+        let _ = self.config.save();
+    }
+
+    pub fn seek(&mut self, forward: bool) {
+        let step_secs = 5i64;
+        let cur_secs = self.elapsed_secs() as i64;
+        let max_secs = self.current_duration_secs as i64;
+        let target_secs = if forward {
+            (cur_secs + step_secs).clamp(0, max_secs) as u64
+        } else {
+            (cur_secs - step_secs).clamp(0, max_secs) as u64
+        };
+
+        let sr = u64::from(self.current_sample_rate.max(1));
+        self.played_frames
+            .store(target_secs.saturating_mul(sr), Ordering::SeqCst);
+
+        if let Some(ref tx) = self.decoder_tx {
+            let _ = tx.send(DecoderCommand::Seek(target_secs));
+        }
+
+        let total = self.current_duration_secs.max(1) as f32;
+        let next_prog = (target_secs as f32 / total).clamp(0.0, 1.0);
         self.now_playing.progress = next_prog;
         self.search.player.progress = next_prog;
         self.library.player.progress = next_prog;
-        let delta_ms = if forward { 2000 } else { -2000 };
-        self.flow_lyrics.position_ms =
-            (self.flow_lyrics.position_ms as i64 + delta_ms).max(0) as u64;
+        self.flow_lyrics.position_ms = target_secs * 1000;
     }
 
     fn navigate_up(&mut self) {
@@ -882,7 +1265,6 @@ impl App {
                 }
             }
             3 => {
-                // Если открыта модалка CHOOSE PLAYLIST — двигаем ТОЛЬКО курсор модалки!
                 if self.library.show_choose_modal {
                     if self.library.modal_selected > 0 {
                         self.library.modal_selected -= 1;
@@ -909,7 +1291,6 @@ impl App {
                 }
             }
             3 => {
-                // Если открыта модалка CHOOSE PLAYLIST — двигаем ТОЛЬКО курсор модалки!
                 if self.library.show_choose_modal {
                     if self.library.modal_selected + 1 < self.library.playlists.len() {
                         self.library.modal_selected += 1;
@@ -959,24 +1340,28 @@ impl App {
     fn press_enter(&mut self) {
         match self.active_tab {
             1 => {
-                if let Some(first) = self.flow_tracks.first().cloned() {
-                    self.start_track_playback(first);
+                if let Some(track) = self.queue.set_queue(self.flow_tracks.clone(), 0) {
+                    self.start_track_playback(track);
                 } else {
-                    self.start_track_playback(TrackData {
+                    let demo = TrackData {
                         track_id: "3135556".into(),
                         title: "Harder, Better, Faster, Stronger".into(),
                         artist: "Daft Punk".into(),
                         album: "Discovery".into(),
                         duration: "3:44".into(),
                         ..Default::default()
-                    });
+                    };
+                    self.queue.set_queue(vec![demo.clone()], 0);
+                    self.start_track_playback(demo);
                 }
             }
             2 => {
-                // Если ввели новый запрос — выполняем поиск; если выбран трек — запускаем его
                 if !self.search.query.trim().is_empty() && self.search.rows.is_empty() {
                     self.trigger_search();
-                } else if let Some(track) = self.search_tracks.get(self.search.selected).cloned() {
+                } else if let Some(track) = self
+                    .queue
+                    .set_queue(self.search_tracks.clone(), self.search.selected)
+                {
                     if !self.search.query.trim().is_empty() {
                         self.trigger_search();
                     }
@@ -987,7 +1372,6 @@ impl App {
             }
             3 => {
                 if self.library.show_choose_modal {
-                    // Копируем выбранный трек в целевой плейлист и закрываем модалку
                     let src_pl = self.library.selected_playlist;
                     let src_tr = self.library.selected_track;
                     let dst_pl = self.library.modal_selected;
@@ -1004,8 +1388,9 @@ impl App {
                         target.num_tracks = target.tracks.len() as u64;
                     }
                     self.library.show_choose_modal = false;
-                } else if let Some(track) =
-                    self.library_tracks.get(self.library.selected_track).cloned()
+                } else if let Some(track) = self
+                    .queue
+                    .set_queue(self.library_tracks.clone(), self.library.selected_track)
                 {
                     self.start_track_playback(track);
                 } else if let Some(row) = self
@@ -1014,29 +1399,36 @@ impl App {
                     .get(self.library.selected_playlist)
                     .and_then(|p| p.tracks.get(self.library.selected_track))
                 {
-                    self.start_track_playback(TrackData {
+                    let track = TrackData {
                         track_id: "0".into(),
                         title: row.track.clone(),
                         artist: row.artist.clone(),
                         album: row.album.clone(),
                         duration: row.time.clone(),
                         ..Default::default()
-                    });
+                    };
+                    self.queue.set_queue(vec![track.clone()], 0);
+                    self.start_track_playback(track);
                 }
             }
             4 => {
-                if let Some(track) = self.flow_tracks.get(self.flow_lyrics.selected_flow).cloned() {
+                if let Some(track) = self
+                    .queue
+                    .set_queue(self.flow_tracks.clone(), self.flow_lyrics.selected_flow)
+                {
                     self.start_track_playback(track);
                 } else if let Some(row) = self.flow_lyrics.flow.get(self.flow_lyrics.selected_flow)
                 {
-                    self.start_track_playback(TrackData {
+                    let track = TrackData {
                         track_id: "0".into(),
                         title: row.title.clone(),
                         artist: row.artist.clone(),
                         album: "Deezer Flow".into(),
                         duration: "3:30".into(),
                         ..Default::default()
-                    });
+                    };
+                    self.queue.set_queue(vec![track.clone()], 0);
+                    self.start_track_playback(track);
                 }
             }
             _ => {}
@@ -1095,19 +1487,20 @@ mod tests {
     }
 
     #[test]
-    fn renders_top_and_bottom_bars_with_1_to_4_tabs() {
+    fn renders_top_and_bottom_bars_with_1_to_5_tabs() {
         let app = App::new();
-        let terminal = render_ui(&app, 110, 20);
+        let terminal = render_ui(&app, 120, 24);
         assert!(row_has(&terminal, 0, "DEEZER-TUI"));
         assert!(row_has(&terminal, 0, "[1]Now Playing"));
         assert!(row_has(&terminal, 0, "[2]Search"));
         assert!(row_has(&terminal, 0, "[3]Library"));
         assert!(row_has(&terminal, 0, "[4]Flow"));
-        assert!(row_has(&terminal, 19, "q quit"));
+        assert!(row_has(&terminal, 0, "[5]Settings"));
+        assert!(row_has(&terminal, 23, "q quit"));
     }
 
     #[test]
-    fn renders_each_tab_screen() {
+    fn renders_each_tab_screen_with_global_player_and_sidebar() {
         let expectations: [(u8, &str); 4] = [
             (1, "FLAC | 1411 kbps"),
             (2, "ARTISTS"),
@@ -1120,7 +1513,57 @@ mod tests {
             let terminal = render_ui(&app, 120, 40);
             assert!(row_has(&terminal, 0, "DEEZER-TUI"));
             assert!(screen_has(&terminal, needle));
+            assert!(screen_has(&terminal, "NAVIGATION [S]"));
+            assert!(screen_has(&terminal, "00:00"));
         }
+    }
+
+    #[test]
+    fn sidebar_and_spectrum_toggles_work() {
+        let mut app = App::new();
+        assert!(!app.config.sidebar_collapsed);
+        app.toggle_sidebar();
+        assert!(app.config.sidebar_collapsed);
+        let terminal = render_ui(&app, 120, 40);
+        assert!(!screen_has(&terminal, "NAVIGATION [S]"));
+
+        assert!(app.config.show_spectrum);
+        app.toggle_spectrum();
+        assert!(!app.config.show_spectrum);
+    }
+
+    #[test]
+    fn playback_queue_advances_and_rewinds() {
+        let mut q = PlaybackQueue::default();
+        let tracks = vec![
+            TrackData {
+                track_id: "1".into(),
+                title: "One".into(),
+                ..Default::default()
+            },
+            TrackData {
+                track_id: "2".into(),
+                title: "Two".into(),
+                ..Default::default()
+            },
+        ];
+        let first = q.set_queue(tracks, 0).unwrap();
+        assert_eq!(first.title, "One");
+        let second = q.next_track().unwrap();
+        assert_eq!(second.title, "Two");
+        assert!(q.next_track().is_none());
+        let prev = q.prev_track().unwrap();
+        assert_eq!(prev.title, "One");
+    }
+
+    #[test]
+    fn seek_updates_played_frames_and_progress() {
+        let mut app = App::new();
+        app.current_sample_rate = 44_100;
+        app.current_duration_secs = 100;
+        app.seek(true);
+        assert_eq!(app.elapsed_secs(), 5);
+        assert!((app.now_playing.progress - 0.05).abs() < 1e-4);
     }
 
     #[test]
@@ -1138,6 +1581,7 @@ mod tests {
             "фоновая таблица треков не должна двигаться при открытом модальном окне!"
         );
     }
+
     #[test]
     fn renders_on_narrow_terminal() {
         let app = App::new();

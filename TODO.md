@@ -1,6 +1,6 @@
-# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026)
+# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.0)
 
-Выполняй задачи строго сверху вниз по одной за итерацию. После прохождения cargo test и cargo clippy -- -D warnings меняй [ ] на [x].
+Выполняй задачи строго сверху вниз по одной за итерацию. После прохождения cargo test и cargo clippy --all-targets -- -D warnings меняй [ ] на [x].
 
 ## Фаза 1: Инициализация и математическое ядро Cavacore
 - [x] Создать Cargo.toml с актуальными зависимостями 2026 года из ARCHITECTURE.md и базовую структуру модулей в src/.
@@ -35,4 +35,30 @@
 - [x] Сверстать src/ui/views/flow_lyrics.rs (Экран 04: блок Deezer Flow, синхронная прокрутка LYRICS по таймкоду декодера с бирюзовой подсветкой активной строки и полный спектр снизу).
 - [x] Подключить D-Bus MPRIS через souvlaki 0.9 (use_zbus) и префетч следующего трека за 20 секунд до окончания текущего для Gapless-воспроизведения.
 - [x] Прогнать финальный cargo test и cargo clippy -- -D warnings.
+
+## Фаза 6: Синхронизация звука и спектра, мгновенная пауза, Seek и очередь треков
+
+* [x] **Шаг 6.1 (`src/audio/output.rs`):** Добавить в `AudioOutput` атомарный флаг `paused: Arc<AtomicBool>`, счётчик реально сыгранных стерео-фреймов `played_frames: Arc<AtomicU64>` и передачу `vis_producer: Option<Producer<f32>>` внутрь real-time коллбэка `CPAL`. Когда `paused == true`, коллбэк пишет `0.0` в буфер карты, не читая `AudioRingBuffer`. Когда `paused == false`, коллбэк пишет моно-сэмплы `(L + R) * 0.5` в `vis_producer` и увеличивает `played_frames`. Сохранить `fill_buffer_from_consumer` и `AudioOutput::new` для совместимости, добавив `AudioOutput::new_with_sync` и unit-тесты.
+
+* [x] **Шаг 6.2 (`src/audio/decoder.rs`):** Добавить `DecoderCommand::Seek(u64)` и структуру `StreamTechInfo` (`codec_name`, `sample_rate`, `bits_per_sample`, `total_frames`, `duration_secs`, `bitrate_kbps`, `file_size_bytes`) с методом `badge(is_preview: bool)`. Реализовать `Decoder::new_seekable(source: Box<dyn MediaSource>, audio_producer: Producer<f32>, fallback_duration_secs: u64) -> Result<(Self, StreamTechInfo)>` (передача MediaSource напрямую в `MediaSourceStream::new` без `ReadOnlySource` — для Seek) и `Decoder::seek(&mut self, target_secs: u64)` через `format.seek(SeekMode::Accurate, SeekTo::Time { time: Time::from(target_secs), track_id: Some(self.track_id) })` + `decoder.reset()`.
+
+* [x] **Шаг 6.3 (`src/ui/app.rs`):** Заменить таймер `Instant::now()` на расчёт прогресса из `played_frames / sample_rate` и `StreamTechInfo::duration_secs`. Добавить `PlaybackQueue` (автоматический переход на следующий трек при `BgEvent::TrackEnded`, хоткеи `n` — следующий трек, `p` — предыдущий, `←`/`→` — отправка `DecoderCommand::Seek`). Всегда очищать `flow_lyrics.lyrics` при старте нового трека.
+
+## Фаза 7: Единый сквозной плеер, сворачиваемый сайдбар и переключатель спектра
+
+* [x] **Шаг 7.1 (`src/config.rs`):** Добавить в `AppConfig` сохраняемые поля: `preferred_quality: String` (`"FLAC"`, `"MP3_320"`, `"MP3_128"`), `show_spectrum: bool` (по умолчанию `true`), `db_scale: bool` (`false`), `sidebar_collapsed: bool` (`false`).
+
+* [x] **Шаг 7.2 (`src/ui/app.rs`):** Сделать нижнюю панель плеера (прогресс `MM:SS / MM:SS`, кнопки `[⏮] [⏸/▶] [⏭]`, реальный бейдж качества из `StreamTechInfo`, громкость) и спектр глобальными в `App::render`, убрав дублирующиеся мини-плееры из `search.rs` и `library.rs`. Добавить клавишу `v` (вкл/выкл спектра) и `s` (свернуть/развернуть левый сайдбар навигации).
+
+## Фаза 8: Удобная навигация в Search и Library + подгрузка плейлистов
+
+* [ ] **Шаг 8.1 (`src/ui/views/search.rs` и `src/ui/app.rs`):** Ввести режим фокуса поисковой строки `search_input_focused: bool`. Включать ввод текста по `/` или `f`, выключать по `Enter` (запуск поиска) или `Esc`. Когда `search_input_focused == false`, клавиши `Space`, `1`–`5`, `n`, `p`, `←`/`→`, `v`, `s` работают как глобальные хоткеи плеера.
+
+* [ ] **Шаг 8.2 (`src/api/client.rs` и `src/ui/views/library.rs`):** Добавить в `DeezerClient` метод `get_playlist_tracks(&self, playlist_id: &str)` (вызов `playlist.getSongs` в `gw-light.php` и публичный `https://api.deezer.com/playlist/{id}/tracks`). Разделить фокус на экране `Library` между списком плейлистов и таблицей треков (переключение по `Tab` или `←`/`→`), подгружая треки выбранного плейлиста.
+
+## Фаза 9: Вкладка `[5] Settings` и окно деталей потока `[i] Track Info`
+
+* [ ] **Шаг 9.1 (`src/ui/views/settings.rs`):** Создать экран `[5] Settings` (открывается по `5` или `,`): выбор качества (`FLAC 1411 kbps`, `MP3 320 kbps`, `MP3 128 kbps`), ввод и сохранение `ARL`-токена (убрать надпись `[press L for ARL]` из топ-бара в настройки), переключатели `Show Spectrum` и `dB Scale`.
+
+* [ ] **Шаг 9.2 (`src/ui/app.rs`):** Добавить модальное окно технической информации о треке и потоке по клавише `i` (`Track ID`, `Artist`, `Album`, `Codec`, `Sample Rate`, `Bit Depth`, `Bitrate kbps`, `Stream Size MB`, `Mode: HiFi BF_CBC_STRIPE / Guest Preview`).
 

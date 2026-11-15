@@ -1,6 +1,6 @@
 //! Экран 03 (Library & Overlays): дерево плейлистов, таблица треков
-//! (`#`, `TRACK`, `ARTIST`, `ALBUM`, `TIME`, `♥`) и модальный оверлей `CHOOSE PLAYLIST`
-//! с независимым курсором `modal_selected`.
+ //! (`#`, `TRACK`, `ARTIST`, `ALBUM`, `TIME`, `♥`) и модальный оверлей `CHOOSE PLAYLIST` 
+//! с независимым курсором `modal_selected`. Нижний плеер рендерится глобально в `App::render`.
 
 #![allow(dead_code)]
 
@@ -91,12 +91,7 @@ impl Widget for &Library {
             return;
         }
 
-        let mini_start = area.bottom().saturating_sub(2);
-        let body_end = mini_start;
-        if body_end > area.top() {
-            self.draw_mini_player(buf, area, mini_start, area.bottom(), w);
-        }
-
+        let body_end = area.bottom();
         if body_end > area.y + 1 {
             let y = area.y;
             if y < body_end {
@@ -345,84 +340,6 @@ impl Library {
         };
         buf.set_string(pos.x, pos.y, Self::truncate(text, max_width), style);
     }
-
-    fn draw_mini_player(
-        &self,
-        buf: &mut Buffer,
-        area: Rect,
-        start: u16,
-        end: u16,
-        width: u16,
-    ) {
-        if start >= end || start < area.top() || end > area.bottom() {
-            return;
-        }
-        let x0 = area.x;
-        if end - start < 2 {
-            self.draw_mini_player_compact(buf, area, start);
-            return;
-        }
-        {
-            let y = start;
-            let style = Style::default()
-                .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
-                .bold();
-            let label = format!("Now playing: {}", self.player.track);
-            buf.set_string(x0, y, Self::truncate(&label, width as usize), style);
-            if !self.player.artist.is_empty() {
-                let offset = (label.chars().count() + 2).min(width as usize) as u16;
-                let x = x0 + offset;
-                if x < area.right() {
-                    let dim = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
-                    buf.set_string(
-                        x,
-                        y,
-                        Self::truncate(&self.player.artist, (area.right() - x) as usize),
-                        dim,
-                    );
-                }
-            }
-        }
-        {
-            let y = start + 1;
-            let bar_w = (width * 60) / 100;
-            if bar_w > 0 {
-                let bar_style = Style::default().bg(theme::color_from_hex(theme::BG_TERMINAL));
-                for x in 0..bar_w {
-                    buf.set_string(x0 + x, y, "░", bar_style);
-                }
-                let col = (self.player.progress.clamp(0.0, 1.0) * (bar_w.saturating_sub(1) as f32))
-                    as u16;
-                let fill_style = Style::default().fg(theme::color_from_hex(theme::GRAD_START));
-                for x in 0..col {
-                    buf.set_string(x0 + x, y, "■", fill_style);
-                }
-                buf.set_string(x0 + col, y, "●", fill_style);
-            }
-            let control_style = Style::default()
-                .fg(theme::color_from_hex(theme::GRAD_END))
-                .bold();
-            if x0 + bar_w + 4 < area.right() {
-                buf.set_string(x0 + bar_w + 4, y, "▶", control_style);
-            }
-        }
-    }
-
-    fn draw_mini_player_compact(&self, buf: &mut Buffer, area: Rect, y: u16) {
-        if y >= area.bottom() {
-            return;
-        }
-        let x0 = area.x;
-        let label = format!("● {}", self.player.track);
-        let style = Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY));
-        let text = if self.player.paused {
-            format!("{label}  [Paused]")
-        } else {
-            format!("{label}  [Playing]")
-        };
-        let available = (area.right() - x0) as usize;
-        buf.set_string(x0, y, Self::truncate(&text, available).as_str(), style);
-    }
 }
 
 #[cfg(test)]
@@ -432,14 +349,7 @@ mod tests {
     use ratatui::Terminal;
 
     fn make_library() -> Library {
-        let mut lib = Library::new();
-        lib.player = crate::ui::views::search::MiniPlayer {
-            track: "Bohemian Rhapsody".into(),
-            artist: "Queen".into(),
-            progress: 0.5,
-            paused: false,
-        };
-        lib
+        Library::new()
     }
 
     fn render(screen: &Library, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -482,7 +392,6 @@ mod tests {
         assert!(row_has(&terminal, 4, "CHOOSE"));
         assert!(row_has(&terminal, 5, "TRACK"));
         assert!(row_has(&terminal, 6, "Bohemian Rhapsody"));
-        assert!(row_has(&terminal, 38, "Bohemian"));
     }
 
     #[test]
@@ -494,6 +403,7 @@ mod tests {
         assert!(row_has(&terminal, 17, "CHOOSE"));
         assert!(row_has(&terminal, 18, "My Mix"));
     }
+
     #[test]
     fn renders_in_narrow_size() {
         let screen = make_library();

@@ -220,7 +220,18 @@ impl FlowLyrics {
 
         let list_start = y0 + 1;
         let visible_rows = row_end.saturating_sub(list_start) as usize;
-        if visible_rows == 0 || self.lyrics.is_empty() {
+        if visible_rows == 0 {
+            return;
+        }
+        if self.lyrics.is_empty() {
+            let empty_msg = "No synchronized lyrics available (Instrumental / Unsynced)";
+            let style = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
+            buf.set_string(
+                x,
+                list_start,
+                Self::truncate(empty_msg, width as usize),
+                style,
+            );
             return;
         }
 
