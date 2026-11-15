@@ -197,6 +197,33 @@ impl TrackData {
         }
     }
 
+    /// Форматирует дату добавления трека (`DATE_ADD` / `TIMELINE`) в `YYYY-MM-DD`.
+    #[allow(clippy::inconsistent_digit_grouping)] // 1970_01_01_00_00_00 читается как дата YYYY_MM_DD_HH_MM_SS
+    pub fn formatted_date_add(&self) -> String {
+        if self.date_add == 0 {
+            return String::from("—");
+        }
+        // Если число вида YYYYMMDDHHMMSS (из строковой даты "2025-11-04 18:12:00")
+        if self.date_add >= 1970_01_01_00_00_00 {
+            let s = self.date_add.to_string();
+            if s.len() >= 8 {
+                return format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]);
+            }
+        }
+        // Иначе это Unix timestamp в секундах (гражданский календарь Алгоритма Говарда Хиннанта)
+        let days = (self.date_add / 86_400) as i64 + 719_468;
+        let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+        let doe = (days - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+        format!("{year:04}-{m:02}-{d:02}")
+    }
+
     /// Длительность трека в секундах.
     pub fn duration_secs(&self) -> u64 {
         if let Ok(secs) = self.duration.parse::<u64>() {

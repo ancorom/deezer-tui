@@ -82,3 +82,19 @@
 * [x] **Шаг 10.8 (`src/ui/views/library.rs`):** Сортировка треков плейлиста (`o` — критерий `Added/Title/Artist/Album` по кругу, `r` — направление `▲/▼`), сортируемые заголовки колонок, бейдж `[Sort [o/r]: ...]` в заголовке и расширенные отступы колонок.
 
 * [x] **Шаг 10.9 (`src/ui/app.rs`):** `PrefetchedTrack`-кэш мгновенной предзагрузки следующего трека (`spawn_prefetch_next` после старта текущего), `spawn_fetch_more_flow` для бесконечного Flow (автоподгрузка при ≤3 треках), `resort_active_library_playlist` с кэшем исходных треков, хоткеи `y` (лирика), `o`/`r` (сортировка), адаптивный спектр 6–4 строки, глобальные `show_lyrics`/`position_ms`.
+
+## Фаза 11: Релиз v2.2 — дебаг и доработки по диагнозу Gemini
+
+* [x] **Шаг 11.1 (`src/audio/stream.rs`):** Заменить `File::try_clone()` на in-memory буфер `Arc<RwLock<Vec<u8>>>` с независимым курсором чтения `pos: usize` у каждого экземпляра (убирает гонку двух FD на один OS offset, портившую FLAC-заголовок при быстрой смене трека); проверять `abort_download` внутри `read()` → мгновенный `Ok(0)`.
+
+* [x] **Шаг 11.2 (`src/api/models.rs`, `src/api/client.rs`, `src/mpris.rs`):** `TrackData::formatted_date_add()` → `YYYY-MM-DD` (Unix-секунды и строка `YYYYMMDDHHMMSS`, `—` при 0); `parse_public_tracks`: `cover_big` → `cover_medium` → `cover`; MPRIS-обложка 500x500 вместо 264x264.
+
+* [x] **Шаг 11.3 (`src/ui/widgets/cover_art.rs`):** Quad subpixel рендеринг **2x2 на ячейку** (16 глифов `QUADRANT_GLYPHS`, `resized_quadrant` 2x2 суперсэмплинг, `best_quadrant_cell` — 4-битная маска fg/bg с минимизацией цветов) = 2x горизонтальное разрешение обложек.
+
+* [x] **Шаг 11.4 (`src/dsp/cavacore.rs`, `src/ui/widgets/spectrum.rs`):** Дробная интерполяция между соседними FFT-бинами для узких полос (убирает «пары-близнецы» и провалы); `eq = (norm_fft * freq_tilt) / bin_count.sqrt()`, `freq_tilt = (f_hi/100)^0.55` (RMS + подъём СЧ/ВЧ); `Spectrum::render` ресемплирует полосы ровно под ширину окна (`sample_slice`, `div_ceil(width/2)`) — весь диапазон умещается при любом ресайзе.
+
+* [x] **Шаг 11.5 (`src/ui/views/search.rs`, `src/ui/views/library.rs`):** `SearchRow + pub added: String`; колонка **ADDED** (`YYYY-MM-DD`) в Library: `ADDED ▲/▼` при Default-сортировке (сортировка по `date_add`), ячейка `added` или `—`.
+
+* [x] **Шаг 11.6 (`src/ui/views/now_playing.rs`, `src/ui/views/flow_lyrics.rs`):** Увеличенные обложки: NowPlaying до 26 строк (104x52 субпикселя 2x2), FlowLyrics до 14 (56x28).
+
+* [x] **Шаг 11.7 (`src/ui/app.rs`):** `playback_seq: Arc<AtomicU64>` (req_id против гонок при быстром n/Enter, устаревшие `TrackStarted`/`TrackEnded` отбрасываются), переиспользование авторизованного `self.client` (без `login_arl` на каждый трек; свежий `get_track` при истёкшем `TRACK_TOKEN`), `BgEvent::FlowLoadFailed` + `.take(15)` убран (flow 1:1 с `flow_tracks`), player row с хоткеями `[←]` `[→]` `[⏮ p]` `[⏸ Space]` `[⏭ n]` `Vol [-/+]`, адаптивный спектр `div_ceil(width/2).clamp(8, 160)`, tokio `worker_threads(4)`.

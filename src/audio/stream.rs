@@ -1,32 +1,45 @@
 //! Поток `DeezerStream`, реализующий `Read + Seek + Send + Sync + MediaSource`.
 //!
-//! Поддерживает как синхронную работу с буфером, так и прогрессивную потоковую
-//! загрузку (`fetch_streaming`), при которой воспроизведение начинается сразу после
-//! буферизации первых 256 КБ аудиопотока.
+//! Использует разделяемый буфер в памяти `Arc<RwLock<Vec<u8>>>` с независимым курсором
+//! чтения `pos: usize`, что полностью исключает гонки файловых дескрипторов при
+//! одновременной фоновой докачке (`fetch_streaming`) и чтении декодером `Symphonia`.
 
 #![allow(dead_code)]
 
-pub use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use symphonia::core::io::MediaSource;
 
 use crate::api::crypto::{self, CHUNK_SIZE};
 
 /// Минимальный размер предбуферизации перед стартом декодера (256 КБ = 128 чанков по 2048 байт).
-const INITIAL_PREBUFFER_BYTES: u64 = 256 * 1024;
+const INITIAL_PREBUFFER_BYTES: usize = 256 * 1024;
 
-/// Кэширующий поток расшифрованного аудио Deezer.
+/// Потоковый буфер расшифрованного аудио Deezer с независимым курсором чтения.
 pub struct DeezerStream {
-    file: File,
+    data: Arc<RwLock<Vec<u8>>>,
+    pos: usize,
     total_len: Arc<AtomicU64>,
     written_len: Arc<AtomicU64>,
     finished: Arc<AtomicBool>,
     abort_download: Arc<AtomicBool>,
+}
+
+impl Clone for DeezerStream {
+    fn clone(&self) -> Self {
+        Self {
+            data: Arc::clone(&self.data),
+            pos: 0,
+            total_len: Arc::clone(&self.total_len),
+            written_len: Arc::clone(&self.written_len),
+            finished: Arc::clone(&self.finished),
+            abort_download: Arc::clone(&self.abort_download),
+        }
+    }
 }
 
 impl Drop for DeezerStream {
@@ -36,11 +49,12 @@ impl Drop for DeezerStream {
 }
 
 impl DeezerStream {
-    /// Оборачивает уже готовый временный `File`.
-    pub fn from_file(file: File) -> Self {
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    /// Создаёт `DeezerStream` из уже расшифрованного вектора байт.
+    pub fn from_decrypted(decrypted: Vec<u8>) -> Self {
+        let len = decrypted.len() as u64;
         Self {
-            file,
+            data: Arc::new(RwLock::new(decrypted)),
+            pos: 0,
             total_len: Arc::new(AtomicU64::new(len)),
             written_len: Arc::new(AtomicU64::new(len)),
             finished: Arc::new(AtomicBool::new(true)),
@@ -48,55 +62,28 @@ impl DeezerStream {
         }
     }
 
-    /// Создаёт `DeezerStream` из уже расшифрованного буфера байт.
-    pub fn from_decrypted(decrypted: Vec<u8>) -> Self {
-        Self::try_from_decrypted(&decrypted).expect("failed to write decrypted buffer to tempfile")
-    }
-
-    /// Безопасно записывает расшифрованные байты в `tempfile` и возвращает `DeezerStream`.
+    /// Создаёт `DeezerStream` из среза расшифрованных байт.
     pub fn try_from_decrypted(decrypted: &[u8]) -> Result<Self> {
-        let mut file = tempfile::tempfile().context("не удалось создать tempfile")?;
-        file.write_all(decrypted)
-            .context("ошибка записи аудиопотока в tempfile")?;
-        file.flush().context("ошибка сброса буфера tempfile")?;
-        file.seek(SeekFrom::Start(0))
-            .context("ошибка перемотки tempfile в начало")?;
-        let len = decrypted.len() as u64;
-        Ok(Self {
-            file,
-            total_len: Arc::new(AtomicU64::new(len)),
-            written_len: Arc::new(AtomicU64::new(len)),
-            finished: Arc::new(AtomicBool::new(true)),
-            abort_download: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self::from_decrypted(decrypted.to_vec()))
     }
 
     /// Принимает зашифрованный `BF_CBC_STRIPE` буфер, расшифровывает каждый блок
-    /// `chunk_idx % 3 == 0` размером ровно 2048 байт и сохраняет результат в `tempfile`.
+    /// `chunk_idx % 3 == 0` размером ровно 2048 байт и сохраняет результат в памяти.
     pub fn from_encrypted(encrypted: &[u8], key: &[u8; 16]) -> Result<Self> {
-        let mut file = tempfile::tempfile().context("не удалось создать tempfile")?;
+        let mut out = Vec::with_capacity(encrypted.len());
         let mut chunk_buf = [0u8; CHUNK_SIZE];
 
         for (chunk_idx, slice) in encrypted.chunks(CHUNK_SIZE).enumerate() {
             if slice.len() == CHUNK_SIZE && chunk_idx.is_multiple_of(3) {
                 chunk_buf.copy_from_slice(slice);
                 crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, key)?;
-                file.write_all(&chunk_buf)?;
+                out.extend_from_slice(&chunk_buf);
             } else {
-                file.write_all(slice)?;
+                out.extend_from_slice(slice);
             }
         }
 
-        file.flush()?;
-        file.seek(SeekFrom::Start(0))?;
-        let len = encrypted.len() as u64;
-        Ok(Self {
-            file,
-            total_len: Arc::new(AtomicU64::new(len)),
-            written_len: Arc::new(AtomicU64::new(len)),
-            finished: Arc::new(AtomicBool::new(true)),
-            abort_download: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self::from_decrypted(out))
     }
 
     /// Скачивает зашифрованный трек целиком (используется для фонового Prefetch следующего трека).
@@ -120,56 +107,60 @@ impl DeezerStream {
         }
 
         let content_len = resp.content_length().unwrap_or(0);
-        let reader_file = tempfile::tempfile().context("не удалось создать tempfile")?;
-        let mut writer_file = reader_file
-            .try_clone()
-            .context("не удалось клонировать дескриптор tempfile")?;
-
+        let cap = (content_len as usize).clamp(INITIAL_PREBUFFER_BYTES, 64 * 1024 * 1024);
+        let data = Arc::new(RwLock::new(Vec::with_capacity(cap)));
         let total_len = Arc::new(AtomicU64::new(content_len));
         let written_len = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
         let abort_download = Arc::new(AtomicBool::new(false));
 
-        let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE * 4);
+        let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE * 8);
         let mut chunk_idx = 0usize;
         let mut chunk_buf = [0u8; CHUNK_SIZE];
-        let mut written_so_far = 0u64;
+        let mut written_so_far = 0usize;
 
         // 1. Буферизуем первые 256 КБ перед стартом декодера
         while written_so_far < INITIAL_PREBUFFER_BYTES {
             match resp.chunk().await? {
                 Some(bytes) => {
                     pending.extend_from_slice(&bytes);
-                    while pending.len() >= CHUNK_SIZE {
-                        chunk_buf.copy_from_slice(&pending[..CHUNK_SIZE]);
-                        pending.drain(..CHUNK_SIZE);
-                        if chunk_idx.is_multiple_of(3) {
-                            crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, &key)?;
+                    if pending.len() >= CHUNK_SIZE {
+                        let mut batch = Vec::with_capacity(pending.len());
+                        while pending.len() >= CHUNK_SIZE {
+                            chunk_buf.copy_from_slice(&pending[..CHUNK_SIZE]);
+                            pending.drain(..CHUNK_SIZE);
+                            if chunk_idx.is_multiple_of(3) {
+                                crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, &key)?;
+                            }
+                            batch.extend_from_slice(&chunk_buf);
+                            chunk_idx += 1;
+                            written_so_far += CHUNK_SIZE;
                         }
-                        writer_file.write_all(&chunk_buf)?;
-                        chunk_idx += 1;
-                        written_so_far += CHUNK_SIZE as u64;
+                        if let Ok(mut guard) = data.write() {
+                            guard.extend_from_slice(&batch);
+                        }
+                        written_len.store(written_so_far as u64, Ordering::Release);
                     }
-                    written_len.store(written_so_far, Ordering::Release);
                 }
                 None => {
                     if !pending.is_empty() {
-                        writer_file.write_all(&pending)?;
-                        written_so_far += pending.len() as u64;
+                        if let Ok(mut guard) = data.write() {
+                            guard.extend_from_slice(&pending);
+                        }
+                        written_so_far += pending.len();
                         pending.clear();
                     }
-                    writer_file.flush()?;
-                    written_len.store(written_so_far, Ordering::Release);
-                    total_len.store(written_so_far, Ordering::Release);
+                    written_len.store(written_so_far as u64, Ordering::Release);
+                    total_len.store(written_so_far as u64, Ordering::Release);
                     finished.store(true, Ordering::Release);
                     break;
                 }
             }
         }
-        let _ = writer_file.flush();
 
         // 2. Если файл ещё не докачан до конца — продолжаем докачку в фоновой задаче tokio
         if !finished.load(Ordering::Acquire) {
+            let data_clone = Arc::clone(&data);
             let written_clone = Arc::clone(&written_len);
             let total_clone = Arc::clone(&total_len);
             let finished_clone = Arc::clone(&finished);
@@ -180,33 +171,37 @@ impl DeezerStream {
                     match resp.chunk().await {
                         Ok(Some(bytes)) => {
                             pending.extend_from_slice(&bytes);
-                            while pending.len() >= CHUNK_SIZE {
-                                chunk_buf.copy_from_slice(&pending[..CHUNK_SIZE]);
-                                pending.drain(..CHUNK_SIZE);
-                                if chunk_idx.is_multiple_of(3)
-                                    && crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, &key)
-                                        .is_err()
-                                {
-                                    break;
+                            if pending.len() >= CHUNK_SIZE {
+                                let mut batch = Vec::with_capacity(pending.len());
+                                while pending.len() >= CHUNK_SIZE {
+                                    chunk_buf.copy_from_slice(&pending[..CHUNK_SIZE]);
+                                    pending.drain(..CHUNK_SIZE);
+                                    if chunk_idx.is_multiple_of(3)
+                                        && crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, &key)
+                                            .is_err()
+                                    {
+                                        break;
+                                    }
+                                    batch.extend_from_slice(&chunk_buf);
+                                    chunk_idx += 1;
+                                    written_so_far += CHUNK_SIZE;
                                 }
-                                if writer_file.write_all(&chunk_buf).is_err() {
-                                    break;
+                                if let Ok(mut guard) = data_clone.write() {
+                                    guard.extend_from_slice(&batch);
                                 }
-                                chunk_idx += 1;
-                                written_so_far += CHUNK_SIZE as u64;
+                                written_clone.store(written_so_far as u64, Ordering::Release);
                             }
-                            let _ = writer_file.flush();
-                            written_clone.store(written_so_far, Ordering::Release);
                         }
                         Ok(None) => {
                             if !pending.is_empty() {
-                                let _ = writer_file.write_all(&pending);
-                                written_so_far += pending.len() as u64;
+                                if let Ok(mut guard) = data_clone.write() {
+                                    guard.extend_from_slice(&pending);
+                                }
+                                written_so_far += pending.len();
                                 pending.clear();
                             }
-                            let _ = writer_file.flush();
-                            written_clone.store(written_so_far, Ordering::Release);
-                            total_clone.store(written_so_far, Ordering::Release);
+                            written_clone.store(written_so_far as u64, Ordering::Release);
+                            total_clone.store(written_so_far as u64, Ordering::Release);
                             break;
                         }
                         Err(_) => break,
@@ -216,11 +211,9 @@ impl DeezerStream {
             });
         }
 
-        let mut reader_file = reader_file;
-        reader_file.seek(SeekFrom::Start(0))?;
-
         Ok(Self {
-            file: reader_file,
+            data,
+            pos: 0,
             total_len,
             written_len,
             finished,
@@ -246,15 +239,25 @@ impl DeezerStream {
 
 impl Read for DeezerStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
-            let pos = self.file.stream_position().unwrap_or(0);
-            let written = self.written_len.load(Ordering::Acquire);
+            if self.abort_download.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
+            let written = self.written_len.load(Ordering::Acquire) as usize;
             let done = self.finished.load(Ordering::Acquire);
 
-            if pos < written {
-                let n = self.file.read(buf)?;
-                if n > 0 || done {
-                    return Ok(n);
+            if self.pos < written {
+                if let Ok(guard) = self.data.read() {
+                    let avail = guard.len().saturating_sub(self.pos);
+                    if avail > 0 {
+                        let to_copy = avail.min(buf.len());
+                        buf[..to_copy].copy_from_slice(&guard[self.pos..self.pos + to_copy]);
+                        self.pos += to_copy;
+                        return Ok(to_copy);
+                    }
                 }
             } else if done {
                 return Ok(0);
@@ -267,35 +270,31 @@ impl Read for DeezerStream {
 
 impl Seek for DeezerStream {
     fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
-        let desired = match target {
-            SeekFrom::Start(offset) => offset,
-            SeekFrom::Current(delta) => {
-                let cur = self.file.stream_position().unwrap_or(0) as i64;
-                (cur + delta).max(0) as u64
-            }
-            SeekFrom::End(delta) => {
-                let end = self.len() as i64;
-                (end + delta).max(0) as u64
-            }
+        let desired: i64 = match target {
+            SeekFrom::Start(offset) => offset as i64,
+            SeekFrom::Current(delta) => (self.pos as i64) + delta,
+            SeekFrom::End(delta) => (self.len() as i64) + delta,
         };
+        let desired_pos = desired.max(0) as usize;
 
-        // Если перематываем вперёд в область, которая ещё докачивается — ждём до 1.5 с
+        // Если целевая позиция ещё докачивается — ждём до 1.5 с (прерываясь при отмене)
         let mut waited_ms = 0u32;
-        while desired > self.written_len.load(Ordering::Acquire)
+        while desired_pos > self.written_len.load(Ordering::Acquire) as usize
             && !self.finished.load(Ordering::Acquire)
+            && !self.abort_download.load(Ordering::Relaxed)
             && waited_ms < 1500
         {
             std::thread::sleep(Duration::from_millis(10));
             waited_ms += 10;
         }
 
-        let max_avail = self.written_len.load(Ordering::Acquire);
-        let safe_pos = if self.finished.load(Ordering::Acquire) {
-            desired
+        let max_avail = self.written_len.load(Ordering::Acquire) as usize;
+        self.pos = if self.finished.load(Ordering::Acquire) {
+            desired_pos.min(max_avail)
         } else {
-            desired.min(max_avail)
+            desired_pos
         };
-        self.file.seek(SeekFrom::Start(safe_pos))
+        Ok(self.pos as u64)
     }
 }
 
@@ -391,4 +390,3 @@ mod tests {
         }
     }
 }
-

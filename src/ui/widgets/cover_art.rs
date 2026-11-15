@@ -8,6 +8,11 @@ use ratatui::style::{Color, Style};
 #[allow(dead_code)]
 const HALF_BLOCK: char = '\u{2580}';
 
+/// Таблица символов квадрантов 2x2 по 4-битной маске `(tl: 1, tr: 2, bl: 4, br: 8)`.
+const QUADRANT_GLYPHS: [&str; 16] = [
+    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+];
+
 #[derive(Clone)]
 pub struct CoverArt {
     img: DynamicImage,
@@ -42,10 +47,10 @@ impl CoverArt {
 
     /// Генерирует стильную градиентную обложку-плейсхолдер до загрузки реального JPEG.
     pub fn solid(r: u8, g: u8, b: u8) -> Self {
-        let mut rgba = RgbaImage::new(16, 16);
-        for y in 0..16 {
-            for x in 0..16 {
-                let mix = ((x + y) as f32) / 30.0;
+        let mut rgba = RgbaImage::new(32, 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                let mix = ((x + y) as f32) / 62.0;
                 let nr = (r as f32 * (1.0 - mix * 0.4) + 127.0 * (mix * 0.4)) as u8;
                 let ng = (g as f32 * (1.0 - mix * 0.5) + 90.0 * (mix * 0.5)) as u8;
                 let nb = (b as f32 * (1.0 - mix * 0.3) + 240.0 * (mix * 0.3)) as u8;
@@ -55,12 +60,101 @@ impl CoverArt {
         Self::from_image(rgba)
     }
 
-    fn resized_for(&self, w: u32, h: u32) -> RgbaImage {
-        let pw = w.max(1);
+    fn resized_quadrant(&self, w: u32, h: u32) -> RgbaImage {
+        let pw = (w * 2).max(1);
         let ph = (h * 2).max(1);
-        self.img
-            .resize_exact(pw, ph, imageops::FilterType::Lanczos3)
-            .to_rgba8()
+        let filter = if self.img.width() <= w && self.img.height() <= ph {
+            imageops::FilterType::Nearest
+        } else {
+            imageops::FilterType::CatmullRom
+        };
+        self.img.resize_exact(pw, ph, filter).to_rgba8()
+    }
+
+    #[inline]
+    fn color_dist_sq(a: [u8; 3], b: [f32; 3]) -> f32 {
+        let dr = a[0] as f32 - b[0];
+        let dg = a[1] as f32 - b[1];
+        let db = a[2] as f32 - b[2];
+        dr * dr + dg * dg + db * db
+    }
+
+    /// Подбирает оптимальный квадрантный символ 2x2 и пару цветов `(fg, bg)` с минимальной ошибкой.
+    #[inline]
+    fn best_quadrant_cell(px: [[u8; 3]; 4]) -> (&'static str, Color, Color) {
+        // Если верхняя пара и нижняя пара горизонтально однородны — используем классический полублок '▀'
+        if px[0] == px[1] && px[2] == px[3] {
+            return (
+                "▀",
+                Color::Rgb(px[0][0], px[0][1], px[0][2]),
+                Color::Rgb(px[2][0], px[2][1], px[2][2]),
+            );
+        }
+
+        let mut best_mask = 0b0011usize;
+        let mut best_err = f32::MAX;
+        let mut best_fg = [px[0][0], px[0][1], px[0][2]];
+        let mut best_bg = [px[2][0], px[2][1], px[2][2]];
+
+        // Проверяем все разбиения 4 субпикселей на 2 непустых кластера (маски 1..=7)
+        for mask in [0b0011usize, 0b0101, 0b0001, 0b0010, 0b0100, 0b0111, 0b0110] {
+            let mut fg_sum = [0.0f32; 3];
+            let mut bg_sum = [0.0f32; 3];
+            let mut fg_cnt = 0.0f32;
+            let mut bg_cnt = 0.0f32;
+
+            for (i, p) in px.iter().enumerate() {
+                if (mask & (1 << i)) != 0 {
+                    fg_sum[0] += p[0] as f32;
+                    fg_sum[1] += p[1] as f32;
+                    fg_sum[2] += p[2] as f32;
+                    fg_cnt += 1.0;
+                } else {
+                    bg_sum[0] += p[0] as f32;
+                    bg_sum[1] += p[1] as f32;
+                    bg_sum[2] += p[2] as f32;
+                    bg_cnt += 1.0;
+                }
+            }
+
+            let fg_avg = [fg_sum[0] / fg_cnt, fg_sum[1] / fg_cnt, fg_sum[2] / fg_cnt];
+            let bg_avg = [bg_sum[0] / bg_cnt, bg_sum[1] / bg_cnt, bg_sum[2] / bg_cnt];
+
+            let mut err = 0.0f32;
+            for (i, p) in px.iter().enumerate() {
+                if (mask & (1 << i)) != 0 {
+                    err += Self::color_dist_sq(*p, fg_avg);
+                } else {
+                    err += Self::color_dist_sq(*p, bg_avg);
+                }
+            }
+
+            // Небольшой приоритет горизонтальному полублоку при равной ошибке
+            if mask == 0b0011 {
+                err *= 0.95;
+            }
+
+            if err < best_err {
+                best_err = err;
+                best_mask = mask;
+                best_fg = [
+                    fg_avg[0].round().clamp(0.0, 255.0) as u8,
+                    fg_avg[1].round().clamp(0.0, 255.0) as u8,
+                    fg_avg[2].round().clamp(0.0, 255.0) as u8,
+                ];
+                best_bg = [
+                    bg_avg[0].round().clamp(0.0, 255.0) as u8,
+                    bg_avg[1].round().clamp(0.0, 255.0) as u8,
+                    bg_avg[2].round().clamp(0.0, 255.0) as u8,
+                ];
+            }
+        }
+
+        (
+            QUADRANT_GLYPHS[best_mask],
+            Color::Rgb(best_fg[0], best_fg[1], best_fg[2]),
+            Color::Rgb(best_bg[0], best_bg[1], best_bg[2]),
+        )
     }
 }
 
@@ -71,18 +165,26 @@ impl Widget for &CoverArt {
         if w == 0 || h == 0 {
             return;
         }
-        let rgba = self.resized_for(w as u32, h as u32);
+        let rgba = self.resized_quadrant(w as u32, h as u32);
         for cy in 0..h {
             let y = area.y + cy;
-            let p_top = (2 * cy) as u32;
+            let py = (cy * 2) as u32;
             for cx in 0..w {
                 let x = area.x + cx;
-                let top = &rgba[(cx as u32, p_top)];
-                let bot = &rgba[(cx as u32, p_top + 1)];
-                let style = Style::default()
-                    .fg(Color::Rgb(top[0], top[1], top[2]))
-                    .bg(Color::Rgb(bot[0], bot[1], bot[2]));
-                buf.set_string(x, y, "▀", style);
+                let px = (cx * 2) as u32;
+                let tl = rgba[(px, py)];
+                let tr = rgba[(px + 1, py)];
+                let bl = rgba[(px, py + 1)];
+                let br = rgba[(px + 1, py + 1)];
+                let block = [
+                    [tl[0], tl[1], tl[2]],
+                    [tr[0], tr[1], tr[2]],
+                    [bl[0], bl[1], bl[2]],
+                    [br[0], br[1], br[2]],
+                ];
+                let (glyph, fg, bg) = CoverArt::best_quadrant_cell(block);
+                let style = Style::default().fg(fg).bg(bg);
+                buf.set_string(x, y, glyph, style);
             }
         }
     }
@@ -142,11 +244,9 @@ mod tests {
         assert_eq!(fg, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(bg, Some(Color::Rgb(0, 0, 255)));
     }
+
     #[test]
     fn two_columns_two_rows() {
-        // 2-wide x 2-tall pixel image with a distinct colour per pixel:
-        // (0,0)=red (top-left), (1,0)=green (top-right),
-        // (0,1)=blue (bottom-left), (1,1)=yellow (bottom-right).
         let mut img = RgbaImage::new(2, 2);
         img[(0, 0)] = image::Rgba([255u8, 0, 0, 255]);
         img[(1, 0)] = image::Rgba([0, 255u8, 0, 255]);
@@ -169,7 +269,6 @@ mod tests {
 
     #[test]
     fn scales_to_fit() {
-        // 2x2 image rendered into a 4-wide x 1-tall area (4x2 pixels) -> upsampled.
         let mut img = RgbaImage::new(2, 2);
         img[(0, 0)] = image::Rgba([255u8, 0, 0, 255]);
         img[(1, 0)] = image::Rgba([0, 0, 255u8, 255]);
@@ -178,8 +277,7 @@ mod tests {
         let cover = CoverArt::from_image(img);
         let terminal = render_terminal(&cover, 4, 1);
         for x in 0..4 {
-            let (sym, fg, _) = cell_info(&terminal, x, 0);
-            assert_eq!(sym, HALF_BLOCK);
+            let (_, fg, _) = cell_info(&terminal, x, 0);
             assert!(fg.is_some());
         }
     }

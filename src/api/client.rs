@@ -192,7 +192,11 @@ impl DeezerClient {
                     .to_string();
                 let cover_url_direct = item
                     .get("album")
-                    .and_then(|a| a.get("cover_medium").or_else(|| a.get("cover")))
+                    .and_then(|a| {
+                        a.get("cover_big")
+                            .or_else(|| a.get("cover_medium"))
+                            .or_else(|| a.get("cover"))
+                    })
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 let duration_secs = item.get("duration").and_then(|v| v.as_u64()).unwrap_or(30);

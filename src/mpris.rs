@@ -102,14 +102,14 @@ impl Mpris {
     }
 }
 
-/// Build the Deezer CDN cover URL from the `ALB_PICTURE` md5 hash.
+/// Build the Deezer CDN cover URL from the `ALB_PICTURE` md5 hash (500x500 HD).
 #[allow(dead_code)]
 pub fn cover_url(album_picture: &str) -> Option<String> {
     if album_picture.is_empty() {
         return None;
     }
     Some(format!(
-        "https://e-cdns-images.dzcdn.net/images/cover/{album_picture}/264x264-000000-80-0-0.jpg"
+        "https://e-cdns-images.dzcdn.net/images/cover/{album_picture}/500x500-000000-80-0-0.jpg"
     ))
 }
 
@@ -147,7 +147,7 @@ mod tests {
         assert_eq!(
             cover_url("abc123"),
             Some(
-                "https://e-cdns-images.dzcdn.net/images/cover/abc123/264x264-000000-80-0-0.jpg"
+                "https://e-cdns-images.dzcdn.net/images/cover/abc123/500x500-000000-80-0-0.jpg"
                     .to_string()
             )
         );

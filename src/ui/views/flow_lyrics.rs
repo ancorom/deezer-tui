@@ -192,7 +192,7 @@ impl FlowLyrics {
         }
         let y_start = area.y + 1;
         let body_rows = row_end.saturating_sub(y_start);
-        let cover_h = body_rows.saturating_sub(6).min(width / 2).min(10);
+        let cover_h = body_rows.saturating_sub(6).min(width / 2).min(14);
         let cover_w = (cover_h * 2).min(width);
         let mut y_cursor = y_start;
 

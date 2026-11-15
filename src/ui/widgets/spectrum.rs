@@ -1,5 +1,6 @@
 //! Виджет субсимвольного спектра (`[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']`)
-//! с интервалом в 1 пробел и точками удержания пиков (`'▪'`).
+//! с интервалом в 1 пробел, точками удержания пиков (`'▪'`) и автоматическим
+//! масштабированием числа полос при изменении ширины окна терминала.
 
 #![allow(dead_code)]
 
@@ -91,28 +92,48 @@ impl Spectrum {
             .fg(theme::gradient_color(value))
             .bg(theme::color_from_hex(theme::BG_TERMINAL))
     }
+
+    #[inline]
+    fn sample_slice(slice: &[f32], idx: usize, count: usize) -> f32 {
+        if slice.is_empty() {
+            return 0.0;
+        }
+        if count >= slice.len() || count <= 1 {
+            return slice.get(idx).copied().unwrap_or(0.0);
+        }
+        let start = idx * slice.len() / count;
+        let end = ((idx + 1) * slice.len() / count).max(start + 1).min(slice.len());
+        let mut peak = 0.0f32;
+        for &v in &slice[start..end] {
+            if v > peak {
+                peak = v;
+            }
+        }
+        peak
+    }
 }
 
 impl Widget for &Spectrum {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let w = area.width;
         let h = area.height;
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || self.bars.is_empty() {
             return;
         }
         let total_rows = h as u32;
         let total_subpixels = total_rows * 8;
+        let fit_bars = (w as usize).div_ceil(2).min(self.bars.len());
 
-        for (b, bar) in self.bars.iter().enumerate() {
+        for b in 0..fit_bars {
             let col = (b * 2) as u16;
             if col >= w {
                 break;
             }
             let x = area.x + col;
-            let v = bar.clamp(0.0, 1.0);
+            let v = Spectrum::sample_slice(&self.bars, b, fit_bars).clamp(0.0, 1.0);
             let style = Spectrum::bar_style(v);
             let total_fill = (v * (total_subpixels as f32)) as u32;
-            let ph = self.peak_holds.get(b).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let ph = Spectrum::sample_slice(&self.peak_holds, b, fit_bars).clamp(0.0, 1.0);
             let ph_row = (ph * (total_rows as f32)).min(total_rows as f32 - 1.0) as u32;
 
             for r in 0..total_rows {
@@ -216,18 +237,14 @@ mod tests {
 
     #[test]
     fn peak_hold_does_not_overwrite_when_equal_to_bar() {
-        // current bar 0.75, peak hold 0.75 -> the peak row is r = 0.75 * 12 = 9 (from bottom),
-        // -> y = 12 - 1 - 9 = 2.
         let terminal = render(&[0.75], &[0.75], 4, 12);
         assert_eq!(at(&terminal, 0, 2), PEAK_DOT);
-        assert_eq!(at(&terminal, 0, 3), '█'); // just below the peak is a full bar
+        assert_eq!(at(&terminal, 0, 3), '█');
     }
 
     #[test]
     fn fits_too_many_bars_truncates() {
         let terminal = render(&[1.0; 12], &[0.0; 12], 6, 4);
-        // width 6 -> cols 0,2,4 fit (3 bars); bar 3 at col 6 == width -> truncated.
-        // Check every in-bounds column (0..=5) is either a full bar or a gap.
         for y in 0..4 {
             assert_eq!(at(&terminal, 0, y), '█');
             assert_eq!(at(&terminal, 1, y), ' ');

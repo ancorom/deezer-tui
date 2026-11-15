@@ -182,10 +182,10 @@ impl Cavacore {
                 .min(max_bin + 1);
 
             let bin_count = (hi - lo).max(1) as f32;
-            // Нормализация амплитуды окна Ханна (4.0 / N) + частотная компенсация ВЧ
+            // RMS-нормализация по корню из числа бинов + подъём СЧ/ВЧ для равномерной шкалы
             let norm_fft = 4.0 / fft_size as f32;
-            let freq_tilt = (f_hi / 120.0).powf(0.32);
-            let eq = (norm_fft * freq_tilt) / bin_count;
+            let freq_tilt = (f_hi / 100.0).powf(0.55);
+            let eq = (norm_fft * freq_tilt) / bin_count.sqrt();
 
             use_bass_fft.push(is_bass);
             lower_bin.push(lo);
@@ -331,7 +331,8 @@ impl Cavacore {
             &mut self.mid_scratch,
         );
 
-        // 1. Сбор магнитуд по логарифмическим полосам
+        // 1. Сбор магнитуд по логарифмическим полосам с интерполяцией узких полос
+        let ratio = HIGH_HZ / LOW_HZ;
         for n in 0..self.num_bars {
             let spectrum = if self.use_bass_fft[n] {
                 &self.bass_out
@@ -341,10 +342,25 @@ impl Cavacore {
             let lo = self.lower_bin[n];
             let hi = self.upper_bin[n].min(spectrum.len());
 
-            let mut sum = 0.0f32;
-            for c in &spectrum[lo..hi] {
-                sum += c.norm();
-            }
+            let sum = if hi.saturating_sub(lo) <= 1 && spectrum.len() > 2 {
+                let f_center = LOW_HZ * ratio.powf((n as f32 + 0.5) / self.num_bars as f32);
+                let fft_size = if self.use_bass_fft[n] {
+                    N_BASS
+                } else {
+                    N_MID_HIGH
+                };
+                let exact_bin = (f_center * fft_size as f32 / self.sample_rate)
+                    .clamp(1.0, (spectrum.len() - 2) as f32);
+                let b0 = exact_bin.floor() as usize;
+                let frac = exact_bin - b0 as f32;
+                spectrum[b0].norm() * (1.0 - frac) + spectrum[b0 + 1].norm() * frac
+            } else {
+                let mut s = 0.0f32;
+                for c in &spectrum[lo..hi] {
+                    s += c.norm();
+                }
+                s
+            };
 
             let mut val = sum * self.eq_weights[n];
             if self.db_scale {

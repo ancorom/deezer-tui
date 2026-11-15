@@ -1,6 +1,6 @@
 //! Экран 03 (Library & Overlays): двухпанельный фокус (`LibraryFocus::Playlists` и
-//! `LibraryFocus::Tracks`), сортировка треков (`Default/Added`, `Title`, `Artist`, `Album`),
-//! дерево плейлистов и модальное окно `CHOOSE PLAYLIST`.
+//! `LibraryFocus::Tracks`), сортировка треков (`Added`, `Title`, `Artist`, `Album`)
+//! с отображением колонки даты добавления `ADDED`, дерево плейлистов и `CHOOSE PLAYLIST`.
 
 #![allow(dead_code)]
 
@@ -90,6 +90,7 @@ impl Library {
                             album: "A Day in the Life".into(),
                             track: "Bohemian Rhapsody".into(),
                             time: "5:55".into(),
+                            added: "2025-11-04".into(),
                             favorite: true,
                         },
                         SearchRow {
@@ -97,6 +98,7 @@ impl Library {
                             album: "Master of Puppets".into(),
                             track: String::from("Master of Puppets"),
                             time: "8:05".into(),
+                            added: "2025-10-19".into(),
                             favorite: false,
                         },
                     ],
@@ -320,10 +322,12 @@ impl Library {
         if row_start >= row_end {
             return;
         }
+        let show_added = width >= 68;
         let hash_w = 5u16;
+        let added_w = if show_added { 12u16 } else { 0u16 };
         let time_w = 6u16;
         let heart_w = 2u16;
-        let rest = width.saturating_sub(hash_w + time_w + heart_w);
+        let rest = width.saturating_sub(hash_w + added_w + time_w + heart_w);
         let track_w = rest * 2 / 5;
         let artist_w = rest / 4;
         let album_w = rest.saturating_sub(track_w + artist_w);
@@ -331,11 +335,12 @@ impl Library {
         let x_track = x0 + hash_w;
         let x_artist = x_track + track_w;
         let x_album = x_artist + artist_w;
-        let x_time = x_album + album_w;
+        let x_added = x_album + album_w;
+        let x_time = x_added + added_w;
         let x_heart = x_time + time_w;
 
         let arrow = if self.sort_asc { "▲" } else { "▼" };
-        let h_hash = if self.sort_by == LibrarySortBy::Default {
+        let h_hash = if !show_added && self.sort_by == LibrarySortBy::Default {
             format!("#{arrow}")
         } else {
             String::from("#")
@@ -354,6 +359,11 @@ impl Library {
             format!("ALBUM {arrow}")
         } else {
             String::from("ALBUM")
+        };
+        let h_added = if self.sort_by == LibrarySortBy::Default {
+            format!("ADDED {arrow}")
+        } else {
+            String::from("ADDED")
         };
 
         {
@@ -384,6 +394,16 @@ impl Library {
                     &h_album,
                     album_w.saturating_sub(1) as usize,
                 );
+                if show_added {
+                    self.draw_header_cell(
+                        buf,
+                        area,
+                        x_added,
+                        y,
+                        &h_added,
+                        added_w.saturating_sub(1) as usize,
+                    );
+                }
                 self.draw_header_cell(
                     buf,
                     area,
@@ -448,6 +468,21 @@ impl Library {
                     album_w.saturating_sub(1) as usize,
                     sel,
                 );
+                if show_added {
+                    let added_str = if track.added.is_empty() {
+                        "—"
+                    } else {
+                        track.added.as_str()
+                    };
+                    self.draw_row_cell(
+                        buf,
+                        area,
+                        Position { x: x_added, y },
+                        added_str,
+                        added_w.saturating_sub(1) as usize,
+                        sel,
+                    );
+                }
                 self.draw_row_cell(
                     buf,
                     area,
@@ -564,7 +599,9 @@ mod tests {
         assert!(row_has(&terminal, 3, "Chill"));
         assert!(row_has(&terminal, 4, "CHOOSE"));
         assert!(row_has(&terminal, 5, "TRACK"));
+        assert!(row_has(&terminal, 5, "ADDED ▲"));
         assert!(row_has(&terminal, 6, "Bohemian Rhapsody"));
+        assert!(row_has(&terminal, 6, "2025-11-04"));
     }
 
     #[test]
@@ -610,4 +647,3 @@ mod tests {
         assert!(row_has(&terminal, 0, "LIBRARY"));
     }
 }
-

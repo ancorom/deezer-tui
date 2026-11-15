@@ -15,6 +15,7 @@ pub struct SearchRow {
     pub album: String,
     pub track: String,
     pub time: String,
+    pub added: String,
     pub favorite: bool,
 }
 
@@ -322,6 +323,7 @@ mod tests {
                     album: "A Day in the Life".into(),
                     track: "Bohemian Rhapsody".into(),
                     time: "5:55".into(),
+                    added: "2025-11-04".into(),
                     favorite: true,
                 },
                 SearchRow {
@@ -329,6 +331,7 @@ mod tests {
                     album: "A Day in the Life".into(),
                     track: "Another One Bites the Dust".into(),
                     time: "3:29".into(),
+                    added: "2025-10-19".into(),
                     favorite: false,
                 },
             ],

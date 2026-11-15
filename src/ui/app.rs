@@ -1,6 +1,6 @@
-//! Глобальное состояние `deezer-tui v2.1`: связывает TUI (60 FPS), фоновый рантайм `tokio`,
-//! потоковый `DeezerStream`, декодер `Symphonia` без утечек CPU, мгновенный Prefetch
-//! следующего трека, бесконечный `Flow`, сортировку `Library` и экран `Settings`.
+//! Глобальное состояние `deezer-tui v2.2`: связывает TUI (60 FPS), фоновый рантайм `tokio`,
+//! потоковый `DeezerStream` в памяти, защиту от гонок переключения `playback_seq`,
+//! переиспользование сессии `DeezerClient`, бесконечный `Flow` и адаптивный спектр.
 
 #![allow(dead_code)]
 
@@ -110,6 +110,7 @@ impl PlaybackQueue {
 #[allow(clippy::large_enum_variant)]
 pub enum BgEvent {
     LoggedIn {
+        client: DeezerClient,
         user_name: String,
         playlists: Vec<PlaylistData>,
         favorites: Vec<TrackData>,
@@ -123,7 +124,9 @@ pub enum BgEvent {
         tracks: Vec<TrackData>,
     },
     FlowMoreLoaded(Vec<TrackData>),
+    FlowLoadFailed,
     TrackStarted {
+        req_id: u64,
         track: TrackData,
         badge: String,
         tech_info: StreamTechInfo,
@@ -133,7 +136,9 @@ pub enum BgEvent {
         lyrics: Vec<LyricLine>,
         decoder_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
     },
-    TrackEnded,
+    TrackEnded {
+        req_id: u64,
+    },
     PlaybackError(String),
 }
 
@@ -167,13 +172,14 @@ pub struct App {
     pub arl_input: String,
     pub show_track_info_modal: bool,
 
-    // DSP, синхронизация прогресса и аудиодвижок
+    // DSP, синхронизация прогресса, защита от гонок и аудиодвижок
     pub cavacore: Cavacore,
     pub vis_consumer: Option<Consumer<f32>>,
     pub audio_output: Option<AudioOutput>,
     pub stop_decode: Arc<AtomicBool>,
     pub paused_flag: Arc<AtomicBool>,
     pub played_frames: Arc<AtomicU64>,
+    pub playback_seq: Arc<AtomicU64>,
     pub current_sample_rate: u32,
     pub current_duration_secs: u64,
     pub current_track: Option<TrackData>,
@@ -206,7 +212,7 @@ impl App {
     pub fn with_config(cfg: AppConfig) -> Self {
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(4)
                 .enable_all()
                 .build()
                 .expect("build tokio runtime"),
@@ -267,6 +273,7 @@ impl App {
             stop_decode: Arc::new(AtomicBool::new(false)),
             paused_flag: Arc::new(AtomicBool::new(true)),
             played_frames: Arc::new(AtomicU64::new(0)),
+            playback_seq: Arc::new(AtomicU64::new(0)),
             current_sample_rate: 44_100,
             current_duration_secs: 30,
             current_track: None,
@@ -316,6 +323,7 @@ impl App {
                         let favorites = client.get_favorites().await.unwrap_or_default();
                         let flow = client.get_flow().await.unwrap_or_default();
                         let _ = tx.send(BgEvent::LoggedIn {
+                            client,
                             user_name: session.user_name,
                             playlists,
                             favorites,
@@ -341,13 +349,11 @@ impl App {
         }
         self.loading_more_flow = true;
         let tx = self.bg_tx.clone();
+        let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
         self.rt.spawn(async move {
-            let mut client = match DeezerClient::new() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            if let Some(arl) = arl_opt
+            if !client.is_authenticated()
+                && let Some(arl) = arl_opt
                 && !arl.is_empty()
             {
                 let _ = client.login_arl(&arl).await;
@@ -356,6 +362,8 @@ impl App {
                 && !more.is_empty()
             {
                 let _ = tx.send(BgEvent::FlowMoreLoaded(more));
+            } else {
+                let _ = tx.send(BgEvent::FlowLoadFailed);
             }
         });
     }
@@ -374,13 +382,11 @@ impl App {
 
         self.library.loading = true;
         let tx = self.bg_tx.clone();
+        let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
         self.rt.spawn(async move {
-            let mut client = match DeezerClient::new() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            if let Some(arl) = arl_opt
+            if !client.is_authenticated()
+                && let Some(arl) = arl_opt
                 && !arl.is_empty()
             {
                 let _ = client.login_arl(&arl).await;
@@ -420,6 +426,7 @@ impl App {
                     album: t.album.clone(),
                     track: t.title.clone(),
                     time: t.formatted_duration(),
+                    added: t.formatted_date_add(),
                     favorite: playlist_id == "fav",
                 })
                 .collect();
@@ -450,7 +457,16 @@ impl App {
             let mut sorted = orig;
             match self.library.sort_by {
                 LibrarySortBy::Default => {
-                    if !self.library.sort_asc {
+                    if sorted.iter().any(|t| t.date_add > 0) {
+                        sorted.sort_by(|a, b| {
+                            let cmp = a.date_add.cmp(&b.date_add);
+                            if self.library.sort_asc {
+                                cmp
+                            } else {
+                                cmp.reverse()
+                            }
+                        });
+                    } else if !self.library.sort_asc {
                         sorted.reverse();
                     }
                 }
@@ -494,6 +510,7 @@ impl App {
                     album: t.album.clone(),
                     track: t.title.clone(),
                     time: t.formatted_duration(),
+                    added: t.formatted_date_add(),
                     favorite: is_fav,
                 })
                 .collect();
@@ -654,11 +671,13 @@ impl App {
         while let Ok(ev) = self.bg_rx.try_recv() {
             match ev {
                 BgEvent::LoggedIn {
+                    client,
                     user_name,
                     playlists,
                     favorites,
                     flow,
                 } => {
+                    self.client = Arc::new(client);
                     self.user_label = Some(user_name.clone());
                     self.status_message = Some(format!("Logged in as {user_name}"));
                     self.sync_settings_view();
@@ -673,6 +692,7 @@ impl App {
                             album: t.album.clone(),
                             track: t.title.clone(),
                             time: t.formatted_duration(),
+                            added: t.formatted_date_add(),
                             favorite: true,
                         })
                         .collect();
@@ -722,12 +742,12 @@ impl App {
                             album: t.album.clone(),
                             track: t.title.clone(),
                             time: t.formatted_duration(),
+                            added: t.formatted_date_add(),
                             favorite: false,
                         })
                         .collect();
                     self.flow_lyrics.flow = tracks
                         .iter()
-                        .take(15)
                         .map(|t| FlowRow {
                             title: t.title.clone(),
                             artist: t.artist.clone(),
@@ -742,6 +762,7 @@ impl App {
                                 album: t.album.clone(),
                                 track: t.title.clone(),
                                 time: t.formatted_duration(),
+                                added: t.formatted_date_add(),
                                 favorite: true,
                             })
                             .collect();
@@ -763,6 +784,7 @@ impl App {
                             album: t.album.clone(),
                             track: t.title.clone(),
                             time: t.formatted_duration(),
+                            added: t.formatted_date_add(),
                             favorite: false,
                         })
                         .collect();
@@ -777,8 +799,9 @@ impl App {
                 }
                 BgEvent::FlowMoreLoaded(more_tracks) => {
                     self.loading_more_flow = false;
-                    let was_stopped_at_end =
-                        self.playing_from_flow && self.now_playing.paused && self.queue.remaining() == 0;
+                    let was_stopped_at_end = self.playing_from_flow
+                        && self.now_playing.paused
+                        && self.queue.remaining() == 0;
                     for t in &more_tracks {
                         if !self
                             .flow_tracks
@@ -801,7 +824,11 @@ impl App {
                         }
                     }
                 }
+                BgEvent::FlowLoadFailed => {
+                    self.loading_more_flow = false;
+                }
                 BgEvent::TrackStarted {
+                    req_id,
                     track,
                     badge,
                     tech_info,
@@ -811,6 +838,10 @@ impl App {
                     lyrics,
                     decoder_tx,
                 } => {
+                    // Отбрасываем устаревшие события от пропущенных треков
+                    if req_id != self.playback_seq.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     self.now_playing.badge = badge;
                     self.now_playing.track = track.title.clone();
                     self.now_playing.artist = format!("{} — {}", track.artist, track.album);
@@ -826,10 +857,13 @@ impl App {
                     self.flow_lyrics.position_ms = 0;
 
                     if self.playing_from_flow {
-                        self.flow_lyrics.selected_flow = self
-                            .queue
-                            .current_index
-                            .min(self.flow_lyrics.flow.len().saturating_sub(1));
+                        if let Some(pos) = self
+                            .flow_tracks
+                            .iter()
+                            .position(|t| t.track_id == track.track_id)
+                        {
+                            self.flow_lyrics.selected_flow = pos;
+                        }
                         if self.queue.remaining() <= 3 {
                             self.spawn_fetch_more_flow();
                         }
@@ -851,7 +885,10 @@ impl App {
                     self.decoder_tx = decoder_tx;
                     self.vis_consumer = Some(vis_consumer);
                 }
-                BgEvent::TrackEnded => {
+                BgEvent::TrackEnded { req_id } => {
+                    if req_id != self.playback_seq.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     if let Some(next_track) = self.queue.next_track() {
                         self.start_track_playback(next_track);
                         if self.playing_from_flow && self.queue.remaining() <= 3 {
@@ -881,7 +918,6 @@ impl App {
         if next_track.track_id.is_empty() || next_track.track_id == "0" {
             return;
         }
-        // Если этот трек уже предзагружен — ничего не делаем
         if let Ok(guard) = self.next_prefetch_cache.lock()
             && guard
                 .as_ref()
@@ -891,32 +927,39 @@ impl App {
         }
 
         let cache = Arc::clone(&self.next_prefetch_cache);
+        let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
         let preferred_quality = self.config.preferred_audio_quality();
 
         self.rt.spawn(async move {
-            let mut client = match DeezerClient::new() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
             let mut stream_opt: Option<(DeezerStream, bool)> = None;
             let mut lyrics = Vec::new();
 
-            if let Some(arl) = arl_opt
+            if !client.is_authenticated()
+                && let Some(arl) = arl_opt
                 && !arl.is_empty()
-                && client.login_arl(&arl).await.is_ok()
             {
+                let _ = client.login_arl(&arl).await;
+            }
+
+            if client.is_authenticated() {
                 if let Ok(lyr) = client.get_lyrics(&next_track.track_id).await {
                     lyrics = lyr.synced;
                 }
-                let full_track = if next_track.has_track_token() {
-                    Ok(next_track.clone())
+                let mut stream_url_res = if next_track.has_track_token() {
+                    client.get_stream_url(&next_track, preferred_quality).await
                 } else {
-                    client.get_track(&next_track.track_id).await
+                    Err(crate::api::models::DeezerError::TrackUnavailable(
+                        "no token".into(),
+                    ))
                 };
-                if let Ok(ft) = full_track
-                    && let Ok((url, _q)) = client.get_stream_url(&ft, preferred_quality).await
-                    && let Ok(s) = DeezerStream::fetch(client.http(), &url, &ft.track_id).await
+                if stream_url_res.is_err()
+                    && let Ok(fresh_track) = client.get_track(&next_track.track_id).await
+                {
+                    stream_url_res = client.get_stream_url(&fresh_track, preferred_quality).await;
+                }
+                if let Ok((url, _q)) = stream_url_res
+                    && let Ok(s) = DeezerStream::fetch(client.http(), &url, &next_track.track_id).await
                 {
                     stream_opt = Some((s, false));
                 }
@@ -961,8 +1004,11 @@ impl App {
 
     /// Запускает воспроизведение выбранного трека (из кэша предзагрузки за 0 мс либо потоково).
     fn start_track_playback(&mut self, track: TrackData) {
-        // Останавливаем предыдущий поток декодера
+        // Останавливаем предыдущий поток декодера и увеличиваем счётчик поколения
         self.stop_decode.store(true, Ordering::SeqCst);
+        let req_id = self.playback_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq_ref = Arc::clone(&self.playback_seq);
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_decode = Arc::clone(&stop_flag);
 
@@ -972,12 +1018,17 @@ impl App {
         let played_frames = Arc::new(AtomicU64::new(0));
         self.played_frames = Arc::clone(&played_frames);
 
+        self.now_playing.track = track.title.clone();
+        self.now_playing.artist = format!("{} — {}", track.artist, track.album);
         self.now_playing.lyrics.clear();
         self.now_playing.position_ms = 0;
         self.flow_lyrics.lyrics.clear();
         self.flow_lyrics.position_ms = 0;
         self.now_playing.progress = 0.0;
         self.decoder_tx = None;
+
+        // Освобождаем предыдущий аудиопоток перед открытием нового
+        self.audio_output = None;
 
         let (audio_ring, vis_ring) = create_rings();
         let (mut audio_prod, audio_cons) = audio_ring.split();
@@ -1009,17 +1060,22 @@ impl App {
             }
         });
 
-        // Немедленно запускаем предзагрузку СЛЕДУЮЩЕГО трека из очереди!
+        // Немедленно запускаем предзагрузку СЛЕДУЮЩЕГО трека из очереди
         self.spawn_prefetch_next();
         if self.playing_from_flow && self.queue.remaining() <= 3 {
             self.spawn_fetch_more_flow();
         }
 
         let tx = self.bg_tx.clone();
+        let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
         let preferred_quality = self.config.preferred_audio_quality();
 
         self.rt.spawn(async move {
+            if stop_flag.load(Ordering::Relaxed) || seq_ref.load(Ordering::SeqCst) != req_id {
+                return;
+            }
+
             let (stream_opt, cover, lyrics) = if let Some(hit) = prefetched_hit {
                 (
                     Some((hit.stream, hit.is_preview)),
@@ -1027,26 +1083,54 @@ impl App {
                     hit.lyrics,
                 )
             } else {
-                let mut client = DeezerClient::new().unwrap();
                 let mut s_opt: Option<(DeezerStream, bool)> = None;
                 let mut lyr_vec = Vec::new();
 
-                if let Some(arl) = arl_opt
+                if !client.is_authenticated()
+                    && let Some(arl) = arl_opt
                     && !arl.is_empty()
-                    && client.login_arl(&arl).await.is_ok()
                 {
+                    let _ = client.login_arl(&arl).await;
+                }
+
+                if stop_flag.load(Ordering::Relaxed) || seq_ref.load(Ordering::SeqCst) != req_id {
+                    return;
+                }
+
+                if client.is_authenticated() {
                     if let Ok(lyr) = client.get_lyrics(&track.track_id).await {
                         lyr_vec = lyr.synced;
                     }
-                    let full_track = if track.has_track_token() {
-                        Ok(track.clone())
+                    let mut stream_url_res = if track.has_track_token() {
+                        client.get_stream_url(&track, preferred_quality).await
                     } else {
-                        client.get_track(&track.track_id).await
+                        Err(crate::api::models::DeezerError::TrackUnavailable(
+                            "no token".into(),
+                        ))
                     };
-                    if let Ok(ft) = full_track
-                        && let Ok((url, _q)) = client.get_stream_url(&ft, preferred_quality).await
+                    // Если токен устарел или отсутствовал — запрашиваем свежие метаданные трека
+                    if stream_url_res.is_err()
+                        && let Ok(fresh_track) = client.get_track(&track.track_id).await
+                    {
+                        let target_id = fresh_track
+                            .fallback
+                            .as_ref()
+                            .filter(|fb| !fb.track_id.is_empty())
+                            .map(|fb| fb.track_id.clone());
+                        stream_url_res = client.get_stream_url(&fresh_track, preferred_quality).await;
+                        if stream_url_res.is_err()
+                            && let Some(fb_id) = target_id
+                            && let Ok(fb_track) = client.get_track(&fb_id).await
+                        {
+                            stream_url_res =
+                                client.get_stream_url(&fb_track, preferred_quality).await;
+                        }
+                    }
+
+                    if let Ok((url, _q)) = stream_url_res
                         && let Ok(s) =
-                            DeezerStream::fetch_streaming(client.http(), &url, &ft.track_id).await
+                            DeezerStream::fetch_streaming(client.http(), &url, &track.track_id)
+                                .await
                     {
                         s_opt = Some((s, false));
                     }
@@ -1076,7 +1160,14 @@ impl App {
                 (s_opt, cov, lyr_vec)
             };
 
+            if stop_flag.load(Ordering::Relaxed) || seq_ref.load(Ordering::SeqCst) != req_id {
+                return;
+            }
+
             thread::spawn(move || {
+                if stop_flag.load(Ordering::Relaxed) || seq_ref.load(Ordering::SeqCst) != req_id {
+                    return;
+                }
                 match stream_opt {
                     Some((stream, is_preview)) => {
                         let fallback_dur = if is_preview {
@@ -1084,70 +1175,87 @@ impl App {
                         } else {
                             track.duration_secs()
                         };
-                        if let Ok((mut dec, mut tech_info)) = Decoder::new_seekable_with_stop(
+                        match Decoder::new_seekable_with_stop(
                             Box::new(stream),
                             audio_prod,
                             fallback_dur,
                             Arc::clone(&stop_flag),
                         ) {
-                            if is_preview {
-                                tech_info.duration_secs = tech_info.duration_secs.min(30);
-                            }
-                            let badge = tech_info.badge(is_preview);
-                            let sample_rate = u64::from(tech_info.sample_rate.max(1));
-                            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DecoderCommand>();
+                            Ok((mut dec, mut tech_info)) => {
+                                if stop_flag.load(Ordering::Relaxed)
+                                    || seq_ref.load(Ordering::SeqCst) != req_id
+                                {
+                                    return;
+                                }
+                                if is_preview {
+                                    tech_info.duration_secs = tech_info.duration_secs.min(30);
+                                }
+                                let badge = tech_info.badge(is_preview);
+                                let sample_rate = u64::from(tech_info.sample_rate.max(1));
+                                let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DecoderCommand>();
 
-                            let _ = tx.send(BgEvent::TrackStarted {
-                                track: track.clone(),
-                                badge,
-                                tech_info,
-                                is_preview,
-                                vis_consumer: vis_cons,
-                                cover,
-                                lyrics,
-                                decoder_tx: Some(cmd_tx),
-                            });
+                                let _ = tx.send(BgEvent::TrackStarted {
+                                    req_id,
+                                    track: track.clone(),
+                                    badge,
+                                    tech_info,
+                                    is_preview,
+                                    vis_consumer: vis_cons,
+                                    cover,
+                                    lyrics,
+                                    decoder_tx: Some(cmd_tx),
+                                });
 
-                            while !stop_flag.load(Ordering::Relaxed)
-                                && !dec.audio_producer.is_abandoned()
-                            {
-                                while let Ok(DecoderCommand::Seek(target_sec)) = cmd_rx.try_recv() {
-                                    if let Ok(actual_frames) = dec.seek(target_sec) {
-                                        played_frames.store(actual_frames, Ordering::SeqCst);
-                                    } else {
-                                        played_frames.store(
-                                            target_sec.saturating_mul(sample_rate),
-                                            Ordering::SeqCst,
-                                        );
+                                while !stop_flag.load(Ordering::Relaxed)
+                                    && !dec.audio_producer.is_abandoned()
+                                {
+                                    while let Ok(DecoderCommand::Seek(target_sec)) =
+                                        cmd_rx.try_recv()
+                                    {
+                                        if let Ok(actual_frames) = dec.seek(target_sec) {
+                                            played_frames.store(actual_frames, Ordering::SeqCst);
+                                        } else {
+                                            played_frames.store(
+                                                target_sec.saturating_mul(sample_rate),
+                                                Ordering::SeqCst,
+                                            );
+                                        }
                                     }
-                                }
 
-                                if paused_flag.load(Ordering::Relaxed) {
-                                    thread::sleep(Duration::from_millis(15));
-                                    continue;
-                                }
+                                    if paused_flag.load(Ordering::Relaxed) {
+                                        thread::sleep(Duration::from_millis(15));
+                                        continue;
+                                    }
 
-                                match dec.process_next() {
-                                    Ok(Some(_)) => {}
-                                    Ok(None) => {
-                                        while !stop_flag.load(Ordering::Relaxed)
-                                            && !dec.audio_producer.is_abandoned()
-                                            && dec.audio_producer.slots()
-                                                < AUDIO_RING_BUFFER_CAPACITY
-                                        {
-                                            if paused_flag.load(Ordering::Relaxed) {
+                                    match dec.process_next() {
+                                        Ok(Some(_)) => {}
+                                        Ok(None) => {
+                                            while !stop_flag.load(Ordering::Relaxed)
+                                                && !dec.audio_producer.is_abandoned()
+                                                && dec.audio_producer.slots()
+                                                    < AUDIO_RING_BUFFER_CAPACITY
+                                            {
+                                                if paused_flag.load(Ordering::Relaxed) {
+                                                    thread::sleep(Duration::from_millis(20));
+                                                    continue;
+                                                }
                                                 thread::sleep(Duration::from_millis(20));
-                                                continue;
                                             }
-                                            thread::sleep(Duration::from_millis(20));
+                                            if !stop_flag.load(Ordering::Relaxed)
+                                                && seq_ref.load(Ordering::SeqCst) == req_id
+                                            {
+                                                let _ = tx.send(BgEvent::TrackEnded { req_id });
+                                            }
+                                            break;
                                         }
-                                        if !stop_flag.load(Ordering::Relaxed) {
-                                            let _ = tx.send(BgEvent::TrackEnded);
-                                        }
-                                        break;
+                                        Err(_) => break,
                                     }
-                                    Err(_) => break,
                                 }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(BgEvent::PlaybackError(format!(
+                                    "Decode error: {e}"
+                                )));
                             }
                         }
                     }
@@ -1162,6 +1270,7 @@ impl App {
                             file_size_bytes: 0,
                         };
                         let _ = tx.send(BgEvent::TrackStarted {
+                            req_id,
                             track: track.clone(),
                             badge: "SYNTH DEMO | 44.1 kHz".to_string(),
                             tech_info,
@@ -1224,13 +1333,11 @@ impl App {
         }
         self.search.loading = true;
         let tx = self.bg_tx.clone();
+        let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
         self.rt.spawn(async move {
-            let mut client = match DeezerClient::new() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            if let Some(arl) = arl_opt
+            if !client.is_authenticated()
+                && let Some(arl) = arl_opt
                 && !arl.is_empty()
             {
                 let _ = client.login_arl(&arl).await;
@@ -1391,18 +1498,18 @@ impl App {
         let cur_str = Self::format_mm_ss(self.elapsed_secs());
         let tot_str = Self::format_mm_ss(self.current_duration_secs);
         let play_icon = if self.now_playing.paused {
-            "[▶ Play]"
+            "[▶ Space]"
         } else {
-            "[⏸ Pause]"
+            "[⏸ Space]"
         };
         let vol_pct = (self.volume * 100.0).round() as i32;
         let right_info = format!(
-            " [⏮] {play_icon} [⏭]  {}  Vol: {vol_pct}%",
+            "  [⏮ p] {play_icon} [⏭ n]  {}  Vol [-/+]: {vol_pct}%",
             self.now_playing.badge
         );
 
-        let left_time = format!("{cur_str} ");
-        let right_time = format!(" {tot_str}");
+        let left_time = format!("{cur_str} [←] ");
+        let right_time = format!(" [→] {tot_str}");
         let fixed_chars =
             left_time.chars().count() + right_time.chars().count() + right_info.chars().count();
 
@@ -1440,7 +1547,10 @@ impl App {
             x += right_time.chars().count() as u16;
             buf.set_string(x, y, &right_info, accent_style);
         } else {
-            let compact = format!("{cur_str}/{tot_str} {play_icon} {}", self.now_playing.badge);
+            let compact = format!(
+                "{cur_str}/{tot_str} [⏮ p] {play_icon} [⏭ n] {}",
+                self.now_playing.badge
+            );
             let truncated: String = compact.chars().take(area.width as usize).collect();
             buf.set_string(area.x, y, &truncated, accent_style);
         }
@@ -1452,7 +1562,7 @@ impl App {
             .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
             .bg(theme::color_from_hex(theme::BG_TERMINAL));
         let hotkeys =
-            "q quit | 1-5 screen | [/] search | [y] lyrics | [o/r] sort | [i] info | Space play/pause | n/p next/prev | s sidebar | v spectrum";
+            "q quit | 1-5 views | [/] search | [y] lyrics | [o/r] sort | [i] track info | [s] sidebar | [v] spectrum";
         let truncated: String = hotkeys.chars().take(area.width as usize).collect();
         buf.set_string(area.left(), y, &truncated, style);
     }
@@ -1472,7 +1582,6 @@ impl App {
         if area.height >= 3 {
             let inner = Rect::new(area.left(), area.top() + 1, area.width, area.height - 2);
             if !inner.is_empty() {
-                // Выразительный полноразмерный спектр снизу (6 строк на большом экране, 4 на среднем)
                 let spec_rows = if self.config.show_spectrum && inner.height >= 22 {
                     6u16
                 } else if self.config.show_spectrum && inner.height >= 12 {
@@ -1579,10 +1688,12 @@ impl App {
             self.step_dsp();
             let _ = terminal.draw(|frame| {
                 let area = frame.area();
-                let desired_bars = ((area.width as usize) / 2).clamp(16, 96);
-                if self.cavacore.num_bars() != desired_bars && area.width >= 40 {
+                let desired_bars = ((area.width as usize).div_ceil(2)).clamp(8, 160);
+                if self.cavacore.num_bars() != desired_bars && area.width >= 16 {
                     self.cavacore = Cavacore::new(self.config.sample_rate_hz, desired_bars)
                         .with_db_scale(self.config.db_scale);
+                    let resized_bars = self.cavacore.process(&[]);
+                    self.global_spectrum.set_bars(resized_bars);
                 }
                 self.render(frame.buffer_mut(), area);
             });
@@ -1600,7 +1711,6 @@ impl App {
     pub fn handle_key_event(&mut self, k: crossterm::event::KeyEvent) -> Result<()> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        // 1. Модальное окно ввода ARL-токена
         if self.show_arl_modal {
             match k.code {
                 KeyCode::Esc => self.show_arl_modal = false,
@@ -1627,7 +1737,6 @@ impl App {
             return Ok(());
         }
 
-        // 2. Модальное окно [i] Track & Stream Info
         if self.show_track_info_modal {
             match k.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
@@ -1638,7 +1747,6 @@ impl App {
             return Ok(());
         }
 
-        // 3. Редактирование ARL-токена прямо на вкладке [5] Settings
         if self.active_tab == 5 && self.settings.editing_arl {
             match k.code {
                 KeyCode::Esc => {
@@ -1672,7 +1780,6 @@ impl App {
             return Ok(());
         }
 
-        // 4. Функциональные клавиши F1..F5 работают всегда
         match k.code {
             KeyCode::F(1) => {
                 self.set_search_input_focus(false);
@@ -1702,7 +1809,6 @@ impl App {
             _ => {}
         }
 
-        // 5. Режим редактирования строки поиска (search_input_focused == true)
         if self.active_tab == 2 && self.search_input_focused {
             match k.code {
                 KeyCode::Enter => {
@@ -1726,7 +1832,6 @@ impl App {
             return Ok(());
         }
 
-        // 6. Навигация и глобальные хоткеи плеера
         match k.code {
             KeyCode::Tab => {
                 if self.active_tab == 3 && !self.library.show_choose_modal {
@@ -2249,7 +2354,9 @@ mod tests {
             assert!(row_has(&terminal, 0, "DEEZER-TUI"));
             assert!(screen_has(&terminal, needle));
             assert!(screen_has(&terminal, "NAVIGATION [S]"));
-            assert!(screen_has(&terminal, "00:00"));
+            assert!(screen_has(&terminal, "00:00 [←]"));
+            assert!(screen_has(&terminal, "[⏮ p]"));
+            assert!(screen_has(&terminal, "Vol [-/+]:"));
         }
     }
 
@@ -2450,4 +2557,3 @@ mod tests {
         assert!(row_has(&terminal, 7, "q quit"));
     }
 }
-

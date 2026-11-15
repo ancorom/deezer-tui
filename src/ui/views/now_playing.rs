@@ -134,8 +134,8 @@ impl NowPlaying {
         }
 
         // Вычисляем пропорциональный размер квадратной обложки (2x1 символа на пиксель)
-        let max_cover_h = body_h.saturating_sub(6).clamp(4, 18);
-        let max_cover_w = (area.width.saturating_sub(2) / 2).clamp(2, 18);
+        let max_cover_h = body_h.saturating_sub(6).clamp(4, 26);
+        let max_cover_w = (area.width.saturating_sub(2) / 2).clamp(2, 26);
         let cover_h = max_cover_h.min(max_cover_w);
         let cover_w = (cover_h * 2).min(area.width);
 
