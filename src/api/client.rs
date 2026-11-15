@@ -357,6 +357,46 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse playlists: {e}")))
     }
 
+    /// Загружает треки выбранного плейлиста:
+    /// - в авторизованном режиме вызывает `playlist.getSongs` через `gw-light.php`;
+    /// - в гостевом режиме (или как fallback) вызывает публичный `https://api.deezer.com/playlist/{id}/tracks`.
+    pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<TrackData>, DeezerError> {
+        if self.is_authenticated() {
+            let params = json!({
+                "playlist_id": playlist_id,
+                "start": 0,
+                "nb": 2000,
+            });
+            if let Ok(results) = self.gw_call("playlist.getSongs", params).await {
+                let data = results.get("data").unwrap_or(&results);
+                if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone())
+                    && !tracks.is_empty()
+                {
+                    return Ok(tracks);
+                }
+            }
+        }
+
+        let resp = self
+            .http
+            .get(format!("{PUBLIC_API_URL}/playlist/{playlist_id}/tracks?limit=200"))
+            .send()
+            .await
+            .map_err(|e| DeezerError::Http(e.to_string()))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| DeezerError::Http(e.to_string()))?;
+
+        let arr = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| DeezerError::Api("Missing 'data' in playlist tracks response".into()))?;
+
+        Ok(Self::parse_public_tracks(arr))
+    }
+
     pub async fn add_to_playlist(
         &self,
         playlist_id: &str,

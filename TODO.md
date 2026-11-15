@@ -52,9 +52,9 @@
 
 ## Фаза 8: Удобная навигация в Search и Library + подгрузка плейлистов
 
-* [ ] **Шаг 8.1 (`src/ui/views/search.rs` и `src/ui/app.rs`):** Ввести режим фокуса поисковой строки `search_input_focused: bool`. Включать ввод текста по `/` или `f`, выключать по `Enter` (запуск поиска) или `Esc`. Когда `search_input_focused == false`, клавиши `Space`, `1`–`5`, `n`, `p`, `←`/`→`, `v`, `s` работают как глобальные хоткеи плеера.
+* [x] **Шаг 8.1 (`src/ui/views/search.rs` и `src/ui/app.rs`):** Ввести режим фокуса поисковой строки `search_input_focused: bool`. Включать ввод текста по `/` или `f`, выключать по `Enter` (запуск поиска) или `Esc`. Когда `search_input_focused == false`, клавиши `Space`, `1`–`5`, `n`, `p`, `←`/`→`, `v`, `s` работают как глобальные хоткеи плеера.
 
-* [ ] **Шаг 8.2 (`src/api/client.rs` и `src/ui/views/library.rs`):** Добавить в `DeezerClient` метод `get_playlist_tracks(&self, playlist_id: &str)` (вызов `playlist.getSongs` в `gw-light.php` и публичный `https://api.deezer.com/playlist/{id}/tracks`). Разделить фокус на экране `Library` между списком плейлистов и таблицей треков (переключение по `Tab` или `←`/`→`), подгружая треки выбранного плейлиста.
+* [x] **Шаг 8.2 (`src/api/client.rs` и `src/ui/views/library.rs`):** Добавить в `DeezerClient` метод `get_playlist_tracks(&self, playlist_id: &str)` (вызов `playlist.getSongs` в `gw-light.php` и публичный `https://api.deezer.com/playlist/{id}/tracks`). Разделить фокус на экране `Library` между списком плейлистов и таблицей треков (переключение по `Tab` или `←`/`→`), подгружая треки выбранного плейлиста.
 
 ## Фаза 9: Вкладка `[5] Settings` и окно деталей потока `[i] Track Info`
 

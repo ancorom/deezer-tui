@@ -1,6 +1,5 @@
-//! Экран 03 (Library & Overlays): дерево плейлистов, таблица треков
- //! (`#`, `TRACK`, `ARTIST`, `ALBUM`, `TIME`, `♥`) и модальный оверлей `CHOOSE PLAYLIST` 
-//! с независимым курсором `modal_selected`. Нижний плеер рендерится глобально в `App::render`.
+//! Экран 03 (Library & Overlays): двухпанельный фокус (`LibraryFocus::Playlists` и
+//! `LibraryFocus::Tracks`), дерево плейлистов, таблица треков и модальное окно `CHOOSE PLAYLIST`.
 
 #![allow(dead_code)]
 
@@ -9,6 +8,14 @@ use ratatui::prelude::*;
 use crate::ui::theme;
 use crate::ui::views::search::{MiniPlayer, SearchRow};
 use crate::ui::widgets::Modal;
+
+/// Активная панель фокуса на экране Library (переключается по `Tab` или `←`/`→`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibraryFocus {
+    Playlists,
+    #[default]
+    Tracks,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PlaylistEntry {
@@ -24,6 +31,7 @@ pub struct Library {
     pub selected_playlist: usize,
     pub selected_track: usize,
     pub modal_selected: usize,
+    pub focus: LibraryFocus,
     pub loading: bool,
     pub show_choose_modal: bool,
     pub player: MiniPlayer,
@@ -76,10 +84,19 @@ impl Library {
             selected_playlist: 0,
             selected_track: 0,
             modal_selected: 0,
+            focus: LibraryFocus::Tracks,
             loading: false,
             show_choose_modal: false,
             player: MiniPlayer::default(),
         }
+    }
+
+    /// Переключает фокус между списком плейлистов и таблицей треков.
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            LibraryFocus::Playlists => LibraryFocus::Tracks,
+            LibraryFocus::Tracks => LibraryFocus::Playlists,
+        };
     }
 }
 
@@ -143,7 +160,16 @@ impl Library {
         let style = Style::default()
             .fg(theme::color_from_hex(theme::GRAD_END))
             .bold();
-        buf.set_string(area.x, y, "LIBRARY", style);
+        let focus_badge = match self.focus {
+            LibraryFocus::Playlists => "LIBRARY • [Focus: Playlists | Tab/←/→: Switch]",
+            LibraryFocus::Tracks => "LIBRARY • [Focus: Tracks | Tab/←/→: Switch]",
+        };
+        let title = if area.width >= 48 {
+            focus_badge
+        } else {
+            "LIBRARY"
+        };
+        buf.set_string(area.x, y, Self::truncate(title, area.width as usize), style);
     }
 
     fn draw_playlist_tree(&self, buf: &mut Buffer, area: Rect, row_start: u16, row_end: u16) {
@@ -160,22 +186,45 @@ impl Library {
             return;
         }
         let max_rows = row_end.saturating_sub(row_start) as usize;
-        for i in 0..std::cmp::min(self.playlists.len(), max_rows) {
-            let y = row_start + i as u16;
-            if y >= row_end || y >= area.bottom() {
+        if max_rows == 0 || self.playlists.is_empty() {
+            return;
+        }
+        let scroll_offset = if self.selected_playlist >= max_rows {
+            self.selected_playlist + 1 - max_rows
+        } else {
+            0
+        };
+
+        for row_idx in 0..max_rows {
+            let i = scroll_offset + row_idx;
+            let y = row_start + row_idx as u16;
+            if y >= row_end || y >= area.bottom() || i >= self.playlists.len() {
                 break;
             }
             let entry = &self.playlists[i];
             let selected = i == self.selected_playlist;
+            let marker = if selected {
+                if self.focus == LibraryFocus::Playlists {
+                    "▶"
+                } else {
+                    "•"
+                }
+            } else {
+                " "
+            };
             let label = format!(
                 "{}  {} ({} tracks)",
-                if selected { "▶" } else { " " },
+                marker,
                 entry.title,
                 entry.tracks.len().max(entry.num_tracks as usize),
             );
-            let style = if selected {
+            let style = if selected && self.focus == LibraryFocus::Playlists {
                 Style::default()
                     .fg(theme::color_from_hex(theme::GRAD_START))
+                    .bold()
+            } else if selected {
+                Style::default()
+                    .fg(theme::color_from_hex(theme::GRAD_END))
                     .bold()
             } else {
                 Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
@@ -200,7 +249,7 @@ impl Library {
             area.x,
             y,
             Self::truncate(
-                "CHOOSE PLAYLIST [press 'a' to add track | Enter to play]",
+                "CHOOSE PLAYLIST [press 'a' to add track | Enter to load/play]",
                 area.width as usize,
             ),
             style,
@@ -246,8 +295,18 @@ impl Library {
 
         if let Some(entry) = self.playlists.get(self.selected_playlist) {
             let max_rows = row_end.saturating_sub(row_start + 1) as usize;
-            for i in 0..max_rows {
-                let y = row_start + 1 + i as u16;
+            if max_rows == 0 || entry.tracks.is_empty() {
+                return;
+            }
+            let scroll_offset = if self.selected_track >= max_rows {
+                self.selected_track + 1 - max_rows
+            } else {
+                0
+            };
+
+            for row_idx in 0..max_rows {
+                let i = scroll_offset + row_idx;
+                let y = row_start + 1 + row_idx as u16;
                 if y >= row_end || y >= area.bottom() || i >= entry.tracks.len() {
                     break;
                 }
@@ -331,9 +390,13 @@ impl Library {
         if pos.x >= area.right() || pos.y >= area.bottom() {
             return;
         }
-        let style = if selected {
+        let style = if selected && self.focus == LibraryFocus::Tracks {
             Style::default()
                 .fg(theme::color_from_hex(theme::GRAD_START))
+                .bold()
+        } else if selected {
+            Style::default()
+                .fg(theme::color_from_hex(theme::GRAD_END))
                 .bold()
         } else {
             Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
@@ -392,6 +455,16 @@ mod tests {
         assert!(row_has(&terminal, 4, "CHOOSE"));
         assert!(row_has(&terminal, 5, "TRACK"));
         assert!(row_has(&terminal, 6, "Bohemian Rhapsody"));
+    }
+
+    #[test]
+    fn toggle_focus_switches_between_playlists_and_tracks() {
+        let mut screen = make_library();
+        assert_eq!(screen.focus, LibraryFocus::Tracks);
+        screen.toggle_focus();
+        assert_eq!(screen.focus, LibraryFocus::Playlists);
+        let terminal = render(&screen, 120, 40);
+        assert!(row_has(&terminal, 0, "Focus: Playlists"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -29,7 +30,7 @@ use crate::dsp::cavacore::Cavacore;
 use crate::mpris::{self, Mpris};
 use crate::ui::theme;
 use crate::ui::views::flow_lyrics::{FlowLyrics, FlowRow};
-use crate::ui::views::library::{Library, PlaylistEntry};
+use crate::ui::views::library::{Library, LibraryFocus, PlaylistEntry};
 use crate::ui::views::now_playing::NowPlaying;
 use crate::ui::views::search::{Search, SearchRow};
 use crate::ui::widgets::{CoverArt, Modal, Spectrum};
@@ -89,6 +90,10 @@ pub enum BgEvent {
     AuthFailed(String),
     SearchDone(Vec<TrackData>),
     ChartLoaded(Vec<TrackData>),
+    PlaylistTracksLoaded {
+        playlist_id: String,
+        tracks: Vec<TrackData>,
+    },
     TrackStarted {
         track: TrackData,
         badge: String,
@@ -109,6 +114,7 @@ pub struct App {
     pub flow_lyrics: FlowLyrics,
     pub global_spectrum: Spectrum,
     pub active_tab: u8,
+    pub search_input_focused: bool,
     pub running: bool,
     pub volume: f32,
     pub config: AppConfig,
@@ -119,6 +125,7 @@ pub struct App {
     // Живые коллекции треков и активная очередь воспроизведения
     pub search_tracks: Vec<TrackData>,
     pub library_tracks: Vec<TrackData>,
+    pub playlist_tracks_cache: HashMap<String, Vec<TrackData>>,
     pub flow_tracks: Vec<TrackData>,
     pub queue: PlaybackQueue,
 
@@ -188,6 +195,7 @@ impl App {
             flow_lyrics: FlowLyrics::default(),
             global_spectrum,
             active_tab: 1,
+            search_input_focused: false,
             running: true,
             volume: cfg.volume.clamp(0.0, 1.0),
             config: cfg.clone(),
@@ -196,6 +204,7 @@ impl App {
             status_message: None,
             search_tracks: Vec::new(),
             library_tracks: Vec::new(),
+            playlist_tracks_cache: HashMap::new(),
             flow_tracks: Vec::new(),
             queue: PlaybackQueue::default(),
             show_arl_modal: false,
@@ -220,6 +229,11 @@ impl App {
 
         app.spawn_initial_load();
         app
+    }
+
+    pub fn set_search_input_focus(&mut self, focused: bool) {
+        self.search_input_focused = focused;
+        self.search.input_focused = focused;
     }
 
     fn spawn_initial_load(&self) {
@@ -257,11 +271,85 @@ impl App {
         });
     }
 
+    /// Асинхронно подгружает треки выбранного плейлиста через `DeezerClient::get_playlist_tracks`.
+    pub fn spawn_load_playlist_tracks(&mut self, playlist_id: String) {
+        if playlist_id.is_empty() {
+            return;
+        }
+        if let Some(cached) = self.playlist_tracks_cache.get(&playlist_id).cloned()
+            && !cached.is_empty()
+        {
+            self.apply_playlist_tracks(&playlist_id, cached);
+            return;
+        }
+
+        let tx = self.bg_tx.clone();
+        let arl_opt = self.config.effective_arl();
+        self.rt.spawn(async move {
+            let mut client = match DeezerClient::new() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if let Some(arl) = arl_opt
+                && !arl.is_empty()
+            {
+                let _ = client.login_arl(&arl).await;
+            }
+            let res = if playlist_id == "fav" {
+                client.get_favorites().await
+            } else {
+                client.get_playlist_tracks(&playlist_id).await
+            };
+            if let Ok(tracks) = res
+                && !tracks.is_empty()
+            {
+                let _ = tx.send(BgEvent::PlaylistTracksLoaded {
+                    playlist_id,
+                    tracks,
+                });
+            }
+        });
+    }
+
+    fn apply_playlist_tracks(&mut self, playlist_id: &str, tracks: Vec<TrackData>) {
+        let rows: Vec<SearchRow> = tracks
+            .iter()
+            .map(|t| SearchRow {
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                track: t.title.clone(),
+                time: t.formatted_duration(),
+                favorite: playlist_id == "fav",
+            })
+            .collect();
+
+        if let Some(entry) = self
+            .library
+            .playlists
+            .iter_mut()
+            .find(|p| p.id == playlist_id)
+        {
+            entry.tracks = rows;
+            entry.num_tracks = entry.tracks.len() as u64;
+        }
+
+        let is_selected_pl = self
+            .library
+            .playlists
+            .get(self.library.selected_playlist)
+            .is_some_and(|p| p.id == playlist_id);
+        if is_selected_pl {
+            self.library_tracks = tracks.clone();
+        }
+        self.playlist_tracks_cache
+            .insert(playlist_id.to_string(), tracks);
+    }
+
     pub fn attach_vis_consumer(&mut self, consumer: Consumer<f32>) {
         self.vis_consumer = Some(consumer);
     }
 
-    ///Текущая позиция воспроизведения в секундах из реально сыгранных `CPAL` фреймов.
+    /// Текущая позиция воспроизведения в секундах из реально сыгранных `CPAL` фреймов.
     pub fn elapsed_secs(&self) -> u64 {
         let frames = self.played_frames.load(Ordering::Relaxed);
         let sr = u64::from(self.current_sample_rate.max(1));
@@ -328,6 +416,8 @@ impl App {
                     self.status_message = Some(format!("Logged in as {user_name}"));
                     if !favorites.is_empty() {
                         self.library_tracks = favorites.clone();
+                        self.playlist_tracks_cache
+                            .insert("fav".to_string(), favorites.clone());
                         let fav_rows: Vec<SearchRow> = favorites
                             .iter()
                             .map(|t| SearchRow {
@@ -353,6 +443,8 @@ impl App {
                             });
                         }
                         self.library.playlists = entries;
+                        self.library.selected_playlist = 0;
+                        self.library.selected_track = 0;
                     }
                     if !flow.is_empty() {
                         self.flow_lyrics.flow = flow
@@ -420,6 +512,13 @@ impl App {
                         .collect();
                     self.search_tracks = tracks;
                 }
+                BgEvent::PlaylistTracksLoaded {
+                    playlist_id,
+                    tracks,
+                } => {
+                    self.library.loading = false;
+                    self.apply_playlist_tracks(&playlist_id, tracks);
+                }
                 BgEvent::TrackStarted {
                     track,
                     badge,
@@ -438,7 +537,6 @@ impl App {
                         self.now_playing.cover = Some(c.clone());
                         self.flow_lyrics.cover = Some(c);
                     }
-                    // Всегда перезаписываем lyrics (очищая старый текст, если трек инструментальный)
                     self.flow_lyrics.lyrics = lyrics;
                     self.flow_lyrics.position_ms = 0;
                     self.search.player.track = track.title.clone();
@@ -482,7 +580,6 @@ impl App {
         let played_frames = Arc::new(AtomicU64::new(0));
         self.played_frames = Arc::clone(&played_frames);
 
-        // Немедленно очищаем старый текст песни перед стартом нового трека
         self.flow_lyrics.lyrics.clear();
         self.flow_lyrics.position_ms = 0;
         self.now_playing.progress = 0.0;
@@ -609,7 +706,6 @@ impl App {
                                 match dec.process_next() {
                                     Ok(Some(_)) => {}
                                     Ok(None) => {
-                                        // Ждём, пока CPAL доиграет оставшиеся сэмплы в буфере
                                         while !stop_flag.load(Ordering::Relaxed)
                                             && dec.audio_producer.slots()
                                                 < AUDIO_RING_BUFFER_CAPACITY
@@ -846,7 +942,6 @@ impl App {
             }
         }
 
-        // Вертикальный разделитель справа от сайдбара
         let sep_x = area.right().saturating_sub(1);
         for ry in area.top()..area.bottom() {
             buf.set_string(sep_x, ry, "│", dim_style);
@@ -922,7 +1017,7 @@ impl App {
             .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
             .bg(theme::color_from_hex(theme::BG_TERMINAL));
         let hotkeys =
-            "q quit | 1-5/Tab screen | Space play/pause | n/p next/prev | <- -> seek | s sidebar | v spectrum | + - vol";
+            "q quit | 1-5 screen | [/] search | Space play/pause | n/p next/prev | <- -> seek | s sidebar | v spectrum";
         let truncated: String = hotkeys.chars().take(area.width as usize).collect();
         buf.set_string(area.left(), y, &truncated, style);
     }
@@ -953,7 +1048,6 @@ impl App {
 
                 let main_area = Rect::new(inner.x, inner.y, inner.width, viewport_h);
 
-                // Отрисовываем глобальный сворачиваемый сайдбар слева (если не свёрнут и хватает ширины)
                 let content_area = if !self.config.sidebar_collapsed && main_area.width >= 64 {
                     let sb_w = 22u16;
                     let sb_rect = Rect::new(main_area.x, main_area.y, sb_w, main_area.height);
@@ -1049,165 +1143,179 @@ impl App {
         Ok(())
     }
 
-    fn handle_events(&mut self) -> Result<()> {
-        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-        if let Ok(true) = event::poll(Duration::from_nanos(0))
-            && let Ok(Event::Key(k)) = event::read()
-            && k.kind == KeyEventKind::Press
-        {
-            if self.show_arl_modal {
-                match k.code {
-                    KeyCode::Esc => self.show_arl_modal = false,
-                    KeyCode::Backspace => {
-                        self.arl_input.pop();
-                    }
-                    KeyCode::Enter => {
-                        self.show_arl_modal = false;
-                        let trimmed = self.arl_input.trim().to_string();
-                        self.config.arl = if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed)
-                        };
-                        let _ = self.config.save();
-                        self.spawn_initial_load();
-                    }
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.arl_input.push(c);
-                    }
-                    _ => {}
+    pub fn handle_key_event(&mut self, k: crossterm::event::KeyEvent) -> Result<()> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // 1. Модальное окно ввода ARL-токена
+        if self.show_arl_modal {
+            match k.code {
+                KeyCode::Esc => self.show_arl_modal = false,
+                KeyCode::Backspace => {
+                    self.arl_input.pop();
                 }
+                KeyCode::Enter => {
+                    self.show_arl_modal = false;
+                    let trimmed = self.arl_input.trim().to_string();
+                    self.config.arl = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    };
+                    let _ = self.config.save();
+                    self.spawn_initial_load();
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.arl_input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // 2. Функциональные клавиши F1..F5 работают всегда
+        match k.code {
+            KeyCode::F(1) => {
+                self.set_search_input_focus(false);
+                self.active_tab = 1;
                 return Ok(());
             }
+            KeyCode::F(2) => {
+                self.active_tab = 2;
+                return Ok(());
+            }
+            KeyCode::F(3) => {
+                self.set_search_input_focus(false);
+                self.active_tab = 3;
+                return Ok(());
+            }
+            KeyCode::F(4) => {
+                self.set_search_input_focus(false);
+                self.active_tab = 4;
+                return Ok(());
+            }
+            KeyCode::F(5) => {
+                self.set_search_input_focus(false);
+                self.active_tab = 5;
+                return Ok(());
+            }
+            _ => {}
+        }
 
+        // 3. Режим редактирования строки поиска (search_input_focused == true)
+        if self.active_tab == 2 && self.search_input_focused {
             match k.code {
-                KeyCode::F(1) => {
-                    self.active_tab = 1;
-                    return Ok(());
+                KeyCode::Enter => {
+                    self.set_search_input_focus(false);
+                    self.trigger_search();
                 }
-                KeyCode::F(2) => {
-                    self.active_tab = 2;
-                    return Ok(());
+                KeyCode::Esc => {
+                    self.set_search_input_focus(false);
                 }
-                KeyCode::F(3) => {
-                    self.active_tab = 3;
-                    return Ok(());
+                KeyCode::Backspace => {
+                    self.search.query.pop();
                 }
-                KeyCode::F(4) => {
-                    self.active_tab = 4;
-                    return Ok(());
+                KeyCode::Char(c)
+                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.search.query.push(c);
                 }
-                KeyCode::F(5) => {
-                    self.active_tab = 5;
-                    return Ok(());
-                }
-                KeyCode::Tab => {
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // 4. Навигация и глобальные хоткеи плеера (когда search_input_focused == false)
+        match k.code {
+            KeyCode::Tab => {
+                if self.active_tab == 3 && !self.library.show_choose_modal {
+                    self.library.toggle_focus();
+                } else {
                     self.active_tab = (self.active_tab % 5) + 1;
-                    return Ok(());
                 }
-                KeyCode::BackTab => {
+            }
+            KeyCode::BackTab => {
+                if self.active_tab == 3 && !self.library.show_choose_modal {
+                    self.library.toggle_focus();
+                } else {
                     self.active_tab = if self.active_tab <= 1 {
                         5
                     } else {
                         self.active_tab - 1
                     };
-                    return Ok(());
-                }
-                _ => {}
-            }
-
-            if self.active_tab == 2 {
-                match k.code {
-                    KeyCode::Backspace => {
-                        self.search.query.pop();
-                        return Ok(());
-                    }
-                    KeyCode::Char('L') if k.modifiers.contains(KeyModifiers::SHIFT) => {
-                        self.show_arl_modal = true;
-                        return Ok(());
-                    }
-                    KeyCode::Char(c)
-                        if !k.modifiers.contains(KeyModifiers::CONTROL)
-                            && !k.modifiers.contains(KeyModifiers::ALT) =>
-                    {
-                        if self.search.query.is_empty()
-                            && matches!(c, '1' | '2' | '3' | '4' | '5')
-                        {
-                            self.active_tab = c as u8 - b'0';
-                            return Ok(());
-                        }
-                        self.search.query.push(c);
-                        return Ok(());
-                    }
-                    KeyCode::Up => {
-                        self.navigate_up();
-                        return Ok(());
-                    }
-                    KeyCode::Down => {
-                        self.navigate_down();
-                        return Ok(());
-                    }
-                    KeyCode::Enter => {
-                        self.press_enter();
-                        return Ok(());
-                    }
-                    KeyCode::Esc => {
-                        if !self.search.query.is_empty() {
-                            self.search.query.clear();
-                        } else {
-                            self.active_tab = 1;
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
                 }
             }
-
-            match k.code {
-                KeyCode::Char('q') => self.running = false,
-                KeyCode::Char('1') => self.active_tab = 1,
-                KeyCode::Char('2') => self.active_tab = 2,
-                KeyCode::Char('3') => self.active_tab = 3,
-                KeyCode::Char('4') => self.active_tab = 4,
-                KeyCode::Char('5') => self.active_tab = 5,
-                KeyCode::Char('l') | KeyCode::Char('L') => {
+            KeyCode::Char('/') => {
+                self.active_tab = 2;
+                self.set_search_input_focus(true);
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') if self.active_tab == 2 => {
+                self.set_search_input_focus(true);
+            }
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Char('1') => self.active_tab = 1,
+            KeyCode::Char('2') => self.active_tab = 2,
+            KeyCode::Char('3') => self.active_tab = 3,
+            KeyCode::Char('4') => self.active_tab = 4,
+            KeyCode::Char('5') => self.active_tab = 5,
+            KeyCode::Char('L') => {
+                self.show_arl_modal = true;
+            }
+            KeyCode::Char('l') => {
+                if self.active_tab == 3 && !self.library.show_choose_modal {
+                    self.library.focus = LibraryFocus::Tracks;
+                } else {
                     self.show_arl_modal = true;
                 }
-                KeyCode::Char('a') if self.active_tab == 3 => {
-                    self.library.modal_selected = self.library.selected_playlist;
-                    self.library.show_choose_modal = !self.library.show_choose_modal;
-                }
-                KeyCode::Char(' ') => self.toggle_play_pause(),
-                KeyCode::Char('n') | KeyCode::Char('>') => self.play_next_in_queue(),
-                KeyCode::Char('p') | KeyCode::Char('<') => self.play_prev_in_queue(),
-                KeyCode::Char('v') | KeyCode::Char('V') => self.toggle_spectrum(),
-                KeyCode::Char('s') | KeyCode::Char('S') => self.toggle_sidebar(),
-                KeyCode::Char('+') | KeyCode::Char('=') => {
-                    self.volume = (self.volume + 0.05).min(1.0);
-                    if let Some(ref out) = self.audio_output {
-                        out.set_volume(self.volume);
-                    }
-                    if let Some(ref mpris) = self.mpris {
-                        let _ = mpris.set_volume(f64::from(self.volume));
-                    }
-                }
-                KeyCode::Char('-') => {
-                    self.volume = (self.volume - 0.05).max(0.0);
-                    if let Some(ref out) = self.audio_output {
-                        out.set_volume(self.volume);
-                    }
-                    if let Some(ref mpris) = self.mpris {
-                        let _ = mpris.set_volume(f64::from(self.volume));
-                    }
-                }
-                KeyCode::Up => self.navigate_up(),
-                KeyCode::Down => self.navigate_down(),
-                KeyCode::Left => self.navigate_left(),
-                KeyCode::Right => self.navigate_right(),
-                KeyCode::Enter => self.press_enter(),
-                KeyCode::Esc => self.press_escape(),
-                _ => {}
             }
+            KeyCode::Char('h') if self.active_tab == 3 && !self.library.show_choose_modal => {
+                self.library.focus = LibraryFocus::Playlists;
+            }
+            KeyCode::Char('a') if self.active_tab == 3 => {
+                self.library.modal_selected = self.library.selected_playlist;
+                self.library.show_choose_modal = !self.library.show_choose_modal;
+            }
+            KeyCode::Char(' ') => self.toggle_play_pause(),
+            KeyCode::Char('n') | KeyCode::Char('>') => self.play_next_in_queue(),
+            KeyCode::Char('p') | KeyCode::Char('<') => self.play_prev_in_queue(),
+            KeyCode::Char('v') | KeyCode::Char('V') => self.toggle_spectrum(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.toggle_sidebar(),
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.volume = (self.volume + 0.05).min(1.0);
+                if let Some(ref out) = self.audio_output {
+                    out.set_volume(self.volume);
+                }
+                if let Some(ref mpris) = self.mpris {
+                    let _ = mpris.set_volume(f64::from(self.volume));
+                }
+            }
+            KeyCode::Char('-') => {
+                self.volume = (self.volume - 0.05).max(0.0);
+                if let Some(ref out) = self.audio_output {
+                    out.set_volume(self.volume);
+                }
+                if let Some(ref mpris) = self.mpris {
+                    let _ = mpris.set_volume(f64::from(self.volume));
+                }
+            }
+            KeyCode::Up => self.navigate_up(),
+            KeyCode::Down => self.navigate_down(),
+            KeyCode::Left => self.navigate_left(),
+            KeyCode::Right => self.navigate_right(),
+            KeyCode::Enter => self.press_enter(),
+            KeyCode::Esc => self.press_escape(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_events(&mut self) -> Result<()> {
+        use crossterm::event::{self, Event, KeyEventKind};
+        if let Ok(true) = event::poll(Duration::from_nanos(0))
+            && let Ok(Event::Key(k)) = event::read()
+            && k.kind == KeyEventKind::Press
+        {
+            self.handle_key_event(k)?;
         }
         Ok(())
     }
@@ -1269,11 +1377,28 @@ impl App {
                     if self.library.modal_selected > 0 {
                         self.library.modal_selected -= 1;
                     }
-                } else if self.library.selected_track > 0 {
-                    self.library.selected_track -= 1;
-                } else if self.library.selected_playlist > 0 {
-                    self.library.selected_playlist -= 1;
-                    self.library.selected_track = 0;
+                } else {
+                    match self.library.focus {
+                        LibraryFocus::Playlists => {
+                            if self.library.selected_playlist > 0 {
+                                self.library.selected_playlist -= 1;
+                                self.library.selected_track = 0;
+                                if let Some(pl_id) = self
+                                    .library
+                                    .playlists
+                                    .get(self.library.selected_playlist)
+                                    .map(|p| p.id.clone())
+                                {
+                                    self.spawn_load_playlist_tracks(pl_id);
+                                }
+                            }
+                        }
+                        LibraryFocus::Tracks => {
+                            if self.library.selected_track > 0 {
+                                self.library.selected_track -= 1;
+                            }
+                        }
+                    }
                 }
             }
             4 if self.flow_lyrics.selected_flow > 0 => self.flow_lyrics.selected_flow -= 1,
@@ -1295,14 +1420,30 @@ impl App {
                     if self.library.modal_selected + 1 < self.library.playlists.len() {
                         self.library.modal_selected += 1;
                     }
-                } else if let Some(entry) =
-                    self.library.playlists.get(self.library.selected_playlist)
-                {
-                    if self.library.selected_track + 1 < entry.tracks.len() {
-                        self.library.selected_track += 1;
-                    } else if self.library.selected_playlist + 1 < self.library.playlists.len() {
-                        self.library.selected_playlist += 1;
-                        self.library.selected_track = 0;
+                } else {
+                    match self.library.focus {
+                        LibraryFocus::Playlists => {
+                            if self.library.selected_playlist + 1 < self.library.playlists.len() {
+                                self.library.selected_playlist += 1;
+                                self.library.selected_track = 0;
+                                if let Some(pl_id) = self
+                                    .library
+                                    .playlists
+                                    .get(self.library.selected_playlist)
+                                    .map(|p| p.id.clone())
+                                {
+                                    self.spawn_load_playlist_tracks(pl_id);
+                                }
+                            }
+                        }
+                        LibraryFocus::Tracks => {
+                            if let Some(entry) =
+                                self.library.playlists.get(self.library.selected_playlist)
+                                && self.library.selected_track + 1 < entry.tracks.len()
+                            {
+                                self.library.selected_track += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1317,10 +1458,7 @@ impl App {
 
     fn navigate_left(&mut self) {
         if self.active_tab == 3 && !self.library.show_choose_modal {
-            if self.library.selected_playlist > 0 {
-                self.library.selected_playlist -= 1;
-                self.library.selected_track = 0;
-            }
+            self.library.toggle_focus();
         } else {
             self.seek(false);
         }
@@ -1328,10 +1466,7 @@ impl App {
 
     fn navigate_right(&mut self) {
         if self.active_tab == 3 && !self.library.show_choose_modal {
-            if self.library.selected_playlist + 1 < self.library.playlists.len() {
-                self.library.selected_playlist += 1;
-                self.library.selected_track = 0;
-            }
+            self.library.toggle_focus();
         } else {
             self.seek(true);
         }
@@ -1356,15 +1491,13 @@ impl App {
                 }
             }
             2 => {
-                if !self.search.query.trim().is_empty() && self.search.rows.is_empty() {
-                    self.trigger_search();
-                } else if let Some(track) = self
-                    .queue
-                    .set_queue(self.search_tracks.clone(), self.search.selected)
+                if self.search.rows.is_empty() && self.search.query.trim().is_empty() {
+                    self.set_search_input_focus(true);
+                } else if !self.search.rows.is_empty()
+                    && let Some(track) = self
+                        .queue
+                        .set_queue(self.search_tracks.clone(), self.search.selected)
                 {
-                    if !self.search.query.trim().is_empty() {
-                        self.trigger_search();
-                    }
                     self.start_track_playback(track);
                 } else if !self.search.query.trim().is_empty() {
                     self.trigger_search();
@@ -1388,6 +1521,16 @@ impl App {
                         target.num_tracks = target.tracks.len() as u64;
                     }
                     self.library.show_choose_modal = false;
+                } else if self.library.focus == LibraryFocus::Playlists {
+                    if let Some(pl_id) = self
+                        .library
+                        .playlists
+                        .get(self.library.selected_playlist)
+                        .map(|p| p.id.clone())
+                    {
+                        self.spawn_load_playlist_tracks(pl_id);
+                    }
+                    self.library.focus = LibraryFocus::Tracks;
                 } else if let Some(track) = self
                     .queue
                     .set_queue(self.library_tracks.clone(), self.library.selected_track)
@@ -1438,6 +1581,8 @@ impl App {
     fn press_escape(&mut self) {
         if self.show_arl_modal {
             self.show_arl_modal = false;
+        } else if self.search_input_focused {
+            self.set_search_input_focus(false);
         } else if self.library.show_choose_modal {
             self.library.show_choose_modal = false;
         } else {
@@ -1449,6 +1594,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
 
     fn render_ui(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -1516,6 +1662,66 @@ mod tests {
             assert!(screen_has(&terminal, "NAVIGATION [S]"));
             assert!(screen_has(&terminal, "00:00"));
         }
+    }
+
+    #[test]
+    fn search_modal_input_focus_and_global_hotkeys() {
+        let mut app = App::new();
+        app.active_tab = 2;
+        assert!(!app.search_input_focused);
+
+        // Вне режима ввода пробел переключает паузу, а не пишет в query
+        let was_paused = app.now_playing.paused;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert_ne!(app.now_playing.paused, was_paused);
+        assert!(app.search.query.is_empty());
+
+        // Нажатие 'f' включает режим ввода текста
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.search_input_focused);
+
+        // В режиме ввода символы (включая пробел и цифры) идут в поисковую строку
+        for ch in ['d', 'a', 'f', 't', ' ', '1'] {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(app.search.query, "daft 1");
+        assert_eq!(app.active_tab, 2);
+
+        // Esc выключает фокус ввода, после чего цифра '3' переключает вкладку на Library
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.search_input_focused);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.active_tab, 3);
+    }
+
+    #[test]
+    fn library_two_panel_focus_and_navigation() {
+        let mut app = App::new();
+        app.active_tab = 3;
+        assert_eq!(app.library.focus, LibraryFocus::Tracks);
+
+        // В фокусе Tracks стрелка вниз листает треки, но не переключает плейлист на границе
+        assert_eq!(app.library.selected_playlist, 0);
+        assert_eq!(app.library.selected_track, 0);
+        app.navigate_down();
+        assert_eq!(app.library.selected_track, 1);
+        app.navigate_down();
+        assert_eq!(
+            app.library.selected_playlist, 0,
+            "плейлист не должен переключаться при прокрутке таблицы треков"
+        );
+
+        // Стрелка влево (или Tab) переключает фокус на список плейлистов
+        app.navigate_left();
+        assert_eq!(app.library.focus, LibraryFocus::Playlists);
+        app.navigate_down();
+        assert_eq!(app.library.selected_playlist, 1);
+        assert_eq!(app.library.selected_track, 0);
     }
 
     #[test]

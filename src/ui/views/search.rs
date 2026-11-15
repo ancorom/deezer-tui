@@ -1,4 +1,5 @@
-//! Экран 02 (Search & Discover): поле ввода `Search:` и 3 колонки (`ARTISTS`, `ALBUMS`, `TRACKS`).
+//! Экран 02 (Search & Discover): модальное поле ввода `Search:` (`input_focused`)
+//! и 3 колонки результатов (`ARTISTS`, `ALBUMS`, `TRACKS`).
 //! Сайдбар `NAVIGATION`, нижний плеер и спектр в v2.0 рендерятся глобально в `App::render`.
 
 #![allow(dead_code)]
@@ -44,6 +45,7 @@ impl MiniPlayer {
 
 pub struct Search {
     pub query: String,
+    pub input_focused: bool,
     pub selected: usize,
     pub loading: bool,
     pub rows: Vec<SearchRow>,
@@ -55,6 +57,7 @@ impl std::fmt::Debug for Search {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Search")
             .field("query", &self.query)
+            .field("input_focused", &self.input_focused)
             .field("selected", &self.selected)
             .field("loading", &self.loading)
             .field("rows", &self.rows)
@@ -76,6 +79,7 @@ impl Search {
         spectrum.set_bars(&[0.2, 0.45, 0.8, 1.0, 0.9, 0.6, 0.4, 0.65, 0.85, 0.3]);
         Self {
             query: String::new(),
+            input_focused: false,
             selected: 0,
             loading: false,
             rows: Vec::new(),
@@ -117,9 +121,15 @@ impl Search {
             return;
         }
         let x0 = area.x;
-        let label_style = Style::default()
-            .fg(theme::color_from_hex(theme::GRAD_END))
-            .bold();
+        let label_style = if self.input_focused {
+            Style::default()
+                .fg(theme::color_from_hex(theme::GRAD_START))
+                .bold()
+        } else {
+            Style::default()
+                .fg(theme::color_from_hex(theme::GRAD_END))
+                .bold()
+        };
         buf.set_string(
             x0,
             y,
@@ -131,11 +141,21 @@ impl Search {
         if x >= area.right() {
             return;
         }
-        let text_style = Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY));
+        let text_style = if self.input_focused {
+            Style::default()
+                .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
+                .bold()
+        } else {
+            Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
+        };
         let display = if self.loading {
             String::from("Loading…")
         } else if self.query.is_empty() {
-            String::from("type a query…")
+            if self.input_focused {
+                String::from("type a query…")
+            } else {
+                String::from("press [/] or [f] to type…")
+            }
         } else {
             self.query.clone()
         };
@@ -143,11 +163,30 @@ impl Search {
         let text = Self::truncate(&display, available);
         buf.set_string(x, y, text.as_str(), text_style);
 
-        if !self.query.is_empty() {
+        if self.input_focused || !self.query.is_empty() {
             let cursor_x = x.saturating_add(text.chars().count() as u16);
             if cursor_x < area.right() {
-                buf.set_string(cursor_x, y, "|", text_style);
+                let cursor_sym = if self.input_focused { "█" } else { "|" };
+                buf.set_string(cursor_x, y, cursor_sym, label_style);
             }
+        }
+
+        let mode_hint = if self.input_focused {
+            "[EDITING: Enter/Esc]"
+        } else {
+            "[/ or f: Edit]"
+        };
+        let hint_len = mode_hint.chars().count() as u16;
+        if area.width > hint_len + 28 {
+            let hx = area.right().saturating_sub(hint_len);
+            let hint_style = if self.input_focused {
+                Style::default()
+                    .fg(theme::color_from_hex(theme::GRAD_START))
+                    .bold()
+            } else {
+                Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY))
+            };
+            buf.set_string(hx, y, mode_hint, hint_style);
         }
     }
 
@@ -182,8 +221,18 @@ impl Search {
         }
 
         let max_rows = row_end.saturating_sub(row_start + 1) as usize;
-        for i in 0..max_rows {
-            let y = row_start + 1 + i as u16;
+        if max_rows == 0 {
+            return;
+        }
+        let scroll_offset = if self.selected >= max_rows {
+            self.selected + 1 - max_rows
+        } else {
+            0
+        };
+
+        for row_idx in 0..max_rows {
+            let i = scroll_offset + row_idx;
+            let y = row_start + 1 + row_idx as u16;
             if y >= row_end || y >= area.bottom() || i >= self.rows.len() {
                 break;
             }
@@ -264,6 +313,7 @@ mod tests {
         spectrum.set_bars(&[0.25, 0.5, 0.9, 1.0, 0.8, 0.55, 0.35, 0.7, 0.95, 0.4]);
         Search {
             query: "queen".into(),
+            input_focused: false,
             selected: 1,
             loading: false,
             rows: vec![
@@ -326,6 +376,14 @@ mod tests {
         assert!(row_has(&terminal, 1, "TRACKS"));
         assert!(row_has(&terminal, 2, "Queen"));
         assert!(row_has(&terminal, 2, "Bohemian Rhapsody"));
+    }
+
+    #[test]
+    fn shows_editing_badge_when_input_focused() {
+        let mut screen = make_search();
+        screen.input_focused = true;
+        let terminal = render(&screen, 120, 20);
+        assert!(row_has(&terminal, 0, "[EDITING: Enter/Esc]"));
     }
 
     #[test]
