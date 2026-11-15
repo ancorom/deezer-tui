@@ -62,3 +62,23 @@
 
 * [x] **Шаг 9.2 (`src/ui/app.rs`):** Добавить модальное окно технической информации о треке и потоке по клавише `i` (`Track ID`, `Artist`, `Album`, `Codec`, `Sample Rate`, `Bit Depth`, `Bitrate kbps`, `Stream Size MB`, `Mode: HiFi BF_CBC_STRIPE / Guest Preview`).
 
+
+## Фаза 10: Релиз v2.1 — масштабный дебаг и доработки
+
+* [x] **Шаг 10.1 (`src/api/models.rs`):** Добавить `TrackData.date_add: u64` (rename `DATE_ADD`, alias `TIMELINE`, `deserialize_u64_flexible`) и расширить алиасы `PlaylistData` (`id`, `title`, `nb_tracks`, `COUNT`, `CREATED_AT`, `creation_date` + `deserialize_u64_flexible` для `NB_SONG`/`DATE_ADD`), чтобы плейлисты с строковыми датами и числами в API не терялись при десериализации.
+
+* [x] **Шаг 10.2 (`src/api/client.rs`):** Заменить `get_playlists` — собирать плейлисты из `deezer.pageProfile` поэлементно (без whole-array `unwrap`) и дублировать/дополнять через публичный fallback `https://api.deezer.com/user/{id}/playlists?limit=100` с дедупликацией по `playlist_id`.
+
+* [x] **Шаг 10.3 (`src/audio/stream.rs`):** Streaming-декод: `fetch_streaming` с общим temp-файлом и `written_len: AtomicU64` — декодер стартует после пребуфера 256 КБ, загрузка продолжается в фоновом tokio-задаче; `Read` ждёт дописанных байтов, `Seek` ждёт не более 1.5 с и клампится к `written_len` до окончания загрузки.
+
+* [x] **Шаг 10.4 (`src/audio/decoder.rs`):** Убить CPU-зомби: `push_all_cancelable` с проверкой `stop_flag.load() || dst.is_abandoned()` и `thread::sleep(5 мс)` вместо busy-spin `yield_now()`; `Decoder::new_seekable_with_stop` с общим `stop_flag`; `push_all_blocking` оставлена как обёртка.
+
+* [x] **Шаг 10.5 (`src/config.rs`):** Добавить сохраняемое поле `show_lyrics: bool` (по умолчанию `true`) для глобального переключателя `y`.
+
+* [x] **Шаг 10.6 (`src/ui/views/now_playing.rs`):** Разбить Now Playing на левую панель (крупная обложка + метаданные + подсказки) и панель `LYRICS [Y]` с переносом строк, подсветкой активной строки и автопрокруткой; прогресс-бар/кнопки/спектр рендерятся глобально в `App::render`.
+
+* [x] **Шаг 10.7 (`src/ui/views/flow_lyrics.rs`):** Убрать второй спектр, добавить вертикальный разделитель `│`, `wrap_text` для длинных названий, header `FLOW • Infinite Recommendations [y: Lyrics ON/OFF]`, автопрокрутку списка Flow и подсветку активной строки лирики.
+
+* [x] **Шаг 10.8 (`src/ui/views/library.rs`):** Сортировка треков плейлиста (`o` — критерий `Added/Title/Artist/Album` по кругу, `r` — направление `▲/▼`), сортируемые заголовки колонок, бейдж `[Sort [o/r]: ...]` в заголовке и расширенные отступы колонок.
+
+* [x] **Шаг 10.9 (`src/ui/app.rs`):** `PrefetchedTrack`-кэш мгновенной предзагрузки следующего трека (`spawn_prefetch_next` после старта текущего), `spawn_fetch_more_flow` для бесконечного Flow (автоподгрузка при ≤3 треках), `resort_active_library_playlist` с кэшем исходных треков, хоткеи `y` (лирика), `o`/`r` (сортировка), адаптивный спектр 6–4 строки, глобальные `show_lyrics`/`position_ms`.

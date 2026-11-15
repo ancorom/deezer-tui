@@ -202,8 +202,14 @@ impl DeezerClient {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
 
+                let date_add = item
+                    .get("DATE_ADD")
+                    .or_else(|| item.get("TIMELINE"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 Some(TrackData {
                     track_id: id,
+                    date_add,
                     title,
                     artist,
                     album,
@@ -339,23 +345,56 @@ impl DeezerClient {
             .as_ref()
             .ok_or_else(|| DeezerError::Auth("Not authenticated".into()))?;
 
+        let mut collected: Vec<PlaylistData> = Vec::new();
+
+        // 1. Запрос через приватный gw-light.php (deezer.pageProfile)
         let params = json!({
             "user_id": session.user_id,
             "tab": "playlists",
             "nb": 2000,
         });
 
-        let results = self.gw_call("deezer.pageProfile", params).await?;
+        if let Ok(results) = self.gw_call("deezer.pageProfile", params).await
+            && let Some(arr) = results
+                .get("TAB")
+                .and_then(|t| t.get("playlists"))
+                .and_then(|p| p.get("data"))
+                .or_else(|| results.get("data"))
+                .and_then(|d| d.as_array())
+        {
+            for item in arr {
+                if let Ok(pl) = serde_json::from_value::<PlaylistData>(item.clone())
+                    && !pl.playlist_id.is_empty()
+                    && !pl.playlist_title.is_empty()
+                {
+                    collected.push(pl);
+                }
+            }
+        }
 
-        let data = results
-            .get("TAB")
-            .and_then(|t| t.get("playlists"))
-            .and_then(|p| p.get("data"))
-            .ok_or_else(|| DeezerError::Api("Missing TAB.playlists.data in profile".into()))?;
+        // 2. Дополняем / fallback через REST API https://api.deezer.com/user/{user_id}/playlists
+        let public_url = format!(
+            "{PUBLIC_API_URL}/user/{}/playlists?limit=100",
+            session.user_id
+        );
+        if let Ok(resp) = self.http.get(&public_url).send().await
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+            && let Some(arr) = body.get("data").and_then(|d| d.as_array())
+        {
+            for item in arr {
+                if let Ok(pl) = serde_json::from_value::<PlaylistData>(item.clone())
+                    && !pl.playlist_id.is_empty()
+                    && !pl.playlist_title.is_empty()
+                    && !collected.iter().any(|existing| existing.playlist_id == pl.playlist_id)
+                {
+                    collected.push(pl);
+                }
+            }
+        }
 
-        serde_json::from_value(data.clone())
-            .map_err(|e| DeezerError::Api(format!("Failed to parse playlists: {e}")))
+        Ok(collected)
     }
+
 
     /// Загружает треки выбранного плейлиста:
     /// - в авторизованном режиме вызывает `playlist.getSongs` через `gw-light.php`;

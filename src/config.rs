@@ -30,6 +30,9 @@ pub struct AppConfig {
     /// Отображать ли глобальный спектроанализатор снизу (переключается по `v`).
     #[serde(default = "default_show_spectrum")]
     pub show_spectrum: bool,
+    /// Отображать ли синхронную панель текста песни на экранах Now Playing и Flow (переключается по `y`).
+    #[serde(default = "default_show_lyrics")]
+    pub show_lyrics: bool,
     /// Использовать ли логарифмическую шкалу децибел (`dB`) для спектра.
     #[serde(default)]
     pub db_scale: bool,
@@ -54,6 +57,10 @@ fn default_show_spectrum() -> bool {
     true
 }
 
+fn default_show_lyrics() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +69,7 @@ impl Default for AppConfig {
             sample_rate_hz: default_sample_rate_hz(),
             preferred_quality: default_preferred_quality(),
             show_spectrum: default_show_spectrum(),
+            show_lyrics: default_show_lyrics(),
             db_scale: false,
             sidebar_collapsed: false,
         }
@@ -184,6 +192,7 @@ mod tests {
         assert_eq!(config.sample_rate_hz, 44_100.0);
         assert_eq!(config.preferred_quality, "FLAC");
         assert!(config.show_spectrum);
+        assert!(config.show_lyrics);
         assert!(!config.db_scale);
         assert!(!config.sidebar_collapsed);
     }
@@ -207,6 +216,7 @@ mod tests {
             sample_rate_hz: 44_100.0,
             preferred_quality: "MP3_320".into(),
             show_spectrum: false,
+            show_lyrics: false,
             db_scale: true,
             sidebar_collapsed: true,
         };
@@ -217,3 +227,4 @@ mod tests {
         assert_eq!(loaded.preferred_audio_quality(), AudioQuality::Mp3_320);
     }
 }
+

@@ -1,30 +1,51 @@
 //! Поток `DeezerStream`, реализующий `Read + Seek + Send + Sync + MediaSource`.
 //!
-//! Расшифровывает каждый чанк `chunk_idx % 3 == 0` размером ровно 2048 байт
-//! через Blowfish-CBC и сохраняет данные во временный файл `tempfile`,
-//! обеспечивая мгновенный `Seek` вперёд и назад для декодера `symphonia`.
+//! Поддерживает как синхронную работу с буфером, так и прогрессивную потоковую
+//! загрузку (`fetch_streaming`), при которой воспроизведение начинается сразу после
+//! буферизации первых 256 КБ аудиопотока.
 
 #![allow(dead_code)]
 
 pub use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use symphonia::core::io::MediaSource;
 
 use crate::api::crypto::{self, CHUNK_SIZE};
 
+/// Минимальный размер предбуферизации перед стартом декодера (256 КБ = 128 чанков по 2048 байт).
+const INITIAL_PREBUFFER_BYTES: u64 = 256 * 1024;
+
 /// Кэширующий поток расшифрованного аудио Deezer.
 pub struct DeezerStream {
     file: File,
-    total_len: u64,
+    total_len: Arc<AtomicU64>,
+    written_len: Arc<AtomicU64>,
+    finished: Arc<AtomicBool>,
+    abort_download: Arc<AtomicBool>,
+}
+
+impl Drop for DeezerStream {
+    fn drop(&mut self) {
+        self.abort_download.store(true, Ordering::Relaxed);
+    }
 }
 
 impl DeezerStream {
     /// Оборачивает уже готовый временный `File`.
     pub fn from_file(file: File) -> Self {
-        let total_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Self { file, total_len }
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Self {
+            file,
+            total_len: Arc::new(AtomicU64::new(len)),
+            written_len: Arc::new(AtomicU64::new(len)),
+            finished: Arc::new(AtomicBool::new(true)),
+            abort_download: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Создаёт `DeezerStream` из уже расшифрованного буфера байт.
@@ -40,9 +61,13 @@ impl DeezerStream {
         file.flush().context("ошибка сброса буфера tempfile")?;
         file.seek(SeekFrom::Start(0))
             .context("ошибка перемотки tempfile в начало")?;
+        let len = decrypted.len() as u64;
         Ok(Self {
             file,
-            total_len: decrypted.len() as u64,
+            total_len: Arc::new(AtomicU64::new(len)),
+            written_len: Arc::new(AtomicU64::new(len)),
+            finished: Arc::new(AtomicBool::new(true)),
+            abort_download: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -64,13 +89,17 @@ impl DeezerStream {
 
         file.flush()?;
         file.seek(SeekFrom::Start(0))?;
+        let len = encrypted.len() as u64;
         Ok(Self {
             file,
-            total_len: encrypted.len() as u64,
+            total_len: Arc::new(AtomicU64::new(len)),
+            written_len: Arc::new(AtomicU64::new(len)),
+            finished: Arc::new(AtomicBool::new(true)),
+            abort_download: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Скачивает зашифрованный трек с CDN Deezer, расшифровывает чанки на лету и возвращает `DeezerStream`.
+    /// Скачивает зашифрованный трек целиком (используется для фонового Prefetch следующего трека).
     pub async fn fetch(http: &reqwest::Client, url: &str, track_id: &str) -> Result<Self> {
         let key = crypto::generate_blowfish_key(track_id);
         let resp = http.get(url).send().await?;
@@ -81,26 +110,192 @@ impl DeezerStream {
         Self::from_encrypted(&raw, &key)
     }
 
+    /// Потоковое скачивание и дешифровка `BF_CBC_STRIPE` на лету:
+    /// возвращает `DeezerStream` сразу после загрузки первых 256 КБ, продолжая докачку в фоне.
+    pub async fn fetch_streaming(http: &reqwest::Client, url: &str, track_id: &str) -> Result<Self> {
+        let key = crypto::generate_blowfish_key(track_id);
+        let mut resp = http.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("CDN returned HTTP status {}", resp.status()));
+        }
+
+        let content_len = resp.content_length().unwrap_or(0);
+        let reader_file = tempfile::tempfile().context("не удалось создать tempfile")?;
+        let mut writer_file = reader_file
+            .try_clone()
+            .context("не удалось клонировать дескриптор tempfile")?;
+
+        let total_len = Arc::new(AtomicU64::new(content_len));
+        let written_len = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let abort_download = Arc::new(AtomicBool::new(false));
+
+        let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE * 4);
+        let mut chunk_idx = 0usize;
+        let mut chunk_buf = [0u8; CHUNK_SIZE];
+        let mut written_so_far = 0u64;
+
+        // 1. Буферизуем первые 256 КБ перед стартом декодера
+        while written_so_far < INITIAL_PREBUFFER_BYTES {
+            match resp.chunk().await? {
+                Some(bytes) => {
+                    pending.extend_from_slice(&bytes);
+                    while pending.len() >= CHUNK_SIZE {
+                        chunk_buf.copy_from_slice(&pending[..CHUNK_SIZE]);
+                        pending.drain(..CHUNK_SIZE);
+                        if chunk_idx.is_multiple_of(3) {
+                            crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, &key)?;
+                        }
+                        writer_file.write_all(&chunk_buf)?;
+                        chunk_idx += 1;
+                        written_so_far += CHUNK_SIZE as u64;
+                    }
+                    written_len.store(written_so_far, Ordering::Release);
+                }
+                None => {
+                    if !pending.is_empty() {
+                        writer_file.write_all(&pending)?;
+                        written_so_far += pending.len() as u64;
+                        pending.clear();
+                    }
+                    writer_file.flush()?;
+                    written_len.store(written_so_far, Ordering::Release);
+                    total_len.store(written_so_far, Ordering::Release);
+                    finished.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+        let _ = writer_file.flush();
+
+        // 2. Если файл ещё не докачан до конца — продолжаем докачку в фоновой задаче tokio
+        if !finished.load(Ordering::Acquire) {
+            let written_clone = Arc::clone(&written_len);
+            let total_clone = Arc::clone(&total_len);
+            let finished_clone = Arc::clone(&finished);
+            let abort_clone = Arc::clone(&abort_download);
+
+            tokio::spawn(async move {
+                while !abort_clone.load(Ordering::Relaxed) {
+                    match resp.chunk().await {
+                        Ok(Some(bytes)) => {
+                            pending.extend_from_slice(&bytes);
+                            while pending.len() >= CHUNK_SIZE {
+                                chunk_buf.copy_from_slice(&pending[..CHUNK_SIZE]);
+                                pending.drain(..CHUNK_SIZE);
+                                if chunk_idx.is_multiple_of(3)
+                                    && crypto::decrypt_chunk(&mut chunk_buf, chunk_idx, &key)
+                                        .is_err()
+                                {
+                                    break;
+                                }
+                                if writer_file.write_all(&chunk_buf).is_err() {
+                                    break;
+                                }
+                                chunk_idx += 1;
+                                written_so_far += CHUNK_SIZE as u64;
+                            }
+                            let _ = writer_file.flush();
+                            written_clone.store(written_so_far, Ordering::Release);
+                        }
+                        Ok(None) => {
+                            if !pending.is_empty() {
+                                let _ = writer_file.write_all(&pending);
+                                written_so_far += pending.len() as u64;
+                                pending.clear();
+                            }
+                            let _ = writer_file.flush();
+                            written_clone.store(written_so_far, Ordering::Release);
+                            total_clone.store(written_so_far, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                finished_clone.store(true, Ordering::Release);
+            });
+        }
+
+        let mut reader_file = reader_file;
+        reader_file.seek(SeekFrom::Start(0))?;
+
+        Ok(Self {
+            file: reader_file,
+            total_len,
+            written_len,
+            finished,
+            abort_download,
+        })
+    }
+
     /// Длина потока в байтах.
     pub fn len(&self) -> u64 {
-        self.total_len
+        let tot = self.total_len.load(Ordering::Acquire);
+        if tot > 0 {
+            tot
+        } else {
+            self.written_len.load(Ordering::Acquire)
+        }
     }
 
     /// Пуст ли поток.
     pub fn is_empty(&self) -> bool {
-        self.total_len == 0
+        self.len() == 0
     }
 }
 
 impl Read for DeezerStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buf)
+        loop {
+            let pos = self.file.stream_position().unwrap_or(0);
+            let written = self.written_len.load(Ordering::Acquire);
+            let done = self.finished.load(Ordering::Acquire);
+
+            if pos < written {
+                let n = self.file.read(buf)?;
+                if n > 0 || done {
+                    return Ok(n);
+                }
+            } else if done {
+                return Ok(0);
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
 impl Seek for DeezerStream {
     fn seek(&mut self, target: SeekFrom) -> std::io::Result<u64> {
-        self.file.seek(target)
+        let desired = match target {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(delta) => {
+                let cur = self.file.stream_position().unwrap_or(0) as i64;
+                (cur + delta).max(0) as u64
+            }
+            SeekFrom::End(delta) => {
+                let end = self.len() as i64;
+                (end + delta).max(0) as u64
+            }
+        };
+
+        // Если перематываем вперёд в область, которая ещё докачивается — ждём до 1.5 с
+        let mut waited_ms = 0u32;
+        while desired > self.written_len.load(Ordering::Acquire)
+            && !self.finished.load(Ordering::Acquire)
+            && waited_ms < 1500
+        {
+            std::thread::sleep(Duration::from_millis(10));
+            waited_ms += 10;
+        }
+
+        let max_avail = self.written_len.load(Ordering::Acquire);
+        let safe_pos = if self.finished.load(Ordering::Acquire) {
+            desired
+        } else {
+            desired.min(max_avail)
+        };
+        self.file.seek(SeekFrom::Start(safe_pos))
     }
 }
 
@@ -110,13 +305,18 @@ impl MediaSource for DeezerStream {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.total_len)
+        let len = self.len();
+        if len > 0 {
+            Some(len)
+        } else {
+            None
+        }
     }
 }
 
 impl std::fmt::Debug for DeezerStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DeezerStream({} bytes)", self.total_len)
+        write!(f, "DeezerStream({} bytes)", self.len())
     }
 }
 
@@ -160,8 +360,6 @@ mod tests {
 
     #[test]
     fn test_8192_bytes_encrypted_stripes_with_arbitrary_seeks_and_unaligned_reads() {
-        // Критерий приёмки Этапа 4 из PLAN.md:
-        // Буфер 8192 байт (4 чанка по 2048 байт, чанки 0 и 3 зашифрованы Blowfish-CBC).
         let key = crypto::generate_blowfish_key("3135556");
         let original = sample(8192);
         let mut encrypted = original.clone();
@@ -193,3 +391,4 @@ mod tests {
         }
     }
 }
+

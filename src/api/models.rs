@@ -155,8 +155,13 @@ pub struct TrackData {
     #[serde(default)]
     pub md5_origin: String,
     #[serde(rename = "NB_LISTEN")]
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
     #[serde(default)]
     pub nb_listen: u64,
+    #[serde(rename = "DATE_ADD", alias = "TIMELINE")]
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
+    #[serde(default)]
+    pub date_add: u64,
     #[serde(rename = "EXPLICIT_LYRICS")]
     #[serde(deserialize_with = "deserialize_bool_flexible")]
     #[serde(default)]
@@ -233,17 +238,19 @@ pub struct SearchResults {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlaylistData {
-    #[serde(rename = "PLAYLIST_ID", alias = "LIST_ID")]
+    #[serde(rename = "PLAYLIST_ID", alias = "LIST_ID", alias = "id")]
     #[serde(deserialize_with = "deserialize_id_to_string")]
     #[serde(default)]
     pub playlist_id: String,
-    #[serde(rename = "TITLE", alias = "PLAYLIST_TITLE")]
+    #[serde(rename = "TITLE", alias = "PLAYLIST_TITLE", alias = "title")]
     #[serde(default)]
     pub playlist_title: String,
-    #[serde(rename = "NB_SONG")]
+    #[serde(rename = "NB_SONG", alias = "nb_tracks", alias = "COUNT")]
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
     #[serde(default)]
     pub num_tracks: u64,
-    #[serde(rename = "DATE_ADD", alias = "CREATED_AT")]
+    #[serde(rename = "DATE_ADD", alias = "CREATED_AT", alias = "creation_date")]
+    #[serde(deserialize_with = "deserialize_u64_flexible")]
     #[serde(default)]
     pub created_at: u64,
 }
@@ -282,8 +289,49 @@ where
         fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
             Ok(v.to_string())
         }
+        fn visit_unit<E: de::Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_none<E: de::Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
     }
     deserializer.deserialize_any(IdToString)
+}
+
+fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct U64Flex;
+    impl<'de> de::Visitor<'de> for U64Flex {
+        type Value = u64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an integer or string")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            Ok(v.max(0) as u64)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            if let Ok(n) = v.trim().parse::<u64>() {
+                return Ok(n);
+            }
+            // Если пришла строка даты вроде "2025-11-04 18:12:00", извлекаем цифры
+            let digits: String = v.chars().filter(|c| c.is_ascii_digit()).take(14).collect();
+            Ok(digits.parse::<u64>().unwrap_or(0))
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<u64, E> {
+            Ok(0)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<u64, E> {
+            Ok(0)
+        }
+    }
+    deserializer.deserialize_any(U64Flex)
 }
 
 fn deserialize_bool_flexible<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -309,6 +357,9 @@ where
         fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
             Ok(v == "1" || v.eq_ignore_ascii_case("true"))
         }
+        fn visit_unit<E: de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
     }
     deserializer.deserialize_any(BoolFlex)
 }
@@ -326,6 +377,18 @@ mod tests {
         assert_eq!(track.track_id, "3135556");
         assert_eq!(track.title, "Around the World");
         assert!(track.has_track_token());
+    }
+
+    #[test]
+    fn test_playlist_deserialization_with_string_dates_and_counts() {
+        let pl: PlaylistData = serde_json::from_str(
+            r#"{"PLAYLIST_ID":"987654","TITLE":"My Synthwave","NB_SONG":"42","DATE_ADD":"2025-11-04 18:12:00"}"#,
+        )
+        .unwrap();
+        assert_eq!(pl.playlist_id, "987654");
+        assert_eq!(pl.playlist_title, "My Synthwave");
+        assert_eq!(pl.num_tracks, 42);
+        assert!(pl.created_at > 0);
     }
 
     #[test]
@@ -350,3 +413,4 @@ mod tests {
         assert_eq!(AudioQuality::Mp3_128.as_api_format(), "MP3_128");
     }
 }
+

@@ -1,5 +1,6 @@
 //! Экран 03 (Library & Overlays): двухпанельный фокус (`LibraryFocus::Playlists` и
-//! `LibraryFocus::Tracks`), дерево плейлистов, таблица треков и модальное окно `CHOOSE PLAYLIST`.
+//! `LibraryFocus::Tracks`), сортировка треков (`Default/Added`, `Title`, `Artist`, `Album`),
+//! дерево плейлистов и модальное окно `CHOOSE PLAYLIST`.
 
 #![allow(dead_code)]
 
@@ -17,6 +18,36 @@ pub enum LibraryFocus {
     Tracks,
 }
 
+/// Поле сортировки треков в плейлисте (переключается по клавише `o`, направление — по `r`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibrarySortBy {
+    #[default]
+    Default,
+    Title,
+    Artist,
+    Album,
+}
+
+impl LibrarySortBy {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Default => Self::Title,
+            Self::Title => Self::Artist,
+            Self::Artist => Self::Album,
+            Self::Album => Self::Default,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Added",
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PlaylistEntry {
     pub id: String,
@@ -32,6 +63,8 @@ pub struct Library {
     pub selected_track: usize,
     pub modal_selected: usize,
     pub focus: LibraryFocus,
+    pub sort_by: LibrarySortBy,
+    pub sort_asc: bool,
     pub loading: bool,
     pub show_choose_modal: bool,
     pub player: MiniPlayer,
@@ -85,6 +118,8 @@ impl Library {
             selected_track: 0,
             modal_selected: 0,
             focus: LibraryFocus::Tracks,
+            sort_by: LibrarySortBy::Default,
+            sort_asc: true,
             loading: false,
             show_choose_modal: false,
             player: MiniPlayer::default(),
@@ -97,6 +132,18 @@ impl Library {
             LibraryFocus::Playlists => LibraryFocus::Tracks,
             LibraryFocus::Tracks => LibraryFocus::Playlists,
         };
+    }
+
+    /// Переключает критерий сортировки по кругу (`Added` -> `Title` -> `Artist` -> `Album`).
+    pub fn cycle_sort_by(&mut self) {
+        self.sort_by = self.sort_by.next();
+        self.selected_track = 0;
+    }
+
+    /// Инвертирует направление сортировки (`Asc` <-> `Desc`).
+    pub fn toggle_sort_direction(&mut self) {
+        self.sort_asc = !self.sort_asc;
+        self.selected_track = 0;
     }
 }
 
@@ -116,7 +163,8 @@ impl Widget for &Library {
             }
 
             let tree_start = area.y + 1;
-            let tree_rows = self.playlists.len().min(3) as u16;
+            let max_tree = if h >= 22 { 5 } else { 3 };
+            let tree_rows = self.playlists.len().clamp(1, max_tree) as u16;
             let tree_end = tree_start + tree_rows;
             if tree_start < tree_end {
                 self.draw_playlist_tree(buf, area, tree_start, tree_end);
@@ -160,12 +208,17 @@ impl Library {
         let style = Style::default()
             .fg(theme::color_from_hex(theme::GRAD_END))
             .bold();
-        let focus_badge = match self.focus {
-            LibraryFocus::Playlists => "LIBRARY • [Focus: Playlists | Tab/←/→: Switch]",
-            LibraryFocus::Tracks => "LIBRARY • [Focus: Tracks | Tab/←/→: Switch]",
+        let focus_str = match self.focus {
+            LibraryFocus::Playlists => "Playlists",
+            LibraryFocus::Tracks => "Tracks",
         };
+        let dir_arrow = if self.sort_asc { "▲" } else { "▼" };
+        let full = format!(
+            "LIBRARY • [Focus: {focus_str} | Tab/←/→: Switch] • [Sort [o/r]: {} {dir_arrow}]",
+            self.sort_by.label()
+        );
         let title = if area.width >= 48 {
-            focus_badge
+            full.as_str()
         } else {
             "LIBRARY"
         };
@@ -249,7 +302,7 @@ impl Library {
             area.x,
             y,
             Self::truncate(
-                "CHOOSE PLAYLIST [press 'a' to add track | Enter to load/play]",
+                "CHOOSE PLAYLIST [a: add to playlist | o: sort column | r: reverse | Enter: play]",
                 area.width as usize,
             ),
             style,
@@ -267,12 +320,12 @@ impl Library {
         if row_start >= row_end {
             return;
         }
-        let hash_w = 3u16;
-        let time_w = 5u16;
-        let heart_w = 1u16;
+        let hash_w = 5u16;
+        let time_w = 6u16;
+        let heart_w = 2u16;
         let rest = width.saturating_sub(hash_w + time_w + heart_w);
         let track_w = rest * 2 / 5;
-        let artist_w = rest / 5;
+        let artist_w = rest / 4;
         let album_w = rest.saturating_sub(track_w + artist_w);
         let x0 = area.x;
         let x_track = x0 + hash_w;
@@ -281,14 +334,64 @@ impl Library {
         let x_time = x_album + album_w;
         let x_heart = x_time + time_w;
 
+        let arrow = if self.sort_asc { "▲" } else { "▼" };
+        let h_hash = if self.sort_by == LibrarySortBy::Default {
+            format!("#{arrow}")
+        } else {
+            String::from("#")
+        };
+        let h_track = if self.sort_by == LibrarySortBy::Title {
+            format!("TRACK {arrow}")
+        } else {
+            String::from("TRACK")
+        };
+        let h_artist = if self.sort_by == LibrarySortBy::Artist {
+            format!("ARTIST {arrow}")
+        } else {
+            String::from("ARTIST")
+        };
+        let h_album = if self.sort_by == LibrarySortBy::Album {
+            format!("ALBUM {arrow}")
+        } else {
+            String::from("ALBUM")
+        };
+
         {
             let y = row_start;
             if y < row_end && y < area.bottom() {
-                self.draw_header_cell(buf, area, x0, y, "#", hash_w as usize);
-                self.draw_header_cell(buf, area, x_track, y, "TRACK", track_w as usize);
-                self.draw_header_cell(buf, area, x_artist, y, "ARTIST", artist_w as usize);
-                self.draw_header_cell(buf, area, x_album, y, "ALBUM", album_w as usize);
-                self.draw_header_cell(buf, area, x_time, y, "TIME", time_w as usize);
+                self.draw_header_cell(buf, area, x0, y, &h_hash, hash_w.saturating_sub(1) as usize);
+                self.draw_header_cell(
+                    buf,
+                    area,
+                    x_track,
+                    y,
+                    &h_track,
+                    track_w.saturating_sub(1) as usize,
+                );
+                self.draw_header_cell(
+                    buf,
+                    area,
+                    x_artist,
+                    y,
+                    &h_artist,
+                    artist_w.saturating_sub(1) as usize,
+                );
+                self.draw_header_cell(
+                    buf,
+                    area,
+                    x_album,
+                    y,
+                    &h_album,
+                    album_w.saturating_sub(1) as usize,
+                );
+                self.draw_header_cell(
+                    buf,
+                    area,
+                    x_time,
+                    y,
+                    "TIME",
+                    time_w.saturating_sub(1) as usize,
+                );
                 self.draw_header_cell(buf, area, x_heart, y, "♥", heart_w as usize);
             }
         }
@@ -312,14 +415,21 @@ impl Library {
                 }
                 let track = &entry.tracks[i];
                 let sel = self.selected_track == i;
-                let num = (i as u16 + 1).to_string();
-                self.draw_row_cell(buf, area, Position { x: x0, y }, &num, hash_w as usize, sel);
+                let num = format!("{:<4}", i + 1);
+                self.draw_row_cell(
+                    buf,
+                    area,
+                    Position { x: x0, y },
+                    &num,
+                    hash_w.saturating_sub(1) as usize,
+                    sel,
+                );
                 self.draw_row_cell(
                     buf,
                     area,
                     Position { x: x_track, y },
                     &track.track,
-                    track_w as usize,
+                    track_w.saturating_sub(1) as usize,
                     sel,
                 );
                 self.draw_row_cell(
@@ -327,7 +437,7 @@ impl Library {
                     area,
                     Position { x: x_artist, y },
                     &track.artist,
-                    artist_w as usize,
+                    artist_w.saturating_sub(1) as usize,
                     sel,
                 );
                 self.draw_row_cell(
@@ -335,7 +445,7 @@ impl Library {
                     area,
                     Position { x: x_album, y },
                     &track.album,
-                    album_w as usize,
+                    album_w.saturating_sub(1) as usize,
                     sel,
                 );
                 self.draw_row_cell(
@@ -343,7 +453,7 @@ impl Library {
                     area,
                     Position { x: x_time, y },
                     &track.time,
-                    time_w as usize,
+                    time_w.saturating_sub(1) as usize,
                     sel,
                 );
                 if track.favorite && x_heart < area.right() && y < area.bottom() {
@@ -458,13 +568,19 @@ mod tests {
     }
 
     #[test]
-    fn toggle_focus_switches_between_playlists_and_tracks() {
+    fn toggle_focus_and_sort_work() {
         let mut screen = make_library();
         assert_eq!(screen.focus, LibraryFocus::Tracks);
         screen.toggle_focus();
         assert_eq!(screen.focus, LibraryFocus::Playlists);
+        screen.cycle_sort_by();
+        assert_eq!(screen.sort_by, LibrarySortBy::Title);
+        screen.toggle_sort_direction();
+        assert!(!screen.sort_asc);
+
         let terminal = render(&screen, 120, 40);
         assert!(row_has(&terminal, 0, "Focus: Playlists"));
+        assert!(row_has(&terminal, 0, "Title ▼"));
     }
 
     #[test]
@@ -494,3 +610,4 @@ mod tests {
         assert!(row_has(&terminal, 0, "LIBRARY"));
     }
 }
+

@@ -1,8 +1,12 @@
-//! Экран 01 (Now Playing): квадратная обложка (с учётом пропорций символов 2:1),
-//! метаданные трека, прогресс-бар и спектр на всю ширину экрана.
+//! Экран 01 (Now Playing): крупная квадратная обложка (2:1), метаданные трека
+//! и переключаемая панель синхронного текста песни `LYRICS [Y]` с переносом строк.
+//! Прогресс-бар, кнопки управления и спектр рендерятся глобально внизу окна (`App::render`).
+
+#![allow(dead_code)]
 
 use ratatui::prelude::*;
 
+use crate::api::models::LyricLine;
 use crate::ui::theme;
 use crate::ui::widgets::{CoverArt, Spectrum};
 
@@ -14,6 +18,9 @@ pub struct NowPlaying {
     pub paused: bool,
     pub cover: Option<CoverArt>,
     pub spectrum: Spectrum,
+    pub lyrics: Vec<LyricLine>,
+    pub position_ms: u64,
+    pub show_lyrics: bool,
 }
 
 impl Default for NowPlaying {
@@ -40,143 +47,249 @@ impl NowPlaying {
             paused: true,
             cover: Some(CoverArt::solid(0x4F, 0xD1, 0xC5)),
             spectrum,
+            lyrics: Vec::new(),
+            position_ms: 0,
+            show_lyrics: true,
         }
     }
 
-    fn cursor_col(width: u16, progress: f32) -> u16 {
-        let max = width.saturating_sub(1);
-        (progress.clamp(0.0, 1.0) * (max as f32)) as u16
+    pub fn active_lyric_index(&self) -> usize {
+        let mut idx = 0;
+        for (i, line) in self.lyrics.iter().enumerate() {
+            if line.time_ms <= self.position_ms {
+                idx = i;
+            } else {
+                break;
+            }
+        }
+        idx
     }
 
-    fn draw_progress(&self, buf: &mut Buffer, area: Rect, row: u16, width: u16) {
-        if row >= area.height || width == 0 {
+    fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+        if max_width == 0 {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for word in text.split_whitespace() {
+            let word_len = word.chars().count();
+            let cur_len = current.chars().count();
+            if cur_len == 0 {
+                if word_len <= max_width {
+                    current.push_str(word);
+                } else {
+                    let chars: Vec<char> = word.chars().collect();
+                    for ch_slice in chars.chunks(max_width) {
+                        lines.push(ch_slice.iter().collect());
+                    }
+                }
+            } else if cur_len + 1 + word_len <= max_width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(std::mem::take(&mut current));
+                if word_len <= max_width {
+                    current.push_str(word);
+                } else {
+                    let chars: Vec<char> = word.chars().collect();
+                    for ch_slice in chars.chunks(max_width) {
+                        lines.push(ch_slice.iter().collect());
+                    }
+                }
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
+
+    fn draw_left_panel(&self, buf: &mut Buffer, area: Rect) {
+        if area.width < 4 || area.height < 2 {
             return;
         }
-        let x0 = area.x;
-        let y = area.y + row;
-        let bar_style = Style::default()
-            .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
-            .bg(theme::color_from_hex(theme::BG_TERMINAL));
-        for x in 0..width {
-            buf.set_string(x0 + x, y, "░", bar_style);
-        }
-        let col = Self::cursor_col(width, self.progress);
-        let fill_style = Style::default()
-            .fg(theme::gradient_color(1.0))
-            .bg(theme::color_from_hex(theme::BG_TERMINAL));
-        for x in 0..col {
-            buf.set_string(x0 + x, y, "■", fill_style);
-        }
-        buf.set_string(x0 + col, y, "●", fill_style);
-    }
-
-    fn draw_controls(&self, buf: &mut Buffer, area: Rect, row: u16, width: u16) {
-        if row >= area.height || width == 0 {
-            return;
-        }
-        let y = area.y + row;
-        let x0 = area.x;
-        let play = if self.paused { "▶" } else { "❚❚" };
-        let mode_lbl = if self.paused { "[PLAY]" } else { "[PAUSE]" };
-        let style = Style::default()
-            .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
-            .bg(theme::color_from_hex(theme::BG_TERMINAL));
-        let accent = Style::default()
-            .fg(theme::color_from_hex(theme::GRAD_START))
-            .bg(theme::color_from_hex(theme::BG_TERMINAL))
+        let header_style = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_END))
             .bold();
+        let title_style = Style::default()
+            .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
+            .bold();
+        let artist_style = Style::default().fg(theme::color_from_hex(theme::GRAD_START));
+        let dim_style = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
 
-        if width >= 32 {
-            let line = format!("{mode_lbl}   ⏮   {play}   ⏭   [FLOW]");
-            let line_chars = line.chars().count() as u16;
-            let start_x = x0 + width.saturating_sub(line_chars) / 2;
-            buf.set_string(start_x, y, &line, accent);
-        } else {
-            let q1 = width / 4;
-            let q2 = width / 2;
-            let q3 = 3 * width / 4;
-            buf.set_string(x0 + q1, y, "⏮", style);
-            buf.set_string(x0 + q2, y, play, style);
-            buf.set_string(x0 + q3, y, "⏭", style);
+        buf.set_string(
+            area.x,
+            area.y,
+            "NOW PLAYING".chars().take(area.width as usize).collect::<String>(),
+            header_style,
+        );
+
+        let body_y = area.y + 1;
+        let body_h = area.height.saturating_sub(1);
+        if body_h == 0 {
+            return;
         }
-    }
 
-    fn draw_cover_and_meta(&self, buf: &mut Buffer, area: Rect, meta_h: u16, width: u16) {
-        let cover_h = meta_h.min(width.saturating_sub(12) / 2).clamp(1, 16);
-        let cover_w = (cover_h * 2).min(width.saturating_sub(4)).max(1);
-        if width > cover_w {
-            let cover_rect = Rect::new(area.x, area.y, cover_w, cover_h);
+        // Вычисляем пропорциональный размер квадратной обложки (2x1 символа на пиксель)
+        let max_cover_h = body_h.saturating_sub(6).clamp(4, 18);
+        let max_cover_w = (area.width.saturating_sub(2) / 2).clamp(2, 18);
+        let cover_h = max_cover_h.min(max_cover_w);
+        let cover_w = (cover_h * 2).min(area.width);
+
+        let mut cursor_y = body_y;
+        if cover_h >= 2 && area.height >= 6 {
             if let Some(ref cover_art) = self.cover {
+                let cover_rect = Rect::new(area.x, cursor_y, cover_w, cover_h);
                 cover_art.render(cover_rect, buf);
             }
+            cursor_y += cover_h + 1;
+        } else if let Some(ref cover_art) = self.cover {
+            let ch = body_h.clamp(1, 4);
+            let cw = (ch * 2).min(area.width).max(1);
+            cover_art.render(Rect::new(area.x, area.y, cw, ch), buf);
+            cursor_y = area.y + ch;
         }
-        let rel_x = (cover_w + 3).min(width);
-        let meta_x = area.x + rel_x;
-        let meta_w = width.saturating_sub(rel_x);
-        if meta_w > 0 {
-            if meta_h >= 1 {
-                self.draw_meta_line(buf, meta_x, area.y, meta_w, &self.badge, true);
+
+        let max_w = area.width.saturating_sub(1) as usize;
+        if max_w == 0 {
+            return;
+        }
+
+        // Название трека (с переносом на 2 строки, если длинное)
+        for line in Self::wrap_text(&self.track, max_w).into_iter().take(2) {
+            if cursor_y >= area.bottom() {
+                break;
             }
-            if meta_h >= 2 {
-                self.draw_meta_line(buf, meta_x, area.y + 1, meta_w, &self.track, false);
+            buf.set_string(area.x, cursor_y, &line, title_style);
+            cursor_y += 1;
+        }
+
+        // Исполнитель и альбом
+        for line in Self::wrap_text(&self.artist, max_w).into_iter().take(2) {
+            if cursor_y >= area.bottom() {
+                break;
             }
-            if meta_h >= 3 {
-                self.draw_meta_line(buf, meta_x, area.y + 2, meta_w, &self.artist, true);
-            }
+            buf.set_string(area.x, cursor_y, &line, artist_style);
+            cursor_y += 1;
+        }
+
+        if cursor_y < area.bottom() {
+            let badge_line: String = self.badge.chars().take(max_w).collect();
+            buf.set_string(area.x, cursor_y, &badge_line, dim_style);
+            cursor_y += 2;
+        }
+
+        if cursor_y < area.bottom() {
+            let lyr_state = if self.show_lyrics { "ON" } else { "OFF" };
+            let hints = format!("[y] Lyrics: {lyr_state}   [i] Track Info   [v] Spectrum");
+            let truncated: String = hints.chars().take(max_w).collect();
+            buf.set_string(area.x, cursor_y, &truncated, dim_style);
         }
     }
 
-    fn draw_meta_line(
-        &self,
-        buf: &mut Buffer,
-        x0: u16,
-        y: u16,
-        width: u16,
-        text: &str,
-        is_dim: bool,
-    ) {
-        let style = Style::default()
-            .fg(theme::color_from_hex(if is_dim {
-                theme::TEXT_SECONDARY
+    fn draw_lyrics_panel(&self, buf: &mut Buffer, area: Rect) {
+        if area.width < 6 || area.height < 3 {
+            return;
+        }
+        let dim_style = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
+        let header_style = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_END))
+            .bold();
+
+        // Рисуем вертикальный разделитель слева от панели лирики
+        for ry in area.top()..area.bottom() {
+            buf.set_string(area.x, ry, "│", dim_style);
+        }
+
+        let text_x = area.x + 2;
+        let text_w = area.width.saturating_sub(2) as usize;
+        if text_w == 0 {
+            return;
+        }
+
+        let hdr: String = "LYRICS [Y to Hide]".chars().take(text_w).collect();
+        buf.set_string(text_x, area.y, &hdr, header_style);
+
+        let list_start = area.y + 1;
+        let visible_rows = area.bottom().saturating_sub(list_start) as usize;
+        if visible_rows == 0 {
+            return;
+        }
+
+        if self.lyrics.is_empty() {
+            let msg = "No synchronized lyrics for this track (press [y] to hide panel)";
+            for (idx, line) in Self::wrap_text(msg, text_w).into_iter().enumerate() {
+                let y = list_start + idx as u16;
+                if y >= area.bottom() {
+                    break;
+                }
+                buf.set_string(text_x, y, &line, dim_style);
+            }
+            return;
+        }
+
+        let active = self.active_lyric_index();
+        let scroll_offset = if active >= visible_rows / 2 {
+            active.saturating_sub(visible_rows / 3)
+        } else {
+            0
+        };
+
+        let mut y = list_start;
+        for (i, lyric) in self.lyrics.iter().enumerate().skip(scroll_offset) {
+            if y >= area.bottom() {
+                break;
+            }
+            let style = if i == active {
+                Style::default()
+                    .fg(theme::color_from_hex(theme::BG_TERMINAL))
+                    .bg(theme::color_from_hex(theme::GRAD_START))
+                    .bold()
+            } else if i < active {
+                dim_style
             } else {
-                theme::TEXT_PRIMARY
-            }))
-            .bg(theme::color_from_hex(theme::BG_TERMINAL));
-        let truncated: String = text.chars().take(width as usize).collect();
-        buf.set_string(x0, y, truncated.as_str(), style);
+                Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
+            };
+
+            for wrapped in Self::wrap_text(&lyric.line, text_w) {
+                if y >= area.bottom() {
+                    break;
+                }
+                let text = if i == active {
+                    let pad = text_w.saturating_sub(wrapped.chars().count());
+                    format!("{wrapped}{}", " ".repeat(pad))
+                } else {
+                    wrapped
+                };
+                buf.set_string(text_x, y, &text, style);
+                y += 1;
+            }
+        }
     }
 }
 
 impl Widget for &NowPlaying {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let w = area.width;
-        let h = area.height;
-        if w == 0 || h == 0 {
+        if area.width == 0 || area.height == 0 {
             return;
         }
-        let content_h = h / 2;
-        if content_h == 0 {
-            return;
+        if self.show_lyrics && area.width >= 56 {
+            let left_w = (area.width * 45 / 100).clamp(26, area.width.saturating_sub(20));
+            let left_area = Rect::new(area.x, area.y, left_w, area.height);
+            let right_area = Rect::new(
+                area.x + left_w,
+                area.y,
+                area.width - left_w,
+                area.height,
+            );
+            self.draw_left_panel(buf, left_area);
+            self.draw_lyrics_panel(buf, right_area);
+        } else {
+            self.draw_left_panel(buf, area);
         }
-        let spec_h = h - content_h;
-
-        if spec_h > 0 {
-            let spec = Rect::new(area.x, area.y + content_h, w, spec_h);
-            (&self.spectrum).render(spec, buf);
-        }
-
-        if content_h < 3 {
-            self.draw_controls(buf, area, content_h - 1, w);
-            return;
-        }
-        let controls_row = content_h - 1;
-        let progress_row = content_h - 2;
-        let meta_h = content_h - 2;
-        if meta_h >= 1 {
-            self.draw_cover_and_meta(buf, area, meta_h, w);
-        }
-        self.draw_progress(buf, area, progress_row, w);
-        self.draw_controls(buf, area, controls_row, w);
     }
 }
 
@@ -187,17 +300,23 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn make_screen() -> NowPlaying {
-        let mut spectrum = Spectrum::new(3);
-        spectrum.set_bars(&[1.0, 1.0, 1.0]);
-        NowPlaying {
-            badge: "FLAC | 1411 kbps".into(),
-            track: "Bohemian Rhapsody".into(),
-            artist: "Queen".into(),
-            progress: 0.5,
-            paused: false,
-            cover: Some(CoverArt::from_image(RgbaImage::new(2, 2))),
-            spectrum,
-        }
+        let mut np = NowPlaying::default_screen();
+        np.badge = "FLAC | 1411 kbps".into();
+        np.track = "Bohemian Rhapsody".into();
+        np.artist = "Queen".into();
+        np.paused = false;
+        np.cover = Some(CoverArt::from_image(RgbaImage::new(2, 2)));
+        np.lyrics = vec![
+            LyricLine {
+                time_ms: 0,
+                line: "Is this the real life?".into(),
+            },
+            LyricLine {
+                time_ms: 4000,
+                line: "Is this just fantasy?".into(),
+            },
+        ];
+        np
     }
 
     fn render(screen: &NowPlaying, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -223,27 +342,43 @@ mod tests {
             .unwrap_or(' ')
     }
 
+    fn screen_has(terminal: &Terminal<TestBackend>, needle: &str) -> bool {
+        let size = terminal.size().unwrap();
+        for y in 0..size.height {
+            let row: String = (0..size.width).map(|x| at(terminal, x, y)).collect();
+            if row.contains(needle) {
+                return true;
+            }
+        }
+        false
+    }
+
     #[test]
-    fn renders_in_normal_size() {
+    fn renders_cover_metadata_and_lyrics_in_normal_size() {
         let screen = make_screen();
-        let terminal = render(&screen, 120, 40);
-        assert_eq!(at(&terminal, 0, 0), '▀');
-        let track_row: Vec<char> = (0..120).map(|x| at(&terminal, x, 1)).collect();
-        assert!(track_row.contains(&'B'));
-        let found_cursor = (0..120).any(|x| at(&terminal, x, 18) == '●');
-        assert!(found_cursor);
-        let has_spectrum =
-            (20..40).any(|y| (0..120).any(|x| !at(&terminal, x, y).is_whitespace()));
-        assert!(has_spectrum);
+        let terminal = render(&screen, 120, 32);
+        assert_eq!(at(&terminal, 0, 1), '▀');
+        assert!(screen_has(&terminal, "Bohemian Rhapsody"));
+        assert!(screen_has(&terminal, "Queen"));
+        assert!(screen_has(&terminal, "FLAC | 1411 kbps"));
+        assert!(screen_has(&terminal, "LYRICS [Y to Hide]"));
+        assert!(screen_has(&terminal, "Is this the real life?"));
+    }
+
+    #[test]
+    fn hides_lyrics_panel_when_toggled_off() {
+        let mut screen = make_screen();
+        screen.show_lyrics = false;
+        let terminal = render(&screen, 120, 32);
+        assert!(screen_has(&terminal, "Bohemian Rhapsody"));
+        assert!(!screen_has(&terminal, "LYRICS [Y to Hide]"));
     }
 
     #[test]
     fn renders_in_narrow_size() {
         let screen = make_screen();
         let terminal = render(&screen, 40, 12);
-        assert_eq!(at(&terminal, 0, 0), '▀');
-        let has_spectrum =
-            (6..12).any(|y| (0..40).any(|x| !at(&terminal, x, y).is_whitespace()));
-        assert!(has_spectrum);
+        assert!(screen_has(&terminal, "NOW PLAYING"));
     }
 }
+

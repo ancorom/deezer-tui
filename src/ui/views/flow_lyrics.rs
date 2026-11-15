@@ -1,5 +1,7 @@
-//! Экран 04 (Flow & Live Lyrics): квадратная обложка 2:1, управление Flow,
-//! синхронная прокрутка `LYRICS` и полноширинный спектр снизу.
+//! Экран 04 (Flow & Live Lyrics): бесконечный поток рекомендаций `DEEZER FLOW` слева
+//! и отключаемая панель синхронного текста песни `LYRICS [Y]` справа с защитой от наложения текста.
+
+#![allow(dead_code)]
 
 use ratatui::prelude::*;
 
@@ -19,6 +21,7 @@ pub struct FlowLyrics {
     pub lyrics: Vec<LyricLine>,
     pub position_ms: u64,
     pub paused: bool,
+    pub show_lyrics: bool,
     pub spectrum: Spectrum,
     pub cover: Option<CoverArt>,
 }
@@ -75,6 +78,7 @@ impl FlowLyrics {
             ],
             position_ms: 9000,
             paused: false,
+            show_lyrics: true,
             spectrum,
             cover: Some(CoverArt::solid(0x4F, 0xD1, 0xC5)),
         }
@@ -91,48 +95,88 @@ impl FlowLyrics {
         }
         idx
     }
+
+    fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+        if max_width == 0 {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for word in text.split_whitespace() {
+            let word_len = word.chars().count();
+            let cur_len = current.chars().count();
+            if cur_len == 0 {
+                if word_len <= max_width {
+                    current.push_str(word);
+                } else {
+                    let chars: Vec<char> = word.chars().collect();
+                    for ch_slice in chars.chunks(max_width) {
+                        lines.push(ch_slice.iter().collect());
+                    }
+                }
+            } else if cur_len + 1 + word_len <= max_width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(std::mem::take(&mut current));
+                if word_len <= max_width {
+                    current.push_str(word);
+                } else {
+                    let chars: Vec<char> = word.chars().collect();
+                    for ch_slice in chars.chunks(max_width) {
+                        lines.push(ch_slice.iter().collect());
+                    }
+                }
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
 }
 
 impl Widget for &FlowLyrics {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let w = area.width;
         let h = area.height;
-        if w < 3 || h < 3 {
+        if w < 3 || h < 2 {
             return;
         }
-        let spec_h = (h / 4).max(4).min(h.saturating_sub(2));
-        let body_h = h.saturating_sub(spec_h);
-        let body_end_y = area.y + body_h;
 
-        if body_h > 0 && spec_h > 0 {
-            (&self.spectrum).render(Rect::new(area.x, body_end_y, w, spec_h), buf);
+        let title_style = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_END))
+            .bold();
+        let lyr_state = if self.show_lyrics { "ON" } else { "OFF" };
+        let header = format!("FLOW • Infinite Recommendations  [y: Lyrics {lyr_state}]");
+        buf.set_string(area.x, area.y, FlowLyrics::truncate(&header, w as usize), title_style);
+
+        if h < 3 {
+            return;
         }
 
-        if h >= 2 {
-            let style = Style::default()
-                .fg(theme::color_from_hex(theme::GRAD_END))
-                .bold();
-            buf.set_string(area.x, area.y, "FLOW", style);
-        }
-
-        if body_h >= 3 {
-            let half = w / 2;
-            let left_x = area.x;
-            let right_x = left_x + half;
-            self.draw_flow_panel(buf, area, left_x, half, body_end_y);
-            if right_x < area.right() {
-                self.draw_lyrics_panel(buf, area, right_x, w - half, body_end_y);
-            }
+        let row_end = area.bottom();
+        if self.show_lyrics && w >= 52 {
+            let left_w = (w / 2).clamp(24, w.saturating_sub(20));
+            let right_x = area.x + left_w;
+            let right_w = w - left_w;
+            self.draw_flow_panel(buf, area, area.x, left_w.saturating_sub(1), row_end);
+            self.draw_lyrics_panel(buf, area, right_x, right_w, row_end);
+        } else {
+            self.draw_flow_panel(buf, area, area.x, w, row_end);
         }
     }
 }
 
 impl FlowLyrics {
-    fn draw_header(buf: &mut Buffer, x: u16, y: u16, text: &str) {
+    fn draw_header(buf: &mut Buffer, x: u16, y: u16, text: &str, max_w: usize) {
         let style = Style::default()
             .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
             .bold();
-        buf.set_string(x, y, text, style);
+        buf.set_string(x, y, Self::truncate(text, max_w), style);
     }
 
     fn draw_flow_panel(
@@ -143,12 +187,12 @@ impl FlowLyrics {
         width: u16,
         row_end: u16,
     ) {
-        if x >= area.right() || row_end <= area.y + 1 {
+        if x >= area.right() || width == 0 || row_end <= area.y + 1 {
             return;
         }
         let y_start = area.y + 1;
         let body_rows = row_end.saturating_sub(y_start);
-        let cover_h = body_rows.saturating_sub(4).min(width / 2).min(12);
+        let cover_h = body_rows.saturating_sub(6).min(width / 2).min(10);
         let cover_w = (cover_h * 2).min(width);
         let mut y_cursor = y_start;
 
@@ -159,39 +203,31 @@ impl FlowLyrics {
             y_cursor += cover_h;
         }
 
-        let y_ctrl = y_cursor;
-        if y_ctrl < row_end {
-            let play = if self.paused { "▶" } else { "❚❚" };
-            let label = format!("⏮  {play}  ⏭");
-            let label_w = label.chars().count();
-            let w = cover_w.max(width.min(24)) as usize;
-            let cx = if label_w < w {
-                x + ((w - label_w) / 2) as u16
-            } else {
-                x
-            };
-            let style = Style::default()
-                .fg(theme::color_from_hex(theme::GRAD_END))
-                .bold();
-            buf.set_string(cx, y_ctrl, Self::truncate(&label, width as usize), style);
+        if y_cursor < row_end {
+            let queue_hdr = format!("DEEZER FLOW ({} tracks queued)", self.flow.len());
+            Self::draw_header(buf, x, y_cursor, &queue_hdr, width as usize);
+            y_cursor += 1;
         }
 
-        let y_head = y_ctrl + 1;
-        if y_head < row_end {
-            Self::draw_header(buf, x, y_head, "DEEZER FLOW");
+        let avail_rows = row_end.saturating_sub(y_cursor) as usize;
+        if avail_rows == 0 || self.flow.is_empty() {
+            return;
         }
-        for (i, row) in self.flow.iter().enumerate() {
-            let y = y_head + 1 + i as u16;
-            if y >= row_end || y >= area.bottom() {
+
+        let scroll_offset = if self.selected_flow >= avail_rows / 2 {
+            self.selected_flow.saturating_sub(avail_rows / 3)
+        } else {
+            0
+        };
+
+        let max_w = width as usize;
+        for (i, row) in self.flow.iter().enumerate().skip(scroll_offset) {
+            if y_cursor >= row_end || y_cursor >= area.bottom() {
                 break;
             }
             let selected = self.selected_flow == i;
-            let label = format!(
-                "{} {} — {}",
-                if selected { "▶" } else { " " },
-                row.title,
-                row.artist,
-            );
+            let prefix = if selected { "▶ " } else { "  " };
+            let full_label = format!("{}{} — {}", prefix, row.title, row.artist);
             let style = if selected {
                 Style::default()
                     .fg(theme::color_from_hex(theme::GRAD_START))
@@ -199,8 +235,21 @@ impl FlowLyrics {
             } else {
                 Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
             };
-            let text = Self::truncate(&label, width as usize);
-            buf.set_string(x, y, &text, style);
+
+            // Переносим длинные названия до 2 строк строго внутри ширины левой колонки
+            let wrapped = Self::wrap_text(&full_label, max_w);
+            for (line_idx, wline) in wrapped.into_iter().take(2).enumerate() {
+                if y_cursor >= row_end || y_cursor >= area.bottom() {
+                    break;
+                }
+                let display_line = if line_idx > 0 {
+                    Self::truncate(&format!("    {wline}"), max_w)
+                } else {
+                    Self::truncate(&wline, max_w)
+                };
+                buf.set_string(x, y_cursor, &display_line, style);
+                y_cursor += 1;
+            }
         }
     }
 
@@ -212,11 +261,24 @@ impl FlowLyrics {
         width: u16,
         row_end: u16,
     ) {
-        if x >= area.right() || row_end <= area.y + 1 {
+        if x >= area.right() || width < 4 || row_end <= area.y + 1 {
             return;
         }
+        let dim_style = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
+
+        // Вертикальная граница между списком Flow и текстом лирики
+        for ry in (area.y + 1)..row_end {
+            buf.set_string(x, ry, "│", dim_style);
+        }
+
+        let text_x = x + 2;
+        let text_w = width.saturating_sub(2) as usize;
+        if text_w == 0 {
+            return;
+        }
+
         let y0 = area.y + 1;
-        Self::draw_header(buf, x, y0, "LYRICS");
+        Self::draw_header(buf, text_x, y0, "LYRICS [Y to Hide]", text_w);
 
         let list_start = y0 + 1;
         let visible_rows = row_end.saturating_sub(list_start) as usize;
@@ -225,32 +287,25 @@ impl FlowLyrics {
         }
         if self.lyrics.is_empty() {
             let empty_msg = "No synchronized lyrics available (Instrumental / Unsynced)";
-            let style = Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY));
-            buf.set_string(
-                x,
-                list_start,
-                Self::truncate(empty_msg, width as usize),
-                style,
-            );
+            for (idx, wline) in Self::wrap_text(empty_msg, text_w).into_iter().enumerate() {
+                let y = list_start + idx as u16;
+                if y >= row_end || y >= area.bottom() {
+                    break;
+                }
+                buf.set_string(text_x, y, &wline, dim_style);
+            }
             return;
         }
 
         let active = self.active_lyric_index();
-        let scroll_offset = if active >= visible_rows {
-            active - visible_rows / 2
+        let scroll_offset = if active >= visible_rows / 2 {
+            active.saturating_sub(visible_rows / 3)
         } else {
             0
         };
 
-        for (row_idx, (i, line)) in self
-            .lyrics
-            .iter()
-            .enumerate()
-            .skip(scroll_offset)
-            .take(visible_rows)
-            .enumerate()
-        {
-            let y = list_start + row_idx as u16;
+        let mut y = list_start;
+        for (i, line) in self.lyrics.iter().enumerate().skip(scroll_offset) {
             if y >= row_end || y >= area.bottom() {
                 break;
             }
@@ -260,18 +315,24 @@ impl FlowLyrics {
                     .bg(theme::color_from_hex(theme::GRAD_START))
                     .bold()
             } else if i < active {
-                Style::default().fg(theme::color_from_hex(theme::TEXT_SECONDARY))
+                dim_style
             } else {
                 Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY))
             };
-            let truncated = Self::truncate(&line.line, width as usize);
-            let text = if i == active {
-                let pad = (width as usize).saturating_sub(truncated.chars().count());
-                truncated + &" ".repeat(pad)
-            } else {
-                truncated
-            };
-            buf.set_string(x, y, &text, style);
+
+            for wrapped in Self::wrap_text(&line.line, text_w) {
+                if y >= row_end || y >= area.bottom() {
+                    break;
+                }
+                let text = if i == active {
+                    let pad = text_w.saturating_sub(wrapped.chars().count());
+                    format!("{wrapped}{}", " ".repeat(pad))
+                } else {
+                    wrapped
+                };
+                buf.set_string(text_x, y, &text, style);
+                y += 1;
+            }
         }
     }
 
@@ -326,9 +387,23 @@ mod tests {
         assert!((1..30).any(|y| row_has(&terminal, y, "DEEZER FLOW")));
         assert!((1..30).any(|y| row_has(&terminal, y, "Bohemian Rhapsody")));
         assert!(row_has(&terminal, 2, "Is this the real life?"));
-        let has_spectrum =
-            (30..40).any(|y| (0..120).any(|x| !at(&terminal, x, y).is_whitespace()));
-        assert!(has_spectrum);
+    }
+
+    #[test]
+    fn long_track_title_never_overwrites_lyrics_column() {
+        let mut screen = FlowLyrics::new();
+        screen.flow[0].title =
+            "Piano Sonata No. 14 in C-Sharp Minor Op. 27 No. 2 Moonlight I. Adagio sostenuto"
+                .into();
+        let terminal = render(&screen, 80, 24);
+        let sep_x = 40;
+        for y in 2..20 {
+            assert_eq!(
+                at(&terminal, sep_x, y),
+                '│',
+                "разделитель колонок не должен затираться длинным названием трека"
+            );
+        }
     }
 
     #[test]
@@ -340,7 +415,7 @@ mod tests {
         let mut found = false;
         for y in 0..size.height {
             if row_has(&terminal, y, "Caught in a landslide") {
-                let cell = buf.cell((size.width / 2 + 1, y)).expect("cell in bounds");
+                let cell = buf.cell((size.width / 2 + 3, y)).expect("cell in bounds");
                 assert_eq!(cell.style().bg, Some(Color::Rgb(0x4F, 0xD1, 0xC5)));
                 found = true;
                 break;
@@ -348,13 +423,13 @@ mod tests {
         }
         assert!(found);
     }
+
     #[test]
     fn renders_in_narrow_size() {
         let screen = FlowLyrics::new();
         let terminal = render(&screen, 40, 12);
         assert!(row_has(&terminal, 0, "FLOW"));
         assert!((1..12).any(|y| row_has(&terminal, y, "DEEZER FLOW")));
-        assert!((2..12).any(|y| row_has(&terminal, y, "this the real")));
     }
 
     #[test]
@@ -375,3 +450,4 @@ mod tests {
         assert!(row_has(&terminal, 0, "FLOW"));
     }
 }
+

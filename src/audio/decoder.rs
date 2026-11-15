@@ -1,9 +1,12 @@
- //! Декодер аудиопотока на базе `symphonia` 0.6 с поддержкой аппаратного `Seek` 
-//! и извлечением технических параметров потока (`StreamTechInfo`).
+//! Декодер аудиопотока на базе `symphonia` 0.6 с поддержкой аппаратного `Seek`,
+//! мгновенной отмены без утечки CPU-потоков и извлечением `StreamTechInfo`.
 
 #![allow(dead_code)]
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rtrb::Producer;
@@ -84,13 +87,22 @@ fn codec_display_name(codec: AudioCodecId) -> String {
     }
 }
 
-/// Записывает все сэмплы `src` в `dst`, уступая квант времени потоку-потребителю при заполнении.
-pub fn push_all_blocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
+/// Записывает сэмплы `src` в `dst` с проверкой `stop_flag` и `dst.is_abandoned()`.
+/// Когда буфер полон, спит 5 мс вместо busy-spin `yield_now()`, полностью устраняя
+/// нагрузку на CPU и зомби-потоки при переключении треков.
+pub fn push_all_cancelable(
+    dst: &mut Producer<f32>,
+    src: &[f32],
+    stop_flag: &AtomicBool,
+) -> usize {
     let mut remaining = src;
     let mut written = 0;
     while !remaining.is_empty() {
+        if stop_flag.load(Ordering::Relaxed) || dst.is_abandoned() {
+            break;
+        }
         if dst.is_full() {
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(5));
             continue;
         }
         let (pushed, rest) = dst.push_partial_slice(remaining);
@@ -98,6 +110,12 @@ pub fn push_all_blocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
         remaining = rest;
     }
     written
+}
+
+/// Обёртка для обратной совместимости с тестами.
+pub fn push_all_blocking(dst: &mut Producer<f32>, src: &[f32]) -> usize {
+    let never_stop = AtomicBool::new(false);
+    push_all_cancelable(dst, src, &never_stop)
 }
 
 /// Неблокирующая запись в `VisRingBuffer`.
@@ -135,6 +153,7 @@ pub struct Decoder {
     decoder: Box<dyn AudioDecoder>,
     pub audio_producer: Producer<f32>,
     vis_producer: Option<Producer<f32>>,
+    stop_flag: Arc<AtomicBool>,
     interleaved_buf: Vec<f32>,
 }
 
@@ -149,21 +168,47 @@ impl Decoder {
             Box::new(ReadOnlySource::new(reader)),
             Default::default(),
         );
-        let (mut dec, _) = Self::from_mss(mss, 0, audio_producer, 30)?;
+        let (mut dec, _) = Self::from_mss(
+            mss,
+            0,
+            audio_producer,
+            30,
+            Arc::new(AtomicBool::new(false)),
+        )?;
         dec.vis_producer = Some(vis_producer);
         Ok(dec)
     }
 
-    /// Инициализирует декодер для `MediaSource` с поддержкой `Seek` (например, `DeezerStream`)
-    /// и возвращает `(Decoder, StreamTechInfo)`. Запись в `VisRingBuffer` при этом выполняет `CPAL`.
+    /// Инициализирует декодер для `MediaSource` с поддержкой `Seek`.
     pub fn new_seekable(
         source: Box<dyn MediaSource>,
         audio_producer: Producer<f32>,
         fallback_duration_secs: u64,
     ) -> Result<(Self, StreamTechInfo)> {
+        Self::new_seekable_with_stop(
+            source,
+            audio_producer,
+            fallback_duration_secs,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Инициализирует декодер с поддержкой `Seek` и общим атомарным флагом остановки `stop_flag`.
+    pub fn new_seekable_with_stop(
+        source: Box<dyn MediaSource>,
+        audio_producer: Producer<f32>,
+        fallback_duration_secs: u64,
+        stop_flag: Arc<AtomicBool>,
+    ) -> Result<(Self, StreamTechInfo)> {
         let file_size_bytes = source.byte_len().unwrap_or(0);
         let mss = MediaSourceStream::new(source, Default::default());
-        Self::from_mss(mss, file_size_bytes, audio_producer, fallback_duration_secs)
+        Self::from_mss(
+            mss,
+            file_size_bytes,
+            audio_producer,
+            fallback_duration_secs,
+            stop_flag,
+        )
     }
 
     fn from_mss(
@@ -171,6 +216,7 @@ impl Decoder {
         file_size_bytes: u64,
         audio_producer: Producer<f32>,
         fallback_duration_secs: u64,
+        stop_flag: Arc<AtomicBool>,
     ) -> Result<(Self, StreamTechInfo)> {
         let format = symphonia::default::get_probe()
             .probe(
@@ -234,6 +280,7 @@ impl Decoder {
                 decoder,
                 audio_producer,
                 vis_producer: None,
+                stop_flag,
                 interleaved_buf: Vec::with_capacity(8192),
             },
             tech_info,
@@ -241,7 +288,6 @@ impl Decoder {
     }
 
     /// Выполняет аппаратный `Seek` к целевой секунде и сбрасывает внутреннее состояние декодера.
-    /// Возвращает новую позицию в фреймах.
     pub fn seek(&mut self, target_secs: u64) -> Result<u64, SymphoniaError> {
         let seeked = self.format.seek(
             SeekMode::Accurate,
@@ -260,9 +306,12 @@ impl Decoder {
     }
 
     /// Декодирует следующий пакет и записывает сэмплы в кольцевой буфер.
-    /// Возвращает `Ok(Some(frames))` или `Ok(None)` при достижении конца потока (EOF).
+    /// Возвращает `Ok(Some(frames))` или `Ok(None)` при достижении конца потока или остановке.
     pub fn process_next(&mut self) -> Result<Option<usize>, SymphoniaError> {
         loop {
+            if self.stop_flag.load(Ordering::Relaxed) || self.audio_producer.is_abandoned() {
+                return Ok(None);
+            }
             let Some(pkt) = self.format.next_packet()? else {
                 return Ok(None);
             };
@@ -287,7 +336,7 @@ impl Decoder {
                 if let Some(ref mut vp) = self.vis_producer {
                     write_interleaved_stereo_to_rings(&stereo, &mut self.audio_producer, vp);
                 } else {
-                    push_all_blocking(&mut self.audio_producer, &stereo);
+                    push_all_cancelable(&mut self.audio_producer, &stereo, &self.stop_flag);
                 }
                 return Ok(Some(frames));
             } else {
@@ -299,7 +348,11 @@ impl Decoder {
                         vp,
                     );
                 } else {
-                    push_all_blocking(&mut self.audio_producer, &self.interleaved_buf);
+                    push_all_cancelable(
+                        &mut self.audio_producer,
+                        &self.interleaved_buf,
+                        &self.stop_flag,
+                    );
                 }
                 return Ok(Some(frames));
             }
@@ -327,7 +380,7 @@ mod tests {
         create_rings, AudioRing, VisRing, VIS_RING_BUFFER_CAPACITY,
     };
     use crate::dsp::cavacore::{Cavacore, N_BASS};
-    use rtrb::{Consumer, PopError};
+    use rtrb::{Consumer, PopError, RingBuffer};
 
     fn drain(consumer: &mut Consumer<f32>) -> Vec<f32> {
         let mut out = Vec::new();
@@ -346,6 +399,19 @@ mod tests {
             out.push(s);
         }
         out
+    }
+
+    #[test]
+    fn abandoned_consumer_or_stop_flag_never_spins_forever() {
+        let (mut prod, cons) = RingBuffer::<f32>::new(4);
+        // Заполняем буфер до предела и дропаем consumer (как при переключении трека!)
+        let _ = prod.push_partial_slice(&[1.0, 2.0, 3.0, 4.0]);
+        assert!(prod.is_full());
+        drop(cons);
+
+        let stop = AtomicBool::new(false);
+        let written = push_all_cancelable(&mut prod, &[5.0, 6.0], &stop);
+        assert_eq!(written, 0, "должен мгновенно выйти при дропнутом Consumer");
     }
 
     #[test]
@@ -458,3 +524,4 @@ mod tests {
         assert!(bars.iter().all(|&b| b == 0.0));
     }
 }
+
