@@ -1,0 +1,340 @@
+//! Модели Deezer API: типы данных и ошибки.
+//
+use serde::Deserialize;
+use thiserror::Error;
+
+/// Ошибки Deezer API.
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub enum DeezerError {
+    #[error("HTTP error: {0}")]
+    Http(String),
+    #[error("API error: {0}")]
+    Api(String),
+    #[error("Authentication failed: {0}")]
+    Auth(String),
+    #[error("Decryption error: {0}")]
+    Decrypt(String),
+    #[error("Quality unavailable")]
+    QualityUnavailable,
+    #[error("Track unavailable: {0}")]
+    TrackUnavailable(String),
+    #[error("No lyrics found")]
+    NoLyrics,
+    #[error("Playlist unavailable: {0}")]
+    PlaylistUnavailable(String),
+}
+
+/// Качество аудио.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+pub enum AudioQuality {
+    #[serde(rename = "MP3_64")]
+    Mp3_64,
+    #[default]
+    #[serde(rename = "MP3_128")]
+    Mp3_128,
+    #[serde(rename = "MP3_320")]
+    Mp3_320,
+    #[serde(rename = "FLAC")]
+    Flac,
+}
+
+impl AudioQuality {
+    /// Формат, отправляемый в `media.deezer.com/v1/get_url`.
+    #[allow(dead_code)]
+    pub fn as_api_format(&self) -> &'static str {
+        match self {
+            Self::Mp3_64 => "MP3_64",
+            Self::Mp3_128 => "MP3_128",
+            Self::Mp3_320 => "MP3_320",
+            Self::Flac => "FLAC",
+        }
+    }
+
+    /// Человекочитаемая метка для UI.
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Mp3_64 => "MP3 64 kbps",
+            Self::Mp3_128 => "MP3 128 kbps",
+            Self::Mp3_320 => "MP3 320 kbps",
+            Self::Flac => "FLAC (HiFi)",
+        }
+    }
+
+    /// Все качества по возрастанию.
+    #[allow(dead_code)]
+    pub const ALL: &'static [AudioQuality] =
+        &[Self::Mp3_64, Self::Mp3_128, Self::Mp3_320, Self::Flac];
+
+    /// Низшее доступное качество (для fallback).
+    #[allow(dead_code)]
+    pub fn fallback(&self) -> Option<Self> {
+        match self {
+            Self::Flac => Some(Self::Mp3_320),
+            Self::Mp3_320 => Some(Self::Mp3_128),
+            Self::Mp3_128 => Some(Self::Mp3_64),
+            Self::Mp3_64 => None,
+        }
+    }
+
+    /// Все качества от запрашиваемого к низшему (для fallback при `get_stream_url`).
+    #[allow(dead_code)]
+    pub fn all_fallbacks(&self) -> Vec<Self> {
+        match self {
+            Self::Mp3_64 => vec![Self::Mp3_64],
+            Self::Mp3_128 => vec![Self::Mp3_128, Self::Mp3_64],
+            Self::Mp3_320 => vec![Self::Mp3_320, Self::Mp3_128, Self::Mp3_64],
+            Self::Flac => vec![Self::Flac, Self::Mp3_320, Self::Mp3_128, Self::Mp3_64],
+        }
+    }
+}
+
+/// Данные пользователя, полученные из `deezer.getUserData`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserData {
+    #[serde(rename = "USER")]
+    pub user: UserInfo,
+    #[serde(rename = "checkForm")]
+    pub api_token: String,
+    #[serde(rename = "OFFER")]
+    #[serde(default)]
+    pub offer: Option<UserOffer>,
+}
+
+/// Информация о пользователе.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserInfo {
+    #[serde(rename = "USER_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub user_id: String,
+    #[serde(rename = "BLOG_NAME")]
+    #[serde(default)]
+    pub user_name: String,
+    #[serde(rename = "OPTIONS")]
+    pub options: UserOptions,
+}
+
+/// Опции пользователя.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserOptions {
+    pub license_token: String,
+    #[serde(rename = "web_streaming")]
+    #[serde(default)]
+    pub web_streaming: bool,
+    #[serde(rename = "web_hq")]
+    #[serde(default)]
+    pub web_hq: bool,
+    #[serde(rename = "web_lossless")]
+    #[serde(default)]
+    pub web_lossless: bool,
+}
+
+/// Предложение (тариф) пользователя.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserOffer {
+    #[serde(rename = "OFFER_NAME")]
+    #[serde(default)]
+    pub offer_name: String,
+}
+
+/// Данные трека Deezer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrackData {
+    #[serde(rename = "SNG_ID")]
+    #[serde(deserialize_with = "deserialize_id_to_string")]
+    pub track_id: String,
+    #[serde(rename = "SNG_TITLE")]
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "ART_NAME")]
+    #[serde(default)]
+    pub artist: String,
+    #[serde(rename = "ALB_TITLE")]
+    #[serde(default)]
+    pub album: String,
+    /// Длительность в формате "MM:SS".
+    #[serde(rename = "DURATION")]
+    #[serde(default)]
+    pub duration: String,
+    #[serde(rename = "ALB_PICTURE")]
+    #[serde(default)]
+    pub album_picture: String,
+    /// Токен для получения URL потока.
+    #[serde(rename = "TRACK_TOKEN")]
+    #[serde(default)]
+    pub track_token: Option<String>,
+    /// MD5-хеш оригинального файла (нужен для ключа).
+    #[serde(rename = "MD5_ORIGIN")]
+    #[serde(default)]
+    pub md5_origin: String,
+    /// Число прослушиваний.
+    #[serde(rename = "NB_LISTEN")]
+    #[serde(default)]
+    pub nb_listen: u64,
+    /// Эксплицитный контент ("E" бейдж).
+    #[serde(rename = "EXPLICIT_LYRICS")]
+    #[serde(default)]
+    pub explicit_lyrics: bool,
+    /// Фолбэк-трек.
+    #[serde(rename = "FALLBACK")]
+    #[serde(default)]
+    pub fallback: Option<TrackFallback>,
+}
+
+impl TrackData {
+        /// Есть ли у трека `TRACK_TOKEN` (нужен для получения URL потока).
+    #[allow(dead_code)]
+    pub fn has_track_token(&self) -> bool {
+        self.track_token.as_deref().is_some_and(|t| !t.is_empty())
+    }
+}
+
+/// Фолбэк-трек.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrackFallback {
+    #[serde(rename = "SNG_ID")]
+    #[serde(default)]
+    pub track_id: String,
+    #[serde(rename = "SNG_TITLE")]
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "ART_NAME")]
+    #[serde(default)]
+    pub artist: String,
+    #[serde(rename = "ALB_TITLE")]
+    #[serde(default)]
+    pub album: String,
+}
+
+/// Результат поиска.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResults {
+    #[serde(default)]
+    pub data: Vec<TrackData>,
+    #[serde(default)]
+    pub total: u64,
+}
+
+/// Плейлист пользователя.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaylistData {
+    #[serde(rename = "LIST_ID")]
+    #[serde(default)]
+    pub playlist_id: String,
+    #[serde(rename = "PLAYLIST_TITLE")]
+    #[serde(default)]
+    pub playlist_title: String,
+    #[serde(rename = "NB_SONG")]
+    #[serde(default)]
+    pub num_tracks: u64,
+    #[serde(rename = "CREATED_AT")]
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+/// Строка синхронизированных субтитров.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LyricLine {
+    /// Время начала строки (миллисекунды).
+    #[serde(rename = "TimeMS")]
+    #[serde(default)]
+    pub time_ms: u64,
+    pub line: String,
+}
+
+/// Лирики трека.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct Lyrics {
+    /// Обычный (не-тайм-синхронизированный) текст.
+    pub plain: String,
+    /// Тайм-синхронизированные строки.
+    pub synced: Vec<LyricLine>,
+}
+
+/// Парсит значение, которое может быть строкой или числом, в `String`.
+#[allow(dead_code)]
+fn deserialize_id_to_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct IdToString;
+
+    impl<'de> de::Visitor<'de> for IdToString {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or number")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(IdToString)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_data_deserialization_number_id() {
+        // ID приходит числом от API.
+        let track: TrackData = serde_json::from_str(
+            r#"{"SNG_ID":3135556,"SNG_TITLE":"Around the World","ART_NAME":"Daft Punk","ALB_TITLE":"Discovery","DURATION":"4:00","TRACK_TOKEN":"AAAAA"}"#,
+        )
+        .unwrap();
+        assert_eq!(track.track_id, "3135556");
+        assert_eq!(track.title, "Around the World");
+        assert_eq!(track.artist, "Daft Punk");
+        assert!(track.has_track_token());
+    }
+
+    #[test]
+    fn test_track_data_deserialization_string_id() {
+        let track: TrackData =
+            serde_json::from_str(r#"{"SNG_ID":"abc","SNG_TITLE":"x"}"#)
+                .unwrap();
+        assert_eq!(track.track_id, "abc");
+    }
+
+    #[test]
+    fn test_user_id_deserialization() {
+        let data: UserData =
+            serde_json::from_str(
+                r#"{"USER":{"USER_ID":123456789,"OPTIONS":{"license_token":"tok"}},"checkForm":"api"}"#,
+            )
+            .unwrap();
+        assert_eq!(data.user.user_id, "123456789");
+        assert_eq!(data.api_token, "api");
+    }
+
+    #[test]
+    fn test_audio_quality_format() {
+        assert_eq!(AudioQuality::Flac.as_api_format(), "FLAC");
+        assert_eq!(AudioQuality::Mp3_128.as_api_format(), "MP3_128");
+    }
+}

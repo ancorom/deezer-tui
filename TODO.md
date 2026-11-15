@@ -15,23 +15,24 @@
 - [x] Написать интеграционный тест передачи декодированных сэмплов через rtrb в Cavacore.
 
 ## Фаза 3: Графическое ядро (Ratatui 0.30) и Экран 01 (Now Playing)
-- [ ] Реализовать src/ui/theme.rs: константы цветов (#13151F, #1E2233, #3E445E, #ECEFF4, #94A3B8) и функцию интерполяции градиента от #4FD1C5 до #7F5AF0.
-- [ ] Реализовать src/ui/widgets/spectrum.rs: отрисовка столбиков символами [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'] с интервалом в 1 пробел и точками удержания пиков сверху.
-- [ ] Реализовать src/ui/widgets/cover_art.rs: чтение через image::ImageReader, масштабирование DynamicImage и рендеринг через полублоки ▀ (fg — верхний пиксель, bg — нижний пиксель).
-- [ ] Сверстать глобальный верхний статус-бар (DEEZER-TUI, вкладки [1]..[4], CONNECTED, VOL, часы) и нижний бар хоткеев в src/ui/app.rs с инициализацией терминала через ratatui::init() и ratatui::restore().
-- [ ] Сверстать src/ui/views/now_playing.rs (Экран 01: обложка, бейдж FLAC | 1411 kbps, название трека, артист, прогресс-бар ●, кнопки управления и спектр во всю нижнюю половину).
-- [ ] Написать рендер-тест Экрана 01 на ratatui::backend::TestBackend.
+- [x] Реализовать src/ui/theme.rs: константы цветов (#13151F, #1E2233, #3E445E, #ECEFF4, #94A3B8) и функцию интерполяции градиента от #4FD1C5 до #7F5AF0.
+- [x] Реализовать src/ui/widgets/spectrum.rs: отрисовка столбиков символами [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'] с интервалом в 1 пробел и точками удержания пиков сверху.
+- [x] Реализовать src/ui/widgets/cover_art.rs: чтение через image::ImageReader, масштабирование DynamicImage и рендеринг через полублоки ▀ (fg — верхний пиксель, bg — нижний пиксель).
+- [x] Сверстать глобальный верхний статус-бар (DEEZER-TUI, вкладки [1]..[4], CONNECTED, VOL, часы) и нижний бар хоткеев в src/ui/app.rs с инициализацией терминала через ratatui::init() и ratatui::restore().
+- [x] Сверстать src/ui/views/now_playing.rs (Экран 01: обложка, бейдж FLAC | 1411 kbps, название трека, артист, прогресс-бар ●, кнопки управления и спектр во всю нижнюю половину).
+- [x] Написать рендер-тест Экрана 01 на ratatui::backend::TestBackend.
 
 ## Фаза 4: Криптография Blowfish и API Deezer (reqwest 0.13)
-- [ ] Реализовать src/api/crypto.rs: генерация 16-байтного ключа из SNG_ID (MD5 hex + XOR с g4el58wc0zvf9na1) и функция расшифровки чанка 2048 байт через cbc::Decryptor<blowfish::Blowfish> с IV [0,1,2,3,4,5,6,7].
-- [ ] Написать unit-тесты для src/api/crypto.rs (проверка длины ключа, детерминированности и обратимости шифрования/дешифрования).
-- [ ] Реализовать src/audio/stream.rs: структура DeezerStream, реализующая Read + Seek + Send + Sync + MediaSource, расшифровывающая каждый чанк chunk_idx % 3 == 0 размером ровно 2048 байт с сохранением в tempfile для мгновенного Seek.
-- [ ] Написать unit-тест для DeezerStream с произвольными операциями SeekFrom::Start и невыровненными чтениями read().
-- [ ] Реализовать src/api/models.rs и src/api/client.rs на базе reqwest 0.13: авторизация по куке arl в gw-light.php (deezer.getUserData), получение URL потока в [media.deezer.com/v1/get_url](https://media.deezer.com/v1/get_url), методы поиска, плейлистов, лайков, Flow и Lyrics.
+- [x] Реализовать src/api/crypto.rs: генерация 16-байтного ключа из SNG_ID (MD5 hex + XOR с g4el58wc0zvf9na1) и функция расшифровки чанка 2048 байт через cbc::Decryptor<blowfish::Blowfish> с IV [0,1,2,3,4,5,6,7].
+- [x] Написать unit-тесты для src/api/crypto.rs (проверка длины ключа, детерминированности и обратимости шифрования/дешифрования).
+- [x] Реализовать src/audio/stream.rs: структура DeezerStream, реализующая Read + Seek + Send + Sync + MediaSource, расшифровывающая каждый чанк chunk_idx % 3 == 0 размером ровно 2048 байт с сохранением в tempfile для мгновенного Seek.
+- [x] Написать unit-тест для DeezerStream с произвольными операциями SeekFrom::Start и невыровненными чтениями read().
+- [x] Реализовать src/api/models.rs и src/api/client.rs на базе reqwest 0.13: авторизация по куке arl в gw-light.php (deezer.getUserData), получение URL потока в [media.deezer.com/v1/get_url](https://media.deezer.com/v1/get_url), методы поиска, плейлистов, лайков, Flow и Lyrics.
 
 ## Фаза 5: Экраны 02, 03, 04 и финализация
-- [ ] Сверстать src/ui/views/search.rs (Экран 02: сайдбар NAVIGATION с мини-спектром, строка ввода поиска и 3 колонки ARTISTS, ALBUMS, TRACKS + нижний мини-плеер).
-- [ ] Сверстать src/ui/views/library.rs и src/ui/widgets/modal.rs (Экран 03: дерево плейлистов слева, таблица треков справа и модальное окно CHOOSE PLAYLIST по клавише добавления в плейлист).
-- [ ] Сверстать src/ui/views/flow_lyrics.rs (Экран 04: блок Deezer Flow, синхронная прокрутка LYRICS по таймкоду декодера с бирюзовой подсветкой активной строки и полный спектр снизу).
-- [ ] Подключить D-Bus MPRIS через souvlaki 0.9 (use_zbus) и префетч следующего трека за 20 секунд до окончания текущего для Gapless-воспроизведения.
-- [ ] Прогнать финальный cargo test и cargo clippy -- -D warnings.
+- [x] Сверстать src/ui/views/search.rs (Экран 02: сайдбар NAVIGATION с мини-спектром, строка ввода поиска и 3 колонки ARTISTS, ALBUMS, TRACKS + нижний мини-плеер).
+- [x] Сверстать src/ui/views/library.rs и src/ui/widgets/modal.rs (Экран 03: дерево плейлистов слева, таблица треков справа и модальное окно CHOOSE PLAYLIST по клавише добавления в плейлист).
+- [x] Сверстать src/ui/views/flow_lyrics.rs (Экран 04: блок Deezer Flow, синхронная прокрутка LYRICS по таймкоду декодера с бирюзовой подсветкой активной строки и полный спектр снизу).
+- [x] Подключить D-Bus MPRIS через souvlaki 0.9 (use_zbus) и префетч следующего трека за 20 секунд до окончания текущего для Gapless-воспроизведения.
+- [x] Прогнать финальный cargo test и cargo clippy -- -D warnings.
+

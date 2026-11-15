@@ -318,8 +318,7 @@ mod tests {
         // then drain. Must not block (no consumer reading while producing)
         // and must not panic.
         let frames = AUDIO_RING_BUFFER_CAPACITY / 4;
-        let mut stereo = vec![0.0f32; frames * 2];
-        let mut vis = vec![0.0f32; frames];
+        let stereo = vec![0.0f32; frames * 2];
         let mut audio = AudioRing::new();
         let mut vis_ring = VisRing::new();
         let (aw, vw) = write_interleaved_stereo_to_rings(&stereo, audio.producer(), vis_ring.producer());

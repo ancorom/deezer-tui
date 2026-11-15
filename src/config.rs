@@ -112,8 +112,13 @@ pub fn normalize_volume(v: f32) -> f32 {
 mod tests {
     use super::*;
 
+    // Тесты, которые трогают DEEZER_TUI_CONFIG, должны выполняться
+    // последовательно: env-переменная глобальна для всего процесса.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn load_missing_file_returns_defaults() {
+        let _g = TEST_LOCK.lock();
         let path = "/tmp/deezer-tui-test-nonexistent-dir/config.toml";
         unsafe { std::env::set_var("DEEZER_TUI_CONFIG", path) };
         let config = AppConfig::load();
@@ -132,6 +137,7 @@ mod tests {
 
     #[test]
     fn save_creates_dir_and_loads_back() {
+        let _g = TEST_LOCK.lock();
         let path = "/tmp/deezer-tui-config-save-test/config.toml";
         unsafe { std::env::set_var("DEEZER_TUI_CONFIG", path) };
         let config = AppConfig {

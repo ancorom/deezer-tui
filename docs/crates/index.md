@@ -1,3 +1,4 @@
+- `docs/crates/progress.md`
 - `docs/crates/anyhow/index.md`
 - `docs/crates/blowfish/index.md`
 - `docs/crates/bytes/index.md`

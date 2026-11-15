@@ -2,11 +2,13 @@ mod api;
 mod audio;
 mod config;
 mod dsp;
+mod mpris;
 mod ui;
 
 use anyhow::Result;
 use std::env;
 use std::path::PathBuf;
+use crate::ui::app::App;
 
 /// Инициализация файлового логгера tracing: логи пишутся в ~/.config/deezer-tui/deezer-tui.log
 /// (ежедневные роллиng-файлы, 20 МБ на файл).
@@ -35,5 +37,7 @@ fn init_file_logger() -> Result<()> {
 
 fn main() -> Result<()> {
     init_file_logger()?;
+    let mut app = App::new();
+    app.run()?;
     Ok(())
 }
