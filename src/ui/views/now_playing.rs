@@ -1,30 +1,18 @@
+//! Экран 01 (Now Playing): обложка альбома, бейдж `FLAC | 1411 kbps`, название трека,
+//! артист, прогресс-бар с ползунком `●`, кнопки `[PAUSE] ⏮ ▶ ⏭ [FLOW]` и полноширинный спектр.
+
 use ratatui::prelude::*;
 
 use crate::ui::theme;
 use crate::ui::widgets::{CoverArt, Spectrum};
 
-/// Now Playing screen (Экран 01).
-///
-/// The top half of the viewport holds the cover art (top-left, square), the
-/// track metadata (badge / track / artist) to the right of the cover, and the
-/// progress bar + transport controls on the bottom rows of that half. The
-/// bottom half holds the full spectrum.
-///
-/// The layout is adaptive: on a short or narrow terminal the cover art shrinks
-/// (it is always a square and is never larger than the content area) and the
-/// text is truncated to the remaining width.
 pub struct NowPlaying {
-    /// "FLAC | 1411 kbps" style badge.
     pub badge: String,
     pub track: String,
     pub artist: String,
-    /// 0.0 ..= 1.0 playback progress.
     pub progress: f32,
-    /// `true` when playback is paused/stopped.
     pub paused: bool,
-    /// Cover image to draw in the top-left (top half).
     pub cover: Option<CoverArt>,
-    /// Audio spectrum rendered into the bottom half.
     pub spectrum: Spectrum,
 }
 
@@ -35,28 +23,30 @@ impl Default for NowPlaying {
 }
 
 impl NowPlaying {
-    /// A default screen, used before real audio data is available.
     pub fn default_screen() -> Self {
+        let mut spectrum = Spectrum::new(32);
+        spectrum.set_bars(&[
+            0.2, 0.35, 0.5, 0.7, 0.85, 0.6, 0.45, 0.75, 0.9, 0.65, 0.4, 0.55, 0.8, 0.5, 0.3, 0.45,
+            0.6, 0.75, 0.5, 0.35, 0.65, 0.85, 0.7, 0.5, 0.4, 0.6, 0.55, 0.35, 0.25, 0.4, 0.3, 0.2,
+        ]);
         Self {
             badge: "FLAC | 1411 kbps".into(),
             track: "No track loaded".into(),
             artist: "Deezer".into(),
             progress: 0.0,
             paused: true,
-            cover: None,
-            spectrum: Spectrum::new(0),
+            cover: Some(CoverArt::solid(0x4F, 0xD1, 0xC5)),
+            spectrum,
         }
     }
 
-    /// Column of the `●` cursor for a bar of `width` cells.
     fn cursor_col(width: u16, progress: f32) -> u16 {
         let max = width.saturating_sub(1);
         (progress.clamp(0.0, 1.0) * (max as f32)) as u16
     }
 
-    /// Draw the progress bar (background + filled portion + `●` cursor).
     fn draw_progress(&self, buf: &mut Buffer, area: Rect, row: u16, width: u16) {
-        if row >= area.height {
+        if row >= area.height || width == 0 {
             return;
         }
         let x0 = area.x;
@@ -75,24 +65,33 @@ impl NowPlaying {
         buf.set_string(x0 + col, y, "●", fill_style);
     }
 
-    /// Draw the transport controls row (prev / play-pause / next).
     fn draw_controls(&self, buf: &mut Buffer, area: Rect, row: u16, width: u16) {
-        if row >= area.height {
+        if row >= area.height || width == 0 {
             return;
         }
         let y = area.y + row;
         let x0 = area.x;
         let play = if self.paused { "▶" } else { "❚❚" };
         let style = Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY));
-        let q1 = width / 4;
-        let q2 = width / 2;
-        let q3 = 3 * width / 4;
-        buf.set_string(x0 + q1, y, "⏮", style);
-        buf.set_string(x0 + q2, y, play, style);
-        buf.set_string(x0 + q3, y, "⏭", style);
+        let accent = Style::default()
+            .fg(theme::color_from_hex(theme::GRAD_START))
+            .bold();
+
+        if width >= 32 {
+            let line = format!("[PAUSE]   ⏮   {play}   ⏭   [FLOW]");
+            let line_chars = line.chars().count() as u16;
+            let start_x = x0 + width.saturating_sub(line_chars) / 2;
+            buf.set_string(start_x, y, &line, accent);
+        } else {
+            let q1 = width / 4;
+            let q2 = width / 2;
+            let q3 = 3 * width / 4;
+            buf.set_string(x0 + q1, y, "⏮", style);
+            buf.set_string(x0 + q2, y, play, style);
+            buf.set_string(x0 + q3, y, "⏭", style);
+        }
     }
 
-    /// Draw the cover art (top-left square) and the track metadata to its right.
     fn draw_cover_and_meta(&self, buf: &mut Buffer, area: Rect, meta_h: u16, width: u16) {
         let cover_side = meta_h.min(width.saturating_sub(12)).clamp(1, 24);
         if cover_side > 0 && width > cover_side {
@@ -101,9 +100,10 @@ impl NowPlaying {
                 cover_art.render(cover_rect, buf);
             }
         }
-        let meta_x = area.x + (cover_side + 2).min(width);
-        if width > meta_x {
-            let meta_w = width - meta_x;
+        let rel_x = (cover_side + 2).min(width);
+        let meta_x = area.x + rel_x;
+        let meta_w = width.saturating_sub(rel_x);
+        if meta_w > 0 {
             if meta_h >= 1 {
                 self.draw_meta_line(buf, meta_x, area.y, meta_w, &self.badge, true);
             }
@@ -111,12 +111,11 @@ impl NowPlaying {
                 self.draw_meta_line(buf, meta_x, area.y + 1, meta_w, &self.track, false);
             }
             if meta_h >= 3 {
-                self.draw_meta_line(buf, meta_x, area.y + 2, meta_w, &self.artist, false);
+                self.draw_meta_line(buf, meta_x, area.y + 2, meta_w, &self.artist, true);
             }
         }
     }
 
-    /// Draw a single metadata line (badge / track / artist), truncated to width.
     fn draw_meta_line(
         &self,
         buf: &mut Buffer,
@@ -131,15 +130,7 @@ impl NowPlaying {
         } else {
             theme::TEXT_PRIMARY
         }));
-        let mut truncated = String::new();
-        for ch in text.chars() {
-            if truncated.len() < width as usize {
-                truncated.push(ch);
-            }
-            if truncated.len() >= width as usize {
-                break;
-            }
-        }
+        let truncated: String = text.chars().take(width as usize).collect();
         buf.set_string(x0, y, truncated.as_str(), style);
     }
 }
@@ -151,29 +142,24 @@ impl Widget for &NowPlaying {
         if w == 0 || h == 0 {
             return;
         }
-        // Split into a content half (top) and a spectrum half (bottom).
         let content_h = h / 2;
         if content_h == 0 {
             return;
         }
         let spec_h = h - content_h;
 
-        // Spectrum: bottom half.
         if spec_h > 0 {
-            let spec = Rect::new(0, content_h, w, spec_h);
+            let spec = Rect::new(area.x, area.y + content_h, w, spec_h);
             (&self.spectrum).render(spec, buf);
         }
 
-        // Content half: cover + metadata + progress + controls.
         if content_h < 3 {
-            if content_h >= 1 {
-                self.draw_controls(buf, area, content_h - 1, w);
-            }
+            self.draw_controls(buf, area, content_h - 1, w);
             return;
         }
         let controls_row = content_h - 1;
         let progress_row = content_h - 2;
-        let meta_h = content_h - 2; // rows 0..=meta_h-1
+        let meta_h = content_h - 2;
         if meta_h >= 1 {
             self.draw_cover_and_meta(buf, area, meta_h, w);
         }
@@ -229,23 +215,13 @@ mod tests {
     fn renders_in_normal_size() {
         let screen = make_screen();
         let terminal = render(&screen, 120, 40);
-        // Cover art area contains half-block glyphs.
         assert_eq!(at(&terminal, 0, 0), '▀');
-        // Track text present in row 1 (first non-space is 'B').
         let track_row: Vec<char> = (0..120).map(|x| at(&terminal, x, 1)).collect();
         assert!(track_row.contains(&'B'));
-        // Progress bar contains the `●` cursor (progress row = 18 for h=40).
-        let mut found_cursor = false;
-        for x in 0..120 {
-            if at(&terminal, x, 18) == '●' {
-                found_cursor = true;
-                break;
-            }
-        }
+        let found_cursor = (0..120).any(|x| at(&terminal, x, 18) == '●');
         assert!(found_cursor);
-        // Spectrum has content in the bottom half (rows 20..=39).
-        let has_spectrum = (20..40)
-            .any(|y| (0..120).any(|x| !at(&terminal, x, y).is_whitespace()));
+        let has_spectrum =
+            (20..40).any(|y| (0..120).any(|x| !at(&terminal, x, y).is_whitespace()));
         assert!(has_spectrum);
     }
 
@@ -253,11 +229,9 @@ mod tests {
     fn renders_in_narrow_size() {
         let screen = make_screen();
         let terminal = render(&screen, 40, 12);
-        // Cover art still renders half-blocks.
         assert_eq!(at(&terminal, 0, 0), '▀');
-        // Spectrum has content in the bottom half (rows 6..=11).
-        let has_spectrum = (6..12)
-            .any(|y| (0..40).any(|x| !at(&terminal, x, y).is_whitespace()));
+        let has_spectrum =
+            (6..12).any(|y| (0..40).any(|x| !at(&terminal, x, y).is_whitespace()));
         assert!(has_spectrum);
     }
 }

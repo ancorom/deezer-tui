@@ -26,5 +26,20 @@
 - [x] 14 clippy-замечаний в тестовом коде (bin-gate их не видел): `u32::from` no-op (output), `1 * CHUNK_SIZE` ×4 (crypto), `loop{match}` → `while let` ×2 (ring_buffers), `at(&terminal,…)` в `row_has` ×6 (app/flow_lyrics/library/search/modal), `iter().any` → `contains` (now_playing).
 - [x] Гейт: `cargo check --all-targets` + `cargo test` **85/85** + `cargo clippy -- -D warnings` exit 0 + `cargo clippy --all-targets -- -D warnings` exit 0, 0 test-build warnings.
 
+## Gemini review fixes (6 файлов) [x]
+- [x] `src/api/crypto.rs` — `generate_blowfish_key` (имя из ARCHITECTURE.md §4.2) + `generate_key` как синоним, file-level `#![allow(dead_code)]`, `Md5::digest` + `hex::encode`, `anyhow!`-ошибки. `as_chunks_mut::<CHUNK_SIZE>()` (clippy 1.99 `chunks_exact_to_as_chunks`).
+- [x] `src/audio/stream.rs` — `impl MediaSource for DeezerStream` (`is_seekable → true`, `byte_len → Some(total_len)`), конструктор `from_encrypted(&[u8], &[u8;16])` (потоковая расшифровка в tempfile), `try_from_decrypted`, `is_empty`. Тест 8192 байта (4 чанка, зашифрованы idx 0 и 3) с произвольными Seek из PLAN.md (`read_exact` побайтово). Stream-тестов: 5 → 3.
+- [x] `src/api/client.rs` — фикс двойного `.get("results")` в `get_lyrics` (fallback `unwrap_or`), поддержка обоих форматов `TRACK: {data:[…], total}` (реальный API) и `TRACK: […]` (тесты), tuple-array `[[sng_id, 0]]` в `add_to_playlist`/`remove_from_playlist`, фолбэк-ключи `milliseconds`/`line` в LYRICS_SYNC_JSON. 5/5 тестов.
+- [x] `src/ui/theme.rs` — фикс градиента: `t as i32` обнулял дробную часть (градиент не работал) → f32-интерполяция с `.round().clamp(0.0, 255.0)`. Тест midpoint `Rgb(103,150,219)`.
+- [x] `src/ui/widgets/spectrum.rs` — `set_bars` больше не сбрасывает `peak_holds` на каждом кадре (плавный decay `PEAK_DECAY_PER_FRAME = 0.015`, `max(bar)`); `set_peak_holds` — явная установка. 8/8 тестов (2 из старой версии перенесены).
+- [x] `src/ui/widgets/modal.rs` — `ratatui::widgets::Clear` под модальным окном (ARCHITECTURE.md §6.2). 3/3.
+- [x] `src/ui/views/now_playing.rs` — спектр в `Rect::new(area.x, area.y + content_h, …)` (был `(0, …)` — сдвиг на 1 строку в App), `rel_x` вместо сравнения `width > meta_x`, кнопки `[PAUSE] ⏮ ▶ ⏭ [FLOW]` (ARCHITECTURE.md §6.2), 32-столбичковый стартовый спектр в `default_screen()`.
+- [x] `src/ui/views/search.rs` — фикс двойного прибавления `area.y` в `draw_query` (строка поиска рисовалась под заголовками), `saturating_sub` в `draw_status` (underflow-паника на узком терминале). 6/6 (1 новый + 2 старых перенесены).
+- [x] `src/ui/views/library.rs` — CHOOSE PLAYLIST рисуется поверх отрисованного экрана (ранний `return` убран — экран Фонотеки больше не пропадает). 4/4 (новый `choose_modal_renders_over_background_screen`).
+- [x] `src/ui/views/flow_lyrics.rs` — спектр в `Rect::new(area.x, area.y + body_h, …)` (был `(0, spec_top)`), автоскролл `scroll_offset` синхронных строк (активная строка в центре видимой области). 5/5.
+- [x] `src/ui/app.rs` — вкладки `[1]..[4]` (было `[0]..[3]`, хоткеи 1–4), часы `HH:MM` в статус-баре, off-by-one в `navigate_down`/`navigate_right` (`selected_track + 1 < len`), `App::with_config(cfg)`, `attach_vis_consumer`, `step_dsp()` (Cavacore 60 FPS: вычитка `VisRingBuffer` → `Cavacore::process` → спектры NowPlaying/Search/Flow), `Mpris::set_volume` на `+`/`-`.
+- [x] `src/main.rs` — `App::with_config(cfg)` (было `App::new()` — конфиг не влиял на приложение).
+- [x] Гейт: `cargo check --all-targets` + `cargo test` **84/84** (85 → 84: stream 5→3, +1 search-тест) + `cargo clippy -- -D warnings` exit 0 + `cargo clippy --all-targets -- -D warnings` exit 0, 0 test-build warnings.
+
 ## Status
-Phase 5: все вью + `src/mpris.rs` + `src/audio/prefetch.rs` + подключение вью к `App` (active_tab + клавиши + `DeezerClient` в `App`) — done. cargo test 85 passed; cargo clippy -- -D warnings = clean, exit 0; 0 warning в test-сборке.
+Все 6 файлов Gemini review применены. Phase 5 + audit + gemini-review: done. cargo test 84 passed; cargo clippy -- -D warnings = clean, exit 0; 0 warning в test-сборке.

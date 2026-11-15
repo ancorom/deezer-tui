@@ -1,13 +1,7 @@
-//! Spectrum widget: renders a normalized set of audio bars as a vertical-bar
-//! equalizer.
-//!
-//! Each bar is drawn as a column of characters using the glyph scale
-//! `[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']`, separated by a single
-//! space. The spectrum's height (`area.height` character rows) maps to
-//! `8 * area.height` subpixels of value, so a value `v in [0, 1]` fills
-//! `v * 8 * rows` subpixels from the bottom. The frontier cell of every bar
-//! uses the partial glyph that matches the exact subpixel fill. Peak-hold
-//! dots ('▪') are drawn at each bar's historical maximum.
+//! Виджет субсимвольного спектра (`[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']`)
+//! с интервалом в 1 пробел и точками удержания пиков (`'▪'`).
+
+#![allow(dead_code)]
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -16,16 +10,10 @@ use ratatui::widgets::Widget;
 
 use crate::ui::theme;
 
-/// The glyph scale: index 0 is empty, 1..8 are the filled block elements.
-const GLYPHS: [char; 9] = [
-    ' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█',
-];
-
-/// Peak-hold dot glyph.
+const GLYPHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const PEAK_DOT: char = '▪';
+const PEAK_DECAY_PER_FRAME: f32 = 0.015;
 
-/// Return a `&'static str` for a single glyph character (avoids per-call
-/// allocation in the per-frame render path).
 const fn char_str(c: char) -> &'static str {
     match c {
         ' ' => " ",
@@ -42,11 +30,9 @@ const fn char_str(c: char) -> &'static str {
     }
 }
 
-/// A normalized set of spectrum bars (each in `[0, 1]`).
+/// Состояние столбиков спектра и удерживаемых пиков в диапазоне `[0.0, 1.0]`.
 pub struct Spectrum {
-    /// Current bar values (normalized `[0, 1]`).
     bars: Vec<f32>,
-    /// Historical maximum per bar (normalized `[0, 1]`).
     peak_holds: Vec<f32>,
 }
 
@@ -57,7 +43,6 @@ impl Default for Spectrum {
 }
 
 impl Spectrum {
-    /// Create an empty spectrum with `num_bars` zero bars.
     pub fn new(num_bars: usize) -> Self {
         Self {
             bars: vec![0.0; num_bars],
@@ -65,46 +50,42 @@ impl Spectrum {
         }
     }
 
-    /// Set the current normalized bars (resizes, clamping values to `[0, 1]`).
+    /// Обновляет высоты столбиков, плавно удерживая исторические пики.
     pub fn set_bars(&mut self, values: &[f32]) {
         self.bars = values.iter().map(|v| v.clamp(0.0, 1.0)).collect();
-        // Reset peak holds to the current bars so they track the new range.
-        self.peak_holds = self.bars.clone();
-    }
-
-    /// Set the historical maximums per bar (resizes, clamping to `[0, 1]`).
-    pub fn set_peak_holds(&mut self, values: &[f32]) {
-        self.peak_holds = values.iter().map(|v| v.clamp(0.0, 1.0)).collect();
-    }
-
-    /// Update each peak hold to `max(peak_holds[i], bars[i])`.
-    pub fn update_peak_holds(&mut self) {
-        for i in 0..self.bars.len() {
-            if i < self.peak_holds.len() {
-                self.peak_holds[i] = self.peak_holds[i].max(self.bars[i]);
+        if self.peak_holds.len() != self.bars.len() {
+            self.peak_holds = self.bars.clone();
+        } else {
+            for (ph, &bar) in self.peak_holds.iter_mut().zip(self.bars.iter()) {
+                *ph = (*ph - PEAK_DECAY_PER_FRAME).max(bar).clamp(0.0, 1.0);
             }
         }
     }
 
-    /// Current bar values.
-    #[allow(dead_code)]
+    /// Явно задаёт массив удерживаемых пиков (используется в unit-тестах).
+    pub fn set_peak_holds(&mut self, values: &[f32]) {
+        self.peak_holds = values.iter().map(|v| v.clamp(0.0, 1.0)).collect();
+    }
+
+    /// Обновляет каждый пик до `max(peak_holds[i], bars[i])`.
+    pub fn update_peak_holds(&mut self) {
+        for (ph, &bar) in self.peak_holds.iter_mut().zip(self.bars.iter()) {
+            *ph = ph.max(bar);
+        }
+    }
+
     pub fn bars(&self) -> &[f32] {
         &self.bars
     }
 
-    /// Historical maximums per bar.
-    #[allow(dead_code)]
     pub fn peak_holds(&self) -> &[f32] {
         &self.peak_holds
     }
 
-    /// Number of bars.
-    #[allow(dead_code)]
     pub fn num_bars(&self) -> usize {
         self.bars.len()
     }
 
-    /// Color for a bar given its normalized value `v` (gradient by height).
     fn bar_style(value: f32) -> Style {
         Style::default()
             .fg(theme::gradient_color(value))
@@ -130,12 +111,11 @@ impl Widget for &Spectrum {
             let x = area.x + col;
             let v = bar.clamp(0.0, 1.0);
             let style = Spectrum::bar_style(v);
-            // Total subpixel fill for this bar across the whole spectrum height.
             let total_fill = (v * (total_subpixels as f32)) as u32;
-            // Peak-hold row for this bar (0 = bottom), clamped to a valid row.
             let ph = self.peak_holds.get(b).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             let ph_row = (ph * (total_rows as f32)).min(total_rows as f32 - 1.0) as u32;
-            for r in 0..h as u32 {
+
+            for r in 0..total_rows {
                 let row_start = r * 8;
                 let row_end = row_start + 8;
                 let glyph_idx: u8 = if total_fill <= row_start {
@@ -163,26 +143,26 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::prelude::*;
 
-    /// Render a spectrum to a `TestBackend` and return the resulting `Terminal`.
     fn render(bars: &[f32], peaks: &[f32], width: u16, height: u16) -> Terminal<TestBackend> {
         let mut spectrum = Spectrum::new(bars.len());
         spectrum.set_bars(bars);
         spectrum.set_peak_holds(peaks);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            frame.render_widget(&spectrum, frame.area());
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(&spectrum, frame.area());
+            })
+            .unwrap();
         terminal
     }
 
-    /// Symbol at (x, y) of a rendered terminal's buffer.
     fn at(terminal: &Terminal<TestBackend>, x: u16, y: u16) -> char {
-        let buf = terminal.backend().buffer();
-        let cell = buf
+        terminal
+            .backend()
+            .buffer()
             .cell((x, y))
-            .expect("buffer cell out of bounds");
-        cell
+            .expect("buffer cell out of bounds")
             .symbol()
             .chars()
             .next()
@@ -192,7 +172,6 @@ mod tests {
     #[test]
     fn full_bar_is_all_gk() {
         let terminal = render(&[1.0], &[0.0], 4, 12);
-        // Bar 0 at column 0, all 12 rows must be '█' (no peak holds).
         for y in 0..12 {
             assert_eq!(at(&terminal, 0, y), '█');
         }
@@ -208,16 +187,14 @@ mod tests {
 
     #[test]
     fn partial_bar_frontier_glyph() {
-        // 0.0625 in a 12-row area -> 0.0625 * 96 = 6 subpixels -> '▆' (idx 6).
         let terminal = render(&[0.0625], &[0.0], 4, 12);
-        assert_eq!(at(&terminal, 0, 11), '▆'); // bottom row (y=11)
-        assert_eq!(at(&terminal, 0, 10), ' '); // row above is empty
+        assert_eq!(at(&terminal, 0, 11), '▆');
+        assert_eq!(at(&terminal, 0, 10), ' ');
     }
 
     #[test]
     fn bars_are_spaced_by_one() {
         let terminal = render(&[1.0, 1.0], &[0.0, 0.0], 8, 4);
-        // bar0 at col 0 full, bar1 at col 2 full, col 1 is the gap.
         for y in 0..4 {
             assert_eq!(at(&terminal, 0, y), '█');
             assert_eq!(at(&terminal, 2, y), '█');
@@ -227,16 +204,12 @@ mod tests {
 
     #[test]
     fn peak_hold_dot_at_top_of_max() {
-        // current bar 0.5, peak hold 0.75 in a 12-row area -> peak at row 9 (from bottom)
-        // -> y = 12 - 1 - 9 = 2.
         let terminal = render(&[0.5], &[0.75], 4, 12);
         assert_eq!(at(&terminal, 0, 2), PEAK_DOT);
     }
 
     #[test]
     fn peak_hold_dot_clamped_to_top_row() {
-        // current bar 0.25, peak hold 1.0 in a 12-row area -> ph_row = min(12.0, 11.0) = 11
-        // -> y = 12 - 1 - 11 = 0 (top row).
         let terminal = render(&[0.25], &[1.0], 4, 12);
         assert_eq!(at(&terminal, 0, 0), PEAK_DOT);
     }
