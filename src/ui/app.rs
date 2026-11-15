@@ -1,6 +1,6 @@
 //! Глобальное состояние `deezer-tui v2.0`: связывает TUI (60 FPS), фоновый рантайм `tokio`,
 //! декодер `Symphonia` (с `Seek` и `StreamTechInfo`), синхронный аудиовывод `CPAL`,
-//! очередь `PlaybackQueue` и спектроанализатор `Cavacore`.
+//! очередь `PlaybackQueue`, экран `Settings` и модальное окно `[i] Track & Stream Info`.
 
 #![allow(dead_code)]
 
@@ -33,6 +33,7 @@ use crate::ui::views::flow_lyrics::{FlowLyrics, FlowRow};
 use crate::ui::views::library::{Library, LibraryFocus, PlaylistEntry};
 use crate::ui::views::now_playing::NowPlaying;
 use crate::ui::views::search::{Search, SearchRow};
+use crate::ui::views::settings::Settings;
 use crate::ui::widgets::{CoverArt, Modal, Spectrum};
 
 /// Очередь воспроизведения для автоматического и ручного (`n`/`p`) переключения треков.
@@ -98,6 +99,7 @@ pub enum BgEvent {
         track: TrackData,
         badge: String,
         tech_info: StreamTechInfo,
+        is_preview: bool,
         vis_consumer: Consumer<f32>,
         cover: Option<CoverArt>,
         lyrics: Vec<LyricLine>,
@@ -112,6 +114,7 @@ pub struct App {
     pub search: Search,
     pub library: Library,
     pub flow_lyrics: FlowLyrics,
+    pub settings: Settings,
     pub global_spectrum: Spectrum,
     pub active_tab: u8,
     pub search_input_focused: bool,
@@ -129,9 +132,10 @@ pub struct App {
     pub flow_tracks: Vec<TrackData>,
     pub queue: PlaybackQueue,
 
-    // Модальное окно ввода ARL-токена (клавиша L)
+    // Модальные окна
     pub show_arl_modal: bool,
     pub arl_input: String,
+    pub show_track_info_modal: bool,
 
     // DSP, синхронизация прогресса и аудиодвижок
     pub cavacore: Cavacore,
@@ -142,7 +146,9 @@ pub struct App {
     pub played_frames: Arc<AtomicU64>,
     pub current_sample_rate: u32,
     pub current_duration_secs: u64,
+    pub current_track: Option<TrackData>,
     pub current_tech_info: Option<StreamTechInfo>,
+    pub current_is_preview: bool,
     pub decoder_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
 
     // Асинхронные фоновые задачи
@@ -187,12 +193,15 @@ impl App {
         global_spectrum.set_bars(&demo);
 
         let cavacore = Cavacore::new(cfg.sample_rate_hz, 64).with_db_scale(cfg.db_scale);
+        let mut settings = Settings::new();
+        settings.sync_from_config(&cfg, None, None);
 
         let app = Self {
             now_playing: NowPlaying::default(),
             search: Search::default(),
             library: Library::default(),
             flow_lyrics: FlowLyrics::default(),
+            settings,
             global_spectrum,
             active_tab: 1,
             search_input_focused: false,
@@ -209,6 +218,7 @@ impl App {
             queue: PlaybackQueue::default(),
             show_arl_modal: false,
             arl_input: cfg.effective_arl().unwrap_or_default(),
+            show_track_info_modal: false,
             cavacore,
             vis_consumer: None,
             audio_output: None,
@@ -217,7 +227,9 @@ impl App {
             played_frames: Arc::new(AtomicU64::new(0)),
             current_sample_rate: 44_100,
             current_duration_secs: 30,
+            current_track: None,
             current_tech_info: None,
+            current_is_preview: false,
             decoder_tx: None,
             rt,
             bg_tx,
@@ -234,6 +246,14 @@ impl App {
     pub fn set_search_input_focus(&mut self, focused: bool) {
         self.search_input_focused = focused;
         self.search.input_focused = focused;
+    }
+
+    fn sync_settings_view(&mut self) {
+        self.settings.sync_from_config(
+            &self.config,
+            self.user_label.as_deref(),
+            self.status_message.as_deref(),
+        );
     }
 
     fn spawn_initial_load(&self) {
@@ -360,6 +380,44 @@ impl App {
         format!("{:02}:{:02}", secs / 60, secs % 60)
     }
 
+    /// Формирует строки модального окна `[i] Track & Stream Info`.
+    pub fn track_info_lines(&self) -> Vec<String> {
+        let track = self.current_track.clone().unwrap_or_else(|| TrackData {
+            track_id: "N/A".into(),
+            title: self.now_playing.track.clone(),
+            artist: self.now_playing.artist.clone(),
+            album: "—".into(),
+            duration: Self::format_mm_ss(self.current_duration_secs),
+            ..Default::default()
+        });
+        let tech = self.current_tech_info.clone().unwrap_or_default();
+        let size_mb = if tech.file_size_bytes > 0 {
+            format!("{:.2} MB ({} bytes)", tech.file_size_bytes as f64 / (1024.0 * 1024.0), tech.file_size_bytes)
+        } else {
+            String::from("0.00 MB (Live / Synth Stream)")
+        };
+        let mode_str = if self.current_is_preview {
+            "Guest Preview (30s Unencrypted CDN)"
+        } else if self.user_label.is_some() || self.config.effective_arl().is_some() {
+            "HiFi BF_CBC_STRIPE (Blowfish-CBC Decrypted)"
+        } else {
+            "Guest Preview / Synth Fallback"
+        };
+
+        vec![
+            format!("Track ID    : {}", track.track_id),
+            format!("Title       : {}", track.title),
+            format!("Artist      : {}", track.artist),
+            format!("Album       : {}", track.album),
+            format!("Codec       : {}", tech.codec_name),
+            format!("Sample Rate : {} Hz ({:.1} kHz)", tech.sample_rate, tech.sample_rate as f32 / 1000.0),
+            format!("Bit Depth   : {}-bit", tech.bits_per_sample),
+            format!("Bitrate     : {} kbps", tech.bitrate_kbps),
+            format!("Stream Size : {}", size_mb),
+            format!("Mode        : {}", mode_str),
+        ]
+    }
+
     /// Обновляет спектр 60 FPS и прогресс воспроизведения строго по `played_frames / sample_rate`.
     pub fn step_dsp(&mut self) {
         let mut samples = Vec::new();
@@ -414,6 +472,7 @@ impl App {
                 } => {
                     self.user_label = Some(user_name.clone());
                     self.status_message = Some(format!("Logged in as {user_name}"));
+                    self.sync_settings_view();
                     if !favorites.is_empty() {
                         self.library_tracks = favorites.clone();
                         self.playlist_tracks_cache
@@ -458,7 +517,9 @@ impl App {
                     }
                 }
                 BgEvent::AuthFailed(err) => {
+                    self.user_label = None;
                     self.status_message = Some(format!("ARL Error: {err}"));
+                    self.sync_settings_view();
                 }
                 BgEvent::ChartLoaded(tracks) => {
                     self.search.rows = tracks
@@ -523,6 +584,7 @@ impl App {
                     track,
                     badge,
                     tech_info,
+                    is_preview,
                     vis_consumer,
                     cover,
                     lyrics,
@@ -549,7 +611,9 @@ impl App {
 
                     self.current_sample_rate = tech_info.sample_rate.max(1);
                     self.current_duration_secs = tech_info.duration_secs.max(1);
+                    self.current_track = Some(track);
                     self.current_tech_info = Some(tech_info);
+                    self.current_is_preview = is_preview;
                     self.decoder_tx = decoder_tx;
                     self.vis_consumer = Some(vis_consumer);
                 }
@@ -680,6 +744,7 @@ impl App {
                                 track: track.clone(),
                                 badge,
                                 tech_info,
+                                is_preview,
                                 vis_consumer: vis_cons,
                                 cover,
                                 lyrics,
@@ -740,6 +805,7 @@ impl App {
                             track: track.clone(),
                             badge: "SYNTH DEMO | 44.1 kHz".to_string(),
                             tech_info,
+                            is_preview: true,
                             vis_consumer: vis_cons,
                             cover,
                             lyrics,
@@ -1017,7 +1083,7 @@ impl App {
             .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
             .bg(theme::color_from_hex(theme::BG_TERMINAL));
         let hotkeys =
-            "q quit | 1-5 screen | [/] search | Space play/pause | n/p next/prev | <- -> seek | s sidebar | v spectrum";
+            "q quit | 1-5 screen | [/] search | [i] info | Space play/pause | n/p next/prev | <- -> seek | s sidebar | v spectrum";
         let truncated: String = hotkeys.chars().take(area.width as usize).collect();
         buf.set_string(area.left(), y, &truncated, style);
     }
@@ -1068,6 +1134,7 @@ impl App {
                         2 => (&self.search).render(content_area, buf),
                         3 => (&self.library).render(content_area, buf),
                         4 => (&self.flow_lyrics).render(content_area, buf),
+                        5 => (&self.settings).render(content_area, buf),
                         _ => {}
                     }
                 }
@@ -1085,6 +1152,21 @@ impl App {
                         spec_rows,
                     );
                     (&self.global_spectrum).render(spec_rect, buf);
+                }
+
+                if self.show_track_info_modal {
+                    let lines = self.track_info_lines();
+                    let mw = 68.min(inner.width).max(3);
+                    let mh = (lines.len() as u16 + 3).min(inner.height).max(3);
+                    let mx = inner.x + (inner.width - mw) / 2;
+                    let my = inner.y + (inner.height - mh) / 2;
+                    let m_area = Rect::new(mx, my, mw, mh);
+                    (&Modal::new(
+                        "TRACK & STREAM INFO [i / Esc to close]",
+                        lines,
+                        usize::MAX,
+                    ))
+                        .render(m_area, buf);
                 }
 
                 if self.show_arl_modal {
@@ -1162,6 +1244,7 @@ impl App {
                         Some(trimmed)
                     };
                     let _ = self.config.save();
+                    self.sync_settings_view();
                     self.spawn_initial_load();
                 }
                 KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1172,7 +1255,52 @@ impl App {
             return Ok(());
         }
 
-        // 2. Функциональные клавиши F1..F5 работают всегда
+        // 2. Модальное окно [i] Track & Stream Info
+        if self.show_track_info_modal {
+            match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
+                    self.show_track_info_modal = false;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // 3. Редактирование ARL-токена прямо на вкладке [5] Settings
+        if self.active_tab == 5 && self.settings.editing_arl {
+            match k.code {
+                KeyCode::Esc => {
+                    self.settings.editing_arl = false;
+                    self.sync_settings_view();
+                }
+                KeyCode::Backspace => {
+                    self.settings.arl_input.pop();
+                }
+                KeyCode::Enter => {
+                    self.settings.editing_arl = false;
+                    let trimmed = self.settings.arl_input.trim().to_string();
+                    self.arl_input = trimmed.clone();
+                    self.config.arl = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    };
+                    let _ = self.config.save();
+                    self.sync_settings_view();
+                    self.spawn_initial_load();
+                }
+                KeyCode::Char(c)
+                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.settings.arl_input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // 4. Функциональные клавиши F1..F5 работают всегда
         match k.code {
             KeyCode::F(1) => {
                 self.set_search_input_focus(false);
@@ -1195,13 +1323,14 @@ impl App {
             }
             KeyCode::F(5) => {
                 self.set_search_input_focus(false);
+                self.sync_settings_view();
                 self.active_tab = 5;
                 return Ok(());
             }
             _ => {}
         }
 
-        // 3. Режим редактирования строки поиска (search_input_focused == true)
+        // 5. Режим редактирования строки поиска (search_input_focused == true)
         if self.active_tab == 2 && self.search_input_focused {
             match k.code {
                 KeyCode::Enter => {
@@ -1225,13 +1354,16 @@ impl App {
             return Ok(());
         }
 
-        // 4. Навигация и глобальные хоткеи плеера (когда search_input_focused == false)
+        // 6. Навигация и глобальные хоткеи плеера
         match k.code {
             KeyCode::Tab => {
                 if self.active_tab == 3 && !self.library.show_choose_modal {
                     self.library.toggle_focus();
                 } else {
                     self.active_tab = (self.active_tab % 5) + 1;
+                    if self.active_tab == 5 {
+                        self.sync_settings_view();
+                    }
                 }
             }
             KeyCode::BackTab => {
@@ -1243,6 +1375,9 @@ impl App {
                     } else {
                         self.active_tab - 1
                     };
+                    if self.active_tab == 5 {
+                        self.sync_settings_view();
+                    }
                 }
             }
             KeyCode::Char('/') => {
@@ -1257,15 +1392,26 @@ impl App {
             KeyCode::Char('2') => self.active_tab = 2,
             KeyCode::Char('3') => self.active_tab = 3,
             KeyCode::Char('4') => self.active_tab = 4,
-            KeyCode::Char('5') => self.active_tab = 5,
+            KeyCode::Char('5') | KeyCode::Char(',') => {
+                self.sync_settings_view();
+                self.active_tab = 5;
+            }
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.show_track_info_modal = !self.show_track_info_modal;
+            }
             KeyCode::Char('L') => {
-                self.show_arl_modal = true;
+                self.sync_settings_view();
+                self.active_tab = 5;
+                self.settings.selected_row = 1;
+                self.settings.editing_arl = true;
             }
             KeyCode::Char('l') => {
                 if self.active_tab == 3 && !self.library.show_choose_modal {
                     self.library.focus = LibraryFocus::Tracks;
                 } else {
-                    self.show_arl_modal = true;
+                    self.sync_settings_view();
+                    self.active_tab = 5;
+                    self.settings.selected_row = 1;
                 }
             }
             KeyCode::Char('h') if self.active_tab == 3 && !self.library.show_choose_modal => {
@@ -1331,6 +1477,14 @@ impl App {
 
     pub fn toggle_spectrum(&mut self) {
         self.config.show_spectrum = !self.config.show_spectrum;
+        self.settings.show_spectrum = self.config.show_spectrum;
+        let _ = self.config.save();
+    }
+
+    pub fn toggle_db_scale(&mut self) {
+        self.config.db_scale = !self.config.db_scale;
+        self.settings.db_scale = self.config.db_scale;
+        self.cavacore.set_db_scale(self.config.db_scale);
         let _ = self.config.save();
     }
 
@@ -1363,6 +1517,26 @@ impl App {
         self.search.player.progress = next_prog;
         self.library.player.progress = next_prog;
         self.flow_lyrics.position_ms = target_secs * 1000;
+    }
+
+    fn adjust_setting(&mut self, forward: bool) {
+        match self.settings.selected_row {
+            0 => {
+                let next_q = self.settings.cycle_quality(forward);
+                self.config.preferred_quality = next_q;
+                let _ = self.config.save();
+            }
+            1 => {
+                self.settings.editing_arl = true;
+            }
+            2 => {
+                self.toggle_spectrum();
+            }
+            3 => {
+                self.toggle_db_scale();
+            }
+            _ => {}
+        }
     }
 
     fn navigate_up(&mut self) {
@@ -1402,6 +1576,7 @@ impl App {
                 }
             }
             4 if self.flow_lyrics.selected_flow > 0 => self.flow_lyrics.selected_flow -= 1,
+            5 if self.settings.selected_row > 0 => self.settings.selected_row -= 1,
             _ => {}
         }
     }
@@ -1452,6 +1627,7 @@ impl App {
             {
                 self.flow_lyrics.selected_flow += 1;
             }
+            5 if self.settings.selected_row < 3 => self.settings.selected_row += 1,
             _ => {}
         }
     }
@@ -1459,6 +1635,8 @@ impl App {
     fn navigate_left(&mut self) {
         if self.active_tab == 3 && !self.library.show_choose_modal {
             self.library.toggle_focus();
+        } else if self.active_tab == 5 && self.settings.selected_row != 1 {
+            self.adjust_setting(false);
         } else {
             self.seek(false);
         }
@@ -1467,6 +1645,8 @@ impl App {
     fn navigate_right(&mut self) {
         if self.active_tab == 3 && !self.library.show_choose_modal {
             self.library.toggle_focus();
+        } else if self.active_tab == 5 && self.settings.selected_row != 1 {
+            self.adjust_setting(true);
         } else {
             self.seek(true);
         }
@@ -1574,6 +1754,9 @@ impl App {
                     self.start_track_playback(track);
                 }
             }
+            5 => {
+                self.adjust_setting(true);
+            }
             _ => {}
         }
     }
@@ -1581,6 +1764,8 @@ impl App {
     fn press_escape(&mut self) {
         if self.show_arl_modal {
             self.show_arl_modal = false;
+        } else if self.show_track_info_modal {
+            self.show_track_info_modal = false;
         } else if self.search_input_focused {
             self.set_search_input_focus(false);
         } else if self.library.show_choose_modal {
@@ -1647,11 +1832,12 @@ mod tests {
 
     #[test]
     fn renders_each_tab_screen_with_global_player_and_sidebar() {
-        let expectations: [(u8, &str); 4] = [
+        let expectations: [(u8, &str); 5] = [
             (1, "FLAC | 1411 kbps"),
             (2, "ARTISTS"),
             (3, "LIBRARY"),
             (4, "FLOW"),
+            (5, "SETTINGS & AUDIO CONFIGURATION"),
         ];
         for (tab, needle) in expectations {
             let mut app = App::new();
@@ -1665,24 +1851,69 @@ mod tests {
     }
 
     #[test]
+    fn settings_tab_opens_on_comma_and_updates_config() {
+        let mut app = App::new();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.active_tab, 5);
+        assert_eq!(app.config.preferred_quality, "FLAC");
+
+        // Enter на первой строке переключает качество FLAC -> MP3_320
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.config.preferred_quality, "MP3_320");
+    }
+
+    #[test]
+    fn track_info_modal_opens_on_i_and_renders_stream_details() {
+        let mut app = App::new();
+        app.current_track = Some(TrackData {
+            track_id: "3135556".into(),
+            title: "Harder, Better, Faster, Stronger".into(),
+            artist: "Daft Punk".into(),
+            album: "Discovery".into(),
+            ..Default::default()
+        });
+        app.current_tech_info = Some(StreamTechInfo {
+            codec_name: "FLAC".into(),
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            total_frames: 44_100 * 224,
+            duration_secs: 224,
+            bitrate_kbps: 1411,
+            file_size_bytes: 26_214_400,
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_track_info_modal);
+
+        let terminal = render_ui(&app, 120, 36);
+        assert!(screen_has(&terminal, "TRACK & STREAM INFO"));
+        assert!(screen_has(&terminal, "3135556"));
+        assert!(screen_has(&terminal, "25.00 MB"));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_track_info_modal);
+    }
+
+    #[test]
     fn search_modal_input_focus_and_global_hotkeys() {
         let mut app = App::new();
         app.active_tab = 2;
         assert!(!app.search_input_focused);
 
-        // Вне режима ввода пробел переключает паузу, а не пишет в query
         let was_paused = app.now_playing.paused;
         app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
             .unwrap();
         assert_ne!(app.now_playing.paused, was_paused);
         assert!(app.search.query.is_empty());
 
-        // Нажатие 'f' включает режим ввода текста
         app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
             .unwrap();
         assert!(app.search_input_focused);
 
-        // В режиме ввода символы (включая пробел и цифры) идут в поисковую строку
         for ch in ['d', 'a', 'f', 't', ' ', '1'] {
             app.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .unwrap();
@@ -1690,7 +1921,6 @@ mod tests {
         assert_eq!(app.search.query, "daft 1");
         assert_eq!(app.active_tab, 2);
 
-        // Esc выключает фокус ввода, после чего цифра '3' переключает вкладку на Library
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         assert!(!app.search_input_focused);
@@ -1705,7 +1935,6 @@ mod tests {
         app.active_tab = 3;
         assert_eq!(app.library.focus, LibraryFocus::Tracks);
 
-        // В фокусе Tracks стрелка вниз листает треки, но не переключает плейлист на границе
         assert_eq!(app.library.selected_playlist, 0);
         assert_eq!(app.library.selected_track, 0);
         app.navigate_down();
@@ -1716,7 +1945,6 @@ mod tests {
             "плейлист не должен переключаться при прокрутке таблицы треков"
         );
 
-        // Стрелка влево (или Tab) переключает фокус на список плейлистов
         app.navigate_left();
         assert_eq!(app.library.focus, LibraryFocus::Playlists);
         app.navigate_down();

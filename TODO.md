@@ -58,7 +58,7 @@
 
 ## Фаза 9: Вкладка `[5] Settings` и окно деталей потока `[i] Track Info`
 
-* [ ] **Шаг 9.1 (`src/ui/views/settings.rs`):** Создать экран `[5] Settings` (открывается по `5` или `,`): выбор качества (`FLAC 1411 kbps`, `MP3 320 kbps`, `MP3 128 kbps`), ввод и сохранение `ARL`-токена (убрать надпись `[press L for ARL]` из топ-бара в настройки), переключатели `Show Spectrum` и `dB Scale`.
+* [x] **Шаг 9.1 (`src/ui/views/settings.rs`):** Создать экран `[5] Settings` (открывается по `5` или `,`): выбор качества (`FLAC 1411 kbps`, `MP3 320 kbps`, `MP3 128 kbps`), ввод и сохранение `ARL`-токена (убрать надпись `[press L for ARL]` из топ-бара в настройки), переключатели `Show Spectrum` и `dB Scale`.
 
-* [ ] **Шаг 9.2 (`src/ui/app.rs`):** Добавить модальное окно технической информации о треке и потоке по клавише `i` (`Track ID`, `Artist`, `Album`, `Codec`, `Sample Rate`, `Bit Depth`, `Bitrate kbps`, `Stream Size MB`, `Mode: HiFi BF_CBC_STRIPE / Guest Preview`).
+* [x] **Шаг 9.2 (`src/ui/app.rs`):** Добавить модальное окно технической информации о треке и потоке по клавише `i` (`Track ID`, `Artist`, `Album`, `Codec`, `Sample Rate`, `Bit Depth`, `Bitrate kbps`, `Stream Size MB`, `Mode: HiFi BF_CBC_STRIPE / Guest Preview`).
 
