@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — Архитектура и спецификация deezer-tui v2.0 (Редакция: Ноябрь 2026)
+# ARCHITECTURE.md — Архитектура и спецификация deezer-tui v2.2 (Редакция: Ноябрь 2026)
 
 ## 1. Технологический стек
 Проект собирается в единый монолитный бинарник на Rust (Edition 2024, MSRV 1.88). Все зависимости зафиксированы в корневом Cargo.toml:
@@ -7,49 +7,96 @@
 - Сеть и криптография: tokio 1.54, reqwest 0.13.5, blowfish 0.9, cbc 0.1, cipher 0.4, md-5 0.10, hex 0.4, tempfile 3.15.
 - Система и конфиги: serde 1.0, serde_json 1.0, toml 1.2.1, souvlaki 0.9.3 (use_zbus), anyhow 1.0, tracing 0.1.
 
-## 2. Структура директорий проекта
+## 2. Структура проекта: что где лежит и для чего
 
     deezer-tui/
-    ├── Cargo.toml
-    ├── AGENT.md
-    ├── ARCHITECTURE.md
-    ├── PLAN.md
-    ├── TODO.md
+    ├── Cargo.toml                  # Единственный crate: deezer-tui (bin). Edition 2024, MSRV 1.88.
+    │                               #   Фичи: pipewire (cpal/pipewire) — включается явно.
+    ├── AGENT.md                    # Инструкции/ограничения для AI-разработчика (NEVER VIOLATE).
+    ├── ARCHITECTURE.md             # Этот файл: стек, карта модулей, пайплайны, спецификации.
+    ├── PLAN.md                     # Этапы разработки и критерии приёмки (исторический план).
+    ├── TODO.md                     # Атомарный чеклист задач по фазам (1..11, все [x]).
+    ├── README.md                   # Публичный README для GitHub (EN + RU).
+    ├── CHANGELOG.md               # История версий v2.0 → v2.2 по фазам.
+    ├── merge_crates_docs.sh        # Скрипт сборки ALL_CRATES_DOCS.md из docs/crates/.
+    ├── .cargo/config.toml          # Локальные настройки cargo (профайлы сборки).
     ├── docs/
-    │   ├── crates/                 # Документация cargo-doc-md 0.11 по всем крейтам
-    │   └── reference/              # Оригинальный cavacore.c, cavacore_test.c и референсы Deezer
+    │   ├── crates/                 # cargo-doc-md: markdown-доки по всем крейтам (справка API).
+    │   │   └── progress.md         # Milestones по фазам: что сделано, тесты, гейты.
+    │   └── reference/
+    │       ├── cava/               # Эталонный C-исходник cavacore (cavacore.c/h, тесты).
+    │       ├── deezer_rust_ref/    # Рабочий референс авторизации/Flow/Lyrics (Rust).
+    │       └── opendeezer_go_ref/  # Рабочий референс Blowfish (Go, OpenDeezer).
     └── src/
-        ├── main.rs                 # Инициализация логгера, потоков, ratatui::init() и ratatui::restore()
-        ├── config.rs               # Чтение/сохранение ~/.config/deezer-tui/config.toml (v2: preferred_quality, show_spectrum, db_scale, sidebar_collapsed)
+        ├── main.rs                 # init_file_logger (tracing→deezer-tui.log), AppConfig::load(),
+        │                           #   App::with_config(cfg).run(). Точка входа.
+        ├── config.rs               # AppConfig: ~/.config/deezer-tui/config.toml (serde+toml).
+        │                           #   Поля: arl, volume, sample_rate_hz, preferred_quality,
+        │                           #   show_spectrum, show_lyrics, db_scale, sidebar_collapsed.
+        │                           #   load()/save(); ARL: env DEEZER_ARL > файл.
+        ├── mpris.rs                # MPRIS (souvlaki/zbus): org.mpris.MediaPlayer2.deezer_tui.
+        │                           #   Аппаратные media-клавиши, now-playing для GNOME/KDE,
+        │                           #   playerctl. cover_url — 500x500. Поток D-Bus (Mpris::attach).
         ├── api/
-        │   ├── mod.rs
-        │   ├── client.rs           # Клиент gw-light.php и media.deezer.com (v2: get_playlist_tracks)
-        │   ├── crypto.rs           # Ключи MD5 и расшифровка Blowfish-CBC чанков по 2048 байт
-        │   └── models.rs           # Структуры Track, Album, Artist, Playlist, SyncedLyrics
+        │   ├── mod.rs              # pub-экспорт: client, crypto, models.
+        │   ├── crypto.rs           # generate_blowfish_key (MD5+XOR secret), decrypt_chunk (2048 B,
+        │                           #   chunk_index%3==0), Blowfish-CBC NoPadding, IV 0..7.
+        │   ├── models.rs           # Модели API: TrackData (date_add, formatted_date_add → YYYY-MM-DD,
+        │                           #   has_track_token, cover), PlaylistData, SearchResults,
+        │                           #   LyricLine/Lyrics, UserData. deserialize_u64_flexible (u64/строка).
+        │   └── client.rs           # DeezerClient: login_arl (gw-light getUserData → api_token, sid,
+        │                           #   license_token), is_authenticated, session. search,
+        │                           #   get_track, get_stream_url (media.deezer.com/v1/get_url),
+        │                           #   get_flow, get_lyrics, get_playlists, playlist ops,
+        │                           #   get_favorites. cover_big→cover_medium→cover.
         ├── audio/
-        │   ├── mod.rs
-        │   ├── stream.rs           # DeezerStream (Read + Seek + MediaSource) с кэшем чанков и расшифровкой
-        │   ├── decoder.rs          # Symphonia 0.6 + DecoderCommand::Seek + StreamTechInfo (v2)
-        │   └── output.rs           # CPAL 0.18 + paused/played_frames/vis_producer в callback (v2)
+        │   ├── mod.rs              # pub-экспорт модулей audio.
+        │   ├── stream.rs           # DeezerStream: Read+Seek+Send+Sync+MediaSource over
+        │                           #   Arc<RwLock<Vec<u8>>> (in-memory, v2.2) + независимый курсор
+        │                           #   pos: usize (Clone сбрасывает). from_decrypted/
+        │                           #   try_from_decrypted/from_encrypted, fetch (full),
+        │                           #   fetch_streaming (256KB prebuffer + bg tokio). read()
+        │                           #   проверяет abort_download → Ok(0). Seek ждёт ≤1.5с.
+        │   ├── decoder.rs          # Symphonia 0.6: decode FLAC→f32 → rtrb AudioRing (stereo) +
+        │                           #   VisRing (mono (L+R)/2). DecoderCommand::Seek, stop_flag,
+        │                           #   push_all_cancelable, StreamTechInfo (codec, sr, kbps, size).
+        │   ├── output.rs           # cpal 0.18: выбор SampleRate(44100) из supported_output_configs,
+        │                           #   RT-callback (no allocs/locks, rtrb::Consumer pop),
+        │                           #   AtomicBool paused, AtomicU64 played_frames, громкость.
+        │   ├── ring_buffers.rs    # AudioRingBuffer 65536 (stereo interleaved f32),
+        │                           #   VisRingBuffer 16384 (mono f32) на rtrb 0.4.
+        │   └── prefetch.rs         # Gapless prefetch: за ~20с до конца текущего трека
+        │                           #   скачивает+расшифровывает следующий в PrefetchSlot
+        │                           #   (Mutex), playback loop читает. Без взаимных блокировок.
         ├── dsp/
-        │   ├── mod.rs
-        │   └── cavacore.rs         # Порт алгоритма Cava на Rust + realfft 3.5
+        │   ├── mod.rs              # pub-экспорт cavacore.
+        │   └── cavacore.rs         # Порт cavacore: dual FFT (4096 bass/2048 mid-high), Hann,
+        │                           #   log bands 50Hz–10kHz, дробная интерполяция узких полос
+        │                           #   (v2.2), eq=(norm*tilt)/bin_count.sqrt(), Monstercat spatial
+        │                           #   filter, gravity falloff, autosens, dB scale. process(&[f32]).
         └── ui/
-            ├── mod.rs
-            ├── app.rs              # AppShell: единый каркас, роутинг [1]..[5], глобальный плеер+спектр
-            ├── theme.rs            # Палитра TrueColor и расчёт бирюзово-фиолетового градиента
-            ├── widgets/
-            │   ├── spectrum.rs     # Виджет спектра на символах ▁▂▃▄▅▆▇█ с точками пиков
-            │   ├── cover_art.rs    # Рендеринг обложки через полублоки ▀ и ratatui-image
-            │   └── modal.rs        # Попап CHOOSE PLAYLIST + Track Info (v2)
+            ├── mod.rs              # pub-экспорт: app, theme, views, widgets.
+            ├── theme.rs            # TrueColor палитра (#13151F/#1E2233/#3E445E/#ECEFF4/#94A3B8)
+            │                       #   + градиент #4FD1C5→#7F5AF0 (линейная интерполяция).
+            ├── app.rs              # AppShell: 5 вкладок, глобальный player bar + спектр,
+            │                       #   event loop (crossterm poll), tokio BgEvent-канал,
+            │                       #   playback_seq (Arc<AtomicU64>), session reuse (self.client),
+            │                       #   PlaybackQueue (n/p), spawn_* (fetch_more_flow, prefetch,
+            │                       #   initial_load, search), адаптивный спектр
+            │                       #   div_ceil(width/2).clamp(8,160), player row с хоткеями.
             └── views/
-                ├── now_playing.rs  # Экран 01: Now Playing
-                ├── search.rs       # Экран 02: Search & Discover (модальный ввод, v2)
-                ├── library.rs      # Экран 03: Library & Overlays (двухпанельный фокус, v2)
-                ├── flow_lyrics.rs  # Экран 04: Flow & Live Lyrics
-                └── settings.rs     # Экран 05: Settings (v2)
-
-## 3. Архитектура аудиопотоков без задержек и рассинхрона (Zero-Latency Audio Pipeline v2.0)
+                ├── now_playing.rs  # Экран 1: обложка (quad 2x2, до 26 строк) + метаданные +
+                │                   #   тех. параметры + панель LYRICS (автопрокрутка, подсветка).
+                ├── search.rs       # Экран 2: строка поиска (модальный ввод / / f), 3 колонки
+                │                   #   результатов (SearchRow: artist/album/track/time/added/fav).
+                ├── library.rs      # Экран 3: двухпанельный фокус (плейлисты | таблица треков),
+                │                   #   LibrarySortBy (Default/Title/Artist/Album, o/r),
+                │                   #   колонка ADDED (▲/▼), CHOOSE PLAYLIST модал (a).
+                ├── flow_lyrics.rs  # Экран 4: бесконечный Flow (автоподгрузка ≤3) + Live Lyrics
+                │                   #   (y toggle), обложка до 14 строк, разделитель │.
+                └── settings.rs     # Экран 5: ARL inline (L), quality FLAC/320/128, Show
+                                    #   Spectrum, dB Scale. Settings::render (Widget).
+## 3. Архитектура аудиопотоков без задержек и рассинхрона (Zero-Latency Audio Pipeline v2.2)
 1. CPAL 0.18 Real-Time Callback (Точка синхронизации):
    - Владеет `rtrb::Consumer<f32>` (`AudioRingBuffer`, 65536 сэмплов) и `rtrb::Producer<f32>` (`VisRingBuffer`, 16384 моно-сэмпла).
    - Проверяет атомарный флаг `paused: Arc<AtomicBool>`: если `true`, немедленно заполняет выходной буфер тишиной (`0.0f32`), не потребляя сэмплы из `AudioRingBuffer`. Задержка паузы равна размеру одного аппаратного периода ALSA/PipeWire (≈ 5–10 мс).
@@ -69,6 +116,15 @@
 4. UI & DSP Render Thread (ratatui 0.30 + Cavacore, 60 FPS):
    - Каждые 16.6 мс вычитывает накопившиеся сэмплы из VisRingBuffer во внутренний кольцевой буфер окна FFT (размер 4096 сэмплов), вызывает Cavacore::process(), получает вектор высот столбиков [f32; num_bars] в диапазоне [0.0, 1.0] и отрисовывает кадр терминала.
    - Позиция воспроизведения считается строго по `played_frames / sample_rate` (не по системному таймеру), а длительность — из `StreamTechInfo::duration_secs` (для гостевого превью принудительно 30.0 с).
+
+### 3.1 Изменения v2.1/v2.2: гонки, сессия, очередь, prefetch
+
+1. **In-memory буфер `DeezerStream` (v2.2, `stream.rs`).** Буфер расшифрованных данных — `Arc<RwLock<Vec<u8>>>`, каждый экземпляр владеет независимым курсором `pos: usize` (`Clone` сбрасывает `pos = 0`). Это убило гонку двух FD `File::try_clone()` на один OS file offset: `seek(0)` декодера больше не конфликтует с фоновой записью чанков и не портит FLAC-заголовок при быстрой смене трека (фриз при двойном `n`/`Enter` в Flow). `read()` проверяет `abort_download` → мгновенно `Ok(0)` без зависания. Временных файлов больше нет.
+2. **Счётчик поколений `playback_seq: Arc<AtomicU64>` (v2.2, `app.rs`).** Каждый вызов `start_track_playback` получает `req_id = playback_seq.fetch_add(1, SeqCst) + 1`. Все async-задачи и `poll_bg_events` сравнивают свой `req_id` с актуальным `playback_seq.load(SeqCst)`: устаревшая задача выходит, не запуская декодер и не шлюя `BgEvent::TrackStarted`/`TrackEnded` (с `req_id`) — поздний `TrackStarted` мёртвой задачи не затирает активный поток `dead-vis_consumer`'ом. Перед открытием нового потока — `self.audio_output = None`.
+3. **Переиспользование сессии (v2.2).** `BgEvent::LoggedIn { client, .. }` сохраняет авторизованный `DeezerClient` в `self.client = Arc::new(client)`. Все фоновые задачи берут `let client = (*self.client).clone()` и вызывают `login_arl` только при `!client.is_authenticated()` — никакого нового клиента + повторного логина на каждый трек. Если `get_stream_url` упал (истёк `TRACK_TOKEN` у трека Flow) — запрашивается свежий `get_track(&track.track_id)` и повторяется `get_stream_url` с фолбэком.
+4. **Очередь воспроизведения `PlaybackQueue` (v2.1).** Глобальная очередь треков: `n`/`p` (и `>`/`<`) листают очередь; `spawn_fetch_more_flow` автоподгружает бесконечный Flow при ≤3 треках, сбрасывая `loading_more_flow` по `BgEvent::FlowLoadFailed` (сетевая ошибка больше не оставляет флаг навсегда). Визуальный список Flow 1:1 с `flow_tracks` (обрезка `.take(15)` убрана); выбор активного трека — по позиции `track_id`, а не по индексу.
+5. **Gapless prefetch (v2.1, `prefetch.rs`).** За ~20 секунд до конца текущего трека `spawn_prefetch_next` скачивает и расшифровывает следующий трек (`DeezerStream::fetch` целиком) в `PrefetchSlot` (`Mutex` — единственный разделяемый мутабельный ресурс; стороны не блокируют друг друга). `fetch_streaming` (пребуфер 256 КБ + фоновая докачка) — только для интерактивного трека.
+6. **Tokio `worker_threads(4)` (v2.2).** Пул расширен 2→4: параллельно живут HTTP-запросы, потоковая докачка, prefetch и декодирование обложек.
 
 ## 4. Спецификация внутреннего API Deezer и криптографии Blowfish
 
@@ -134,6 +190,8 @@
    Для диапазона f_min = 50.0 Гц и f_max = 10000.0 Гц граничная частота i-го столбика вычисляется как:
    f[i] = f_min * (f_max / f_min).powf(i as f32 / num_bars as f32)
    Частоты переводятся в индексы бинов FFT: bin[i] = (f[i] * N as f32 / sample_rate as f32) as usize, а также применяется частотная эквализация (либо опциональное dB-масштабирование из cavacore 2026) для равномерного заполнения спектра.
+   **EQ-веса v2.2:** `eq = (norm_fft * freq_tilt) / bin_count.sqrt()` — RMS-нормализация по корню из числа бинов (вместо линейного деления, затухавшего ВЧ к нулю) и подъём СЧ/ВЧ `freq_tilt = (f_hi / 100.0).powf(0.55)`; `norm_fft = 4.0 / fft_size` (нормализация окна Ханна).
+   **Сбор магнитуд v2.2:** для узких полос (`hi - lo <= 1`, когда полоса ложится в один FFT-бин) берётся дробная линейная интерполяция между соседними бинами: `f_center` → `exact_bin = f_center * N / sample_rate`, `sum = spectrum[b0].norm() * (1 - frac) + spectrum[b0+1].norm() * frac`. Убирает «пары-близнецы» (одинаковые высоты соседних полос с пустыми провалами между ними). Для широких полос — сумма `c.norm()` по `[lo..hi]`.
 4. Фильтр пространственного сглаживания Monstercat:
    Для каждого столбика i соседние столбики j подтягиваются к локальным пикам:
    bars[i] = bars[i].max(bars[j] / 1.5_f32.powi((i as i32 - j as i32).abs()))
@@ -155,8 +213,8 @@
 - Основной текст: Rgb(236, 239, 244) (#ECEFF4), вторичный текст: Rgb(148, 163, 184) (#94A3B8).
 - Градиент спектра и активных элементов: линейная интерполяция от бирюзового Rgb(79, 209, 197) (#4FD1C5) до фиолетового Rgb(127, 90, 240) (#7F5AF0).
 
-### 6.2 Unified Shell Layout v2.0 (единый сквозной каркас)
-В отличие от v1.0, где каждая вкладка рисовала собственный плеер и собственный сайдбар, в v2.0 используется **единый сквозной каркас окна (`AppShell`)**:
+### 6.2 Unified Shell Layout v2.2 (единый сквозной каркас)
+В отличие от v1.0, где каждая вкладка рисовала собственный плеер и собственный сайдбар, в v2.0+ используется **единый сквозной каркас окна (`AppShell`)**:
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -165,35 +223,82 @@
 │ NAVIGATION   [S] │                                                                     │
 │                  │                                                                     │
 │  [1] Now Playing │                 АКТИВНЫЙ ЭКРАН (VIEWPORT)                          │
-│  [2] Search      │   • Экран 1: Большая обложка + Метаданные + Тех. параметры потока  │
-│  [3] Library     │   • Экран 2: Строка поиска (/ для ввода) + 3 колонки результатов   │
-│      ├─ Favorites│   • Экран 3: Таблица треков выбранного плейлиста + фильтр         │
-│      ├─ My Mix   │   • Экран 4: Deezer Flow (слева) + Синхронный Lyrics (справа)      │
-│      └─ Chill    │   • Экран 5: Настройки (ARL-токен, Качество FLAC/320/128, Спектр)  │
+│  [2] Search      │   • Экран 1: Обложка 500x500 (quad 2x2) + Метаданные + LYRICS [Y]  │
+│  [3] Library     │   • Экран 2: Строка поиска (/ для ввода) + таблица результатов      │
+│      ├─ Favorites│   • Экран 3: Плейлисты | треки (… ADDED … TIME), сортировка [o]/[r] │
+│      ├─ My Mix   │   • Экран 4: Бесконечный Flow (слева) + Live Lyrics (справа)       │
+│      └─ Chill    │   • Экран 5: Настройки (ARL, Качество FLAC/320/128, Спектр, dB)    │
 │  [4] Flow        │                                                                     │
 │  [5] Settings    │                                                                     │
 ├──────────────────┴─────────────────────────────────────────────────────────────────────┤
-│ 00:46 ━━━━━━━●───────────────── 03:44   [⏮ Prev] [⏸ Pause] [⏭ Next]   FLAC | 1411 kbps │
-│ ▁▂▃▅▇█▆▄▂▃▅▆█▇▅▃▂▁▂▄▆▇█▆▄▃▂▁▂▃▄▆▇▅▃▂▁▂▃▅▆▇▅▃▂▁  (Глобальный спектр, [V] вкл/выкл)      │
-│ [Space] Play/Pause  [n/p] Next/Prev  [←/→] Seek  [/] Search  [S] Sidebar  [V] Spectrum│
+│ 02:14 [←] ━━━━●─── [→] 03:02   [⏮ p] [⏸ Space] [⏭ n]   FLAC  Vol [-/+]: 100%          │
+│ ▁▂▃▅▇█▆▄▂▃▅▆█▇▅▃▂▁▂▄▆▇█▆▄▃▂▁▂▃▄▆▇▅▃▂▁  (Глобальный спектр, адаптивен по ширине, [v])  │
+│ q quit | 1-5 views | [/] search | [y] lyrics | [o/r] sort | [i] track info | ...       │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Ключевые UX-инварианты v2.0:
-1. **Глобальный плеер и спектр снизу:** Панель прогресса (`MM:SS / MM:SS`), кнопки управления (`⏮ ⏯ ⏭`), реальный битрейт (`FLAC 16-bit/44.1kHz | 1411 kbps`) и спектроанализатор отрисовываются на уровне `App` и доступны на **любой** вкладке.
-2. **Мгновенное управление воспроизведением:** Вне режима набора текста клавиши `Space` (Play/Pause), `n` (Next), `p` (Prev), `←`/`→` (Seek ± 5 с), `+`/`-` (Volume), `v` (Toggle Spectrum), `s` (Toggle Sidebar), `i` (Track Info Modal) работают **везде**.
-3. **Модальный фокус строки поиска:** На вкладке `[2] Search` ввод текста активируется клавишей `/` или `f` (и выключается по `Enter` или `Esc`). Когда ввод не активен, все хоткеи плеера (`Space`, `1`–`5`, `←`/`→`) работают штатно.
-4. **Двухпанельная навигация в Фонотеке (`[3] Library`):** Стрелки `←` / `→` (или `Tab`) переключают фокус между списком плейлистов и таблицей треков. При выборе плейлиста загружаются его треки через `playlist.getSongs`.
-
+### Ключевые UX-инварианты v2.2:
+1. **Глобальный плеер и спектр снизу:** Панель прогресса с **подсказками хоткеев** (`02:14 [←] ━━━━●─── [→] 03:02 [⏮ p] [⏸ Space] [⏭ n] FLAC Vol [-/+]: 100%`; в узкой строке — компактный `00:00/03:02 [⏮ p] ▶ [⏭ n]`), реальный битрейт (`FLAC 16-bit/44.1kHz | 1411 kbps`) и спектроанализатор отрисовываются на уровне `App` и доступны на **любой** вкладке. Нижняя строка: `q quit | 1-5 views | [/] search | [y] lyrics | [o/r] sort | [i] track info | [s] sidebar | [v] spectrum`.
+2. **Мгновенное управление воспроизведением:** Вне режима набора текста клавиши `Space` (Play/Pause), `n`/`>` (Next), `p`/`<` (Prev), `←`/`→` (Seek ± 5 с), `+`/`=`/`-` (Volume ±5 %), `v` (Toggle Spectrum), `s` (Toggle Sidebar), `i` (Track & Stream Info), `y` (Lyrics) работают **везде**.
+3. **Модальный фокус строки поиска:** На вкладке `[2] Search` ввод текста активируется клавишей `/` или `f` (и выключается по `Enter` — поиск — или `Esc`). Когда ввод не активен, все хоткеи плеера (`Space`, `1`–`5`, `←`/`→`) работают штатно.
+4. **Двухпанельная навигация в Фонотеке (`[3] Library`):** Стрелки `←`/`→`, `Tab` (`h` — плейлисты, `l` — треки) переключают фокус между списком плейлистов и таблицей треков. Сортировка: `o` (критерий Added/Title/Artist/Album по кругу), `r` (направление ▲/▼). `a` — модал CHOOSE PLAYLIST (добавить трек в плейлист).
+5. **Адаптивный спектр:** Число полос Cavacore = `div_ceil(area.width / 2).clamp(8, 160)`, пересоздание при ресайзе окна; `Spectrum::render` ресемплирует полосы и peak-holds ровно под ширину (`sample_slice`, `fit_bars = div_ceil(w/2).min(bars.len())`) — весь диапазон 50 Гц–10 кГц умещается в любое окно без обрезки справа.
 ### 6.3 Виджеты
-- Субсимвольный спектр (SpectrumWidget):
-  Использует массив символов [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']. Полная высота столбика в субпикселях равна (val * rows as f32 * 8.0) as usize. Целые клетки заполняются символом '█', верхушка — остатком от деления на 8, а выше удерживаемого пика ставится точка '▪'.
-- Рендерер обложек (CoverArtWidget):
-  По умолчанию рендерит пиксельную сетку из полублоков '▀', где fg равен RGB-цвету верхнего пикселя (x, 2*y), а bg — RGB-цвету нижнего пикселя (x, 2*y + 1), либо переключается на HD-протокол Kitty/Sixel через ratatui-image 11.1.0.
+- Субсимвольный спектр (`Spectrum` / SpectrumWidget):
+  Использует массив символов [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']. Полная высота столбика в субпикселях равна `(val * rows as f32 * 8.0) as usize`. Целые клетки заполняются символом '█', верхушка — остатком от деления на 8, а выше удержанного пика ставится точка '▪'. **v2.2:** доступные полосы = `div_ceil(area.width / 2)`, `sample_slice` ресемплирует входной массив cavacore-полос ровно под доступную ширину (peak-hold при ресемплинге), `fit_bars = div_ceil(w/2).min(bars.len())`.
+- Рендерер обложек (`CoverArtWidget`):
+  **Quad subpixel 2×2 (v2.2):** `QUADRANT_GLYPHS` — 16 глифов (все маски 4-бит fg/bg по квадрантам 2×2); `resized_quadrant` ресемплирует изображение под область, `best_quadrant_cell` выбирает глиф минимизацией 4-бит маски fg/bg и цвета (приоритет 0.95 — горизонтальный полублок '▀'-типа). 2× горизонтальное разрешение относительно classic half-block. Обложки 500×500 (клиент: `cover_big`→`cover_medium`→`cover`; MPRIS — 500×500).
+- Модальные окна (`widgets/modal.rs`):
+  `ChoosePlaylist` (добавление трека в плейлист) и `TrackInfoModal` (`[i]` Track & Stream Info: кодек, sample rate, битрейт, размер, режим — данные из `StreamTechInfo`).
 
-### 6.4 Экраны
-- Экран 01 (Now Playing): Большая обложка + метаданные + тех. параметры потока (Codec, Sample Rate, Bit Depth, Bitrate kbps, Stream Size MB).
-- Экран 02 (Search & Discover): Строка поиска (`/` для ввода) + 3 колонки результатов (ARTISTS, ALBUMS, TRACKS).
-- Экран 03 (Library & Overlays): Двухпанельный фокус — слева дерево плейлистов, справа таблица треков (#, ТРЕК, ИСПОЛНИТЕЛЬ, АЛЬБОМ, ВРЕМЯ, ♥) + фильтр. Попап CHOOSE PLAYLIST по клавише добавления.
-- Экран 04 (Flow & Live Lyrics): Слева обложка и управление Deezer Flow, справа блок LYRICS с автоскроллом по таймкоду и выделением текущей строки бирюзовым фоном (#4FD1C5) с тёмным текстом. При старте нового трека `lyrics` всегда очищается; для инструментальных треков — по центру статус "No synchronized lyrics available".
-- Экран 05 (Settings): Ввод/обновление ARL-токена со статусом подписки (`Deezer HiFi / Premium / Free / Guest`), выбор качества (`FLAC 1411 kbps`, `MP3 320 kbps`, `MP3 128 kbps`), переключатели `Show Spectrum` и `dB Scale`.
+## 6.4 Экраны (v2.2)
+- Экран 01 (Now Playing, `views/now_playing.rs`): Обложка 500×500 в quad 2×2 (высота `clamp(4, 26)` строк, ширина `min(26)` колонок) + метаданные (трек/исполнитель/альбом) + тех. параметры потока (Codec, Sample Rate, Bit Depth, Bitrate kbps, Stream Size MB) + панель LYRICS (автоскролл по таймкоду, подсветка текущей строки бирюзовым `#4FD1C5` с тёмным текстом; `y` — вкл/выкл).
+- Экран 02 (Search, `views/search.rs`): Строка поиска — модал ввода по `/` (или `f`), `Enter` — поиск, `Esc` — сброс фокуса. Результаты: таблица `SearchRow` (ARTIST / ALBUM / TRACK / TIME / ADDED / ♥) с колонкой `added: String` (дата добавления в Deezer, YYYY-MM-DD или "—").
+- Экран 03 (Library, `views/library.rs`): Двухпанельный фокус (плейлисты | таблица треков). Колонки: `#`, ТРЕК, ИСПОЛНИТЕЛЬ, АЛЬБОМ, **ADDED** (YYYY-MM-DD, `track.added`, ширина 12, виден при ширине ≥ 68), TIME, ♥. Заголовок `ADDED ▲/▼` на сортировке Default (по дате добавления); `o` — круг по критериям, `r` — направление. Модал CHOOSE PLAYLIST (`a`) — добавление текущего трека в выбранный плейлист.
+- Экран 04 (Flow & Live Lyrics, `views/flow_lyrics.rs`): Бесконечный Flow (автоподгрузка при ≤3 треках; обложка `min(14)` строк) + Live Lyrics справа (разделитель `│`), автоскролл, подсветка. При старте трека lyrics очищается; для инструментальных — по центру "No synchronized lyrics available".
+- Экран 05 (Settings, `views/settings.rs`): ARL-токен **inline** (`L` — перейти к вводу; статус `Deezer HiFi / Premium / Free / Guest`), качество (`FLAC 1411 kbps`, `MP3 320 kbps`, `MP3 128 kbps`), переключатели `Show Spectrum`, `dB Scale`, `Show Lyrics`, `Sidebar Collapsed`.
+
+## 7. MPRIS и конфигурация
+### 7.1 MPRIS (`src/mpris.rs`)
+- Транспорта: souvlaki 0.9.3 (use_zbus) поверх D-Bus, имя сервиса `org.mpris.MediaPlayer2.deezer_tui`.
+- Объявляет now-playing (метаданные + `cover_url` 500×500), положение/прогресс, громкость; обрабатывает аппаратные media-клавиши (Play/Pause/Next/Previous/Stop) и запросы `playerctl`.
+- Запускается через `Mpris::attach` (поток D-Bus) на старте App; при отсутствии D-Bus-сессион-шину приложение работает без него (feature-некритично).
+
+### 7.2 Конфигурация и окружение
+- Файл конфига: `~/.config/deezer-tui/config.toml` (serde + toml; создаётся при первом сохранении).
+  | Поле | Тип | Назначение |
+  | --- | --- | --- |
+  | `arl` | `Option<String>` | ARL-токен Deezer для HiFi guest-логина |
+  | `volume` | `f32` | Громкость 0.0–1.0 |
+  | `sample_rate_hz` | `f32` | Частота вывода (44100; FLAC ресэмплируется) |
+  | `preferred_quality` | `String` | `FLAC` / `MP3_320` / `MP3_128` |
+  | `show_spectrum` | `bool` | Спектр вкл/выкл |
+  | `show_lyrics` | `bool` | Панель lyrics вкл/выкл |
+  | `db_scale` | `bool` | dB-масштаб в спектре |
+  | `sidebar_collapsed` | `bool` | Сайдбар свёрнут |
+- Переменные окружения: `DEEZER_ARL` (перекрывает `arl` из файла), `DEEZER_TUI_LOG_DIR` (перекрывает каталог логов).
+- Лог: `~/.config/deezer-tui/deezer-tui.log` (tracing → tracing-appender daily rolling).
+
+## 8. Полная карта хоткеев (v2.2)
+| Клавиша | Действие |
+| --- | --- |
+| `1`–`5`, `F1`–`F5`, `Tab`/`Shift-Tab` | Вкладки Now Playing / Search / Library / Flow / Settings |
+| `Space` | Play/Pause (везде) |
+| `n`/`>`, `p`/`<` | Следующий/предыдущий трек в очереди |
+| `←`/`→` | Seek ∓5 с (везде, кроме Library-фокуса и Settings-строк) |
+| `+`/`=`, `-` | Громкость ±5 % |
+| `/`, `f` (на Search) | Фокус строки поиска; `Enter` — поиск, `Esc` — снять |
+| `y` | Toggle панели lyrics |
+| `s` | Toggle сайдбара навигации |
+| `v` | Toggle спектра |
+| `i` | Модал Track & Stream Info |
+| `o` / `r` (Library) | Сменить критерий сортировки / направление |
+| `h` / `l` (Library) | Фокус плейлисты / треки |
+| `a` (Library) | Модал CHOOSE PLAYLIST |
+| `L` | Перейти к ARL-вводу (Settings) |
+| `q` | Выход |
+| `Enter`, `Esc` | Play/подтвердить, закрыть/снять фокус |
+
+## 9. Что добавили v2.1/v2.2 (кратко)
+- **v2.1:** глобальная очередь воспроизведения (`PlaybackQueue`), бесконечный Flow + Live Lyrics, панель lyrics (`y`), `[i]` Track & Stream Info, поиск `/`/`f`, двухпанельная Library с сортировкой (`o`/`r`), `PrefetchedTrack`-кэш (`spawn_prefetch_next`), gapless prefetch, `fetch_streaming` (256 КБ prebuffer), `StreamTechInfo`.
+- **v2.2:** in-memory буфер `DeezerStream` (`Arc<RwLock<Vec<u8>>>` + `pos`), `playback_seq: Arc<AtomicU64>`, переиспользование сессии `self.client`, `BgEvent::FlowLoadFailed`, подсказки хоткеев в player bar, адаптивный спектр (`div_ceil(w/2).clamp(8,160)`, `sample_slice`), Cavacore-интерполяция узких полос + `eq=(norm_fft*freq_tilt)/bin_count.sqrt()`, `freq_tilt=(f_hi/100.0)^0.55`, колонка ADDED (Library, `width>=68`), `TrackData::formatted_date_add()` → YYYY-MM-DD, SearchRow + `added`, quad subpixel 2×2 (`QUADRANT_GLYPHS`, `resized_quadrant`, `best_quadrant_cell`), обложки 500×500, now_playing cover `clamp(4,26)`, flow_lyrics `min(14)`, tokio `worker_threads(4)`.
