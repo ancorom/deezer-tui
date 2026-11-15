@@ -1,5 +1,5 @@
-//! Экран 01 (Now Playing): обложка альбома, бейдж `FLAC | 1411 kbps`, название трека,
-//! артист, прогресс-бар с ползунком `●`, кнопки `[PAUSE] ⏮ ▶ ⏭ [FLOW]` и полноширинный спектр.
+//! Экран 01 (Now Playing): квадратная обложка (с учётом пропорций символов 2:1),
+//! метаданные трека, прогресс-бар и спектр на всю ширину экрана.
 
 use ratatui::prelude::*;
 
@@ -24,15 +24,18 @@ impl Default for NowPlaying {
 
 impl NowPlaying {
     pub fn default_screen() -> Self {
-        let mut spectrum = Spectrum::new(32);
-        spectrum.set_bars(&[
-            0.2, 0.35, 0.5, 0.7, 0.85, 0.6, 0.45, 0.75, 0.9, 0.65, 0.4, 0.55, 0.8, 0.5, 0.3, 0.45,
-            0.6, 0.75, 0.5, 0.35, 0.65, 0.85, 0.7, 0.5, 0.4, 0.6, 0.55, 0.35, 0.25, 0.4, 0.3, 0.2,
-        ]);
+        let mut spectrum = Spectrum::new(64);
+        let demo: Vec<f32> = (0..64)
+            .map(|i| {
+                let x = i as f32 / 64.0;
+                ((x * std::f32::consts::PI * 3.0).sin().abs() * 0.75 + 0.1).clamp(0.0, 1.0)
+            })
+            .collect();
+        spectrum.set_bars(&demo);
         Self {
             badge: "FLAC | 1411 kbps".into(),
-            track: "No track loaded".into(),
-            artist: "Deezer".into(),
+            track: "Press [Enter] on any track in [2]Search or [3]Library".into(),
+            artist: "Deezer TUI (Guest Preview & HiFi ARL ready)".into(),
             progress: 0.0,
             paused: true,
             cover: Some(CoverArt::solid(0x4F, 0xD1, 0xC5)),
@@ -58,7 +61,9 @@ impl NowPlaying {
             buf.set_string(x0 + x, y, "░", bar_style);
         }
         let col = Self::cursor_col(width, self.progress);
-        let fill_style = Style::default().fg(theme::gradient_color(1.0));
+        let fill_style = Style::default()
+            .fg(theme::gradient_color(1.0))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL));
         for x in 0..col {
             buf.set_string(x0 + x, y, "■", fill_style);
         }
@@ -72,13 +77,17 @@ impl NowPlaying {
         let y = area.y + row;
         let x0 = area.x;
         let play = if self.paused { "▶" } else { "❚❚" };
-        let style = Style::default().fg(theme::color_from_hex(theme::TEXT_PRIMARY));
+        let mode_lbl = if self.paused { "[PLAY]" } else { "[PAUSE]" };
+        let style = Style::default()
+            .fg(theme::color_from_hex(theme::TEXT_PRIMARY))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL));
         let accent = Style::default()
             .fg(theme::color_from_hex(theme::GRAD_START))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL))
             .bold();
 
         if width >= 32 {
-            let line = format!("[PAUSE]   ⏮   {play}   ⏭   [FLOW]");
+            let line = format!("{mode_lbl}   ⏮   {play}   ⏭   [FLOW]");
             let line_chars = line.chars().count() as u16;
             let start_x = x0 + width.saturating_sub(line_chars) / 2;
             buf.set_string(start_x, y, &line, accent);
@@ -93,14 +102,15 @@ impl NowPlaying {
     }
 
     fn draw_cover_and_meta(&self, buf: &mut Buffer, area: Rect, meta_h: u16, width: u16) {
-        let cover_side = meta_h.min(width.saturating_sub(12)).clamp(1, 24);
-        if cover_side > 0 && width > cover_side {
-            let cover_rect = Rect::new(area.x, area.y, cover_side, cover_side);
+        let cover_h = meta_h.min(width.saturating_sub(12) / 2).clamp(1, 16);
+        let cover_w = (cover_h * 2).min(width.saturating_sub(4)).max(1);
+        if width > cover_w {
+            let cover_rect = Rect::new(area.x, area.y, cover_w, cover_h);
             if let Some(ref cover_art) = self.cover {
                 cover_art.render(cover_rect, buf);
             }
         }
-        let rel_x = (cover_side + 2).min(width);
+        let rel_x = (cover_w + 3).min(width);
         let meta_x = area.x + rel_x;
         let meta_w = width.saturating_sub(rel_x);
         if meta_w > 0 {
@@ -125,11 +135,13 @@ impl NowPlaying {
         text: &str,
         is_dim: bool,
     ) {
-        let style = Style::default().fg(theme::color_from_hex(if is_dim {
-            theme::TEXT_SECONDARY
-        } else {
-            theme::TEXT_PRIMARY
-        }));
+        let style = Style::default()
+            .fg(theme::color_from_hex(if is_dim {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_PRIMARY
+            }))
+            .bg(theme::color_from_hex(theme::BG_TERMINAL));
         let truncated: String = text.chars().take(width as usize).collect();
         buf.set_string(x0, y, truncated.as_str(), style);
     }

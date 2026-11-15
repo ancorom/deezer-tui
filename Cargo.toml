@@ -24,7 +24,7 @@ num-complex = "0.4"
 
 # Сеть, асинхронность и криптография Deezer
 tokio = { version = "1.54", features = ["full"] }
-reqwest = { version = "0.13.5", features = ["json", "stream", "cookies"] }
+reqwest = { version = "0.13.5", features = ["json", "stream", "cookies", "query"] }
 blowfish = "0.9"
 cbc = { version = "0.1", features = ["std"] }
 cipher = "0.4"

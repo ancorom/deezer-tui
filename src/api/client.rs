@@ -1,6 +1,6 @@
-//! Клиент Deezer API на базе `reqwest` 0.13: авторизация по куке `arl` в `gw-light.php`
-//! (`deezer.getUserData`), получение URL потока в `media.deezer.com/v1/get_url`,
-//! методы поиска, плейлистов, лайков, Flow и Lyrics.
+//! Клиент Deezer API на базе `reqwest` 0.13:
+//! - Полный режим по куке `arl` через `gw-light.php` + `media.deezer.com/v1/get_url` (FLAC/MP3_320);
+//! - Гостевой режим (`GUEST`) через публичный `api.deezer.com` (поиск, чарты, обложки и 30с MP3-превью).
 
 #![allow(dead_code)]
 
@@ -17,20 +17,17 @@ use super::models::{
 const GW_LIGHT_URL: &str = "https://www.deezer.com/ajax/gw-light.php";
 const DEEZER_URL: &str = "https://www.deezer.com";
 const MEDIA_URL: &str = "https://media.deezer.com/v1/get_url";
+const PUBLIC_API_URL: &str = "https://api.deezer.com";
 
-/// Сессия Deezer после `deezer.getUserData`.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// Токен `checkForm` для вызовов `gw-light.php`.
     pub api_token: String,
-    /// Лицензионный токен для `media.deezer.com/v1/get_url`.
     pub license_token: String,
-    /// ID пользователя.
     pub user_id: String,
     pub user_name: String,
 }
 
-/// Асинхронный клиент внутреннего API Deezer.
+#[derive(Clone)]
 pub struct DeezerClient {
     pub(crate) http: Client,
     pub(crate) cookie_jar: Arc<Jar>,
@@ -38,7 +35,6 @@ pub struct DeezerClient {
 }
 
 impl DeezerClient {
-    /// Создаёт новый HTTP-клиент с хранилищем кук.
     pub fn new() -> Result<Self, DeezerError> {
         let cookie_jar = Arc::new(Jar::default());
 
@@ -59,17 +55,14 @@ impl DeezerClient {
         })
     }
 
-    /// Возвращает ссылку на внутренний `reqwest::Client`.
     pub fn http(&self) -> &Client {
         &self.http
     }
 
-    /// Проверяет, пройдена ли аутентификация.
     pub fn is_authenticated(&self) -> bool {
         self.session.is_some()
     }
 
-    /// Возвращает текущую сессию.
     pub fn session(&self) -> Option<&Session> {
         self.session.as_ref()
     }
@@ -107,7 +100,9 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse user data: {e}")))?;
 
         if user_data.user.user_id == "0" || user_data.api_token.is_empty() {
-            return Err(DeezerError::Auth("Invalid or expired ARL token".into()));
+            return Err(DeezerError::Auth(
+                "ARL-токен недействителен или устарел (USER_ID == 0)".into(),
+            ));
         }
 
         let session = Session {
@@ -136,8 +131,6 @@ impl DeezerClient {
         let api_token = self.api_token()?;
         let url =
             format!("{GW_LIGHT_URL}?method={method}&input=3&api_version=1.0&api_token={api_token}");
-
-        debug!(method, "Gateway API call");
 
         let resp = self
             .http
@@ -173,8 +166,117 @@ impl DeezerClient {
         Ok(())
     }
 
-    /// Поиск треков через `deezer.pageSearch`.
+    /// Парсинг массива треков из публичного API `https://api.deezer.com`.
+    fn parse_public_tracks(arr: &[serde_json::Value]) -> Vec<TrackData> {
+        arr.iter()
+            .filter_map(|item| {
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_u64().map(|n| n.to_string()))?;
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let artist = item
+                    .get("artist")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let album = item
+                    .get("album")
+                    .and_then(|a| a.get("title"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let cover_url_direct = item
+                    .get("album")
+                    .and_then(|a| a.get("cover_medium").or_else(|| a.get("cover")))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let duration_secs = item.get("duration").and_then(|v| v.as_u64()).unwrap_or(30);
+                let preview_url = item
+                    .get("preview")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
+                Some(TrackData {
+                    track_id: id,
+                    title,
+                    artist,
+                    album,
+                    duration: format!("{}:{:02}", duration_secs / 60, duration_secs % 60),
+                    album_picture: String::new(),
+                    track_token: None,
+                    md5_origin: String::new(),
+                    nb_listen: 0,
+                    explicit_lyrics: item
+                        .get("explicit_lyrics")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    fallback: None,
+                    preview_url,
+                    cover_url_direct,
+                })
+            })
+            .collect()
+    }
+
+    /// Публичный поиск треков без авторизации (`https://api.deezer.com/search`).
+    pub async fn search_public(&self, query: &str) -> Result<SearchResults, DeezerError> {
+        let resp = self
+            .http
+            .get(format!("{PUBLIC_API_URL}/search"))
+            .query(&[("q", query), ("limit", "40")])
+            .send()
+            .await
+            .map_err(|e| DeezerError::Http(e.to_string()))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| DeezerError::Http(e.to_string()))?;
+
+        let arr = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| DeezerError::Api("Missing 'data' in public search".into()))?;
+
+        let data = Self::parse_public_tracks(arr);
+        let total = data.len() as u64;
+        Ok(SearchResults { data, total })
+    }
+
+    /// Публичный топ-чарт Deezer для заполнения экранов в режиме `GUEST`.
+    pub async fn get_public_chart(&self) -> Result<Vec<TrackData>, DeezerError> {
+        let resp = self
+            .http
+            .get(format!("{PUBLIC_API_URL}/chart/0/tracks?limit=30"))
+            .send()
+            .await
+            .map_err(|e| DeezerError::Http(e.to_string()))?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| DeezerError::Http(e.to_string()))?;
+
+        let arr = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| DeezerError::Api("Missing 'data' in public chart".into()))?;
+
+        Ok(Self::parse_public_tracks(arr))
+    }
+
+    /// Поиск треков: использует `gw-light.php` при наличии сессии, иначе публичный API Deezer.
     pub async fn search(&self, query: &str) -> Result<SearchResults, DeezerError> {
+        if !self.is_authenticated() {
+            return self.search_public(query).await;
+        }
+
         let params = json!({
             "query": query,
             "filter": "ALL",
@@ -202,7 +304,6 @@ impl DeezerClient {
         Ok(SearchResults { data, total })
     }
 
-    /// Получение избранных треков (`favorite_song.getList`).
     pub async fn get_favorites(&self) -> Result<Vec<TrackData>, DeezerError> {
         let session = self
             .session
@@ -222,19 +323,16 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse favorites: {e}")))
     }
 
-    /// Добавление трека в избранное (`favorite_song.add`).
     pub async fn add_favorite(&self, song_id: &str) -> Result<(), DeezerError> {
         let params = json!({ "SNG_ID": song_id });
         self.gw_call_void("favorite_song.add", params).await
     }
 
-    /// Удаление трека из избранного (`favorite_song.remove`).
     pub async fn remove_favorite(&self, song_id: &str) -> Result<(), DeezerError> {
         let params = json!({ "SNG_ID": song_id });
         self.gw_call_void("favorite_song.remove", params).await
     }
 
-    /// Получение списка плейлистов пользователя (`deezer.pageProfile`).
     pub async fn get_playlists(&self) -> Result<Vec<PlaylistData>, DeezerError> {
         let session = self
             .session
@@ -259,7 +357,6 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse playlists: {e}")))
     }
 
-    /// Добавление треков в плейлист (`playlist.addSongs`).
     pub async fn add_to_playlist(
         &self,
         playlist_id: &str,
@@ -273,7 +370,6 @@ impl DeezerClient {
         self.gw_call_void("playlist.addSongs", params).await
     }
 
-    /// Создание нового плейлиста (`playlist.create`).
     pub async fn create_playlist(&self, title: &str) -> Result<String, DeezerError> {
         let session = self
             .session
@@ -298,7 +394,6 @@ impl DeezerClient {
         Ok(playlist_id)
     }
 
-    /// Удаление треков из плейлиста (`playlist.deleteSongs`).
     pub async fn remove_from_playlist(
         &self,
         playlist_id: &str,
@@ -312,7 +407,6 @@ impl DeezerClient {
         self.gw_call_void("playlist.deleteSongs", params).await
     }
 
-    /// Получение метаданных трека (`song.getData`).
     pub async fn get_track(&self, song_id: &str) -> Result<TrackData, DeezerError> {
         let params = json!({ "SNG_ID": song_id, "sng_id": song_id });
         let results = self.gw_call("song.getData", params).await?;
@@ -321,8 +415,10 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse track data: {e}")))
     }
 
-    /// Получение очереди Deezer Flow (`radio.getUserRadio`).
     pub async fn get_flow(&self) -> Result<Vec<TrackData>, DeezerError> {
+        if !self.is_authenticated() {
+            return self.get_public_chart().await;
+        }
         let session = self
             .session
             .as_ref()
@@ -339,7 +435,6 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse flow: {e}")))
     }
 
-    /// Получение текста песни и синхронизированных таймкодов (`song.getLyrics`).
     pub async fn get_lyrics(&self, track_id: &str) -> Result<Lyrics, DeezerError> {
         let session = self
             .session
@@ -394,7 +489,6 @@ impl DeezerClient {
         Ok(Lyrics { plain, synced })
     }
 
-    /// Получение прямой ссылки на зашифрованный поток (`media.deezer.com/v1/get_url`).
     pub async fn get_stream_url(
         &self,
         track: &TrackData,
@@ -412,8 +506,6 @@ impl DeezerClient {
 
         for q in quality.all_fallbacks() {
             let fmt = q.as_api_format();
-            debug!(quality = fmt, track_id = %track.track_id, "Requesting stream URL");
-
             let payload = json!({
                 "license_token": session.license_token,
                 "media": [{

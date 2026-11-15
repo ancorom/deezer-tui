@@ -1,6 +1,5 @@
-//! Экран 04 (Flow & Live Lyrics): обложка и управление Deezer Flow слева,
-//! синхронная прокрутка `LYRICS` с бирюзовой подсветкой (`#4FD1C5`) активной строки справа,
-//! и полноширинный спектр снизу.
+//! Экран 04 (Flow & Live Lyrics): квадратная обложка 2:1, управление Flow,
+//! синхронная прокрутка `LYRICS` и полноширинный спектр снизу.
 
 use ratatui::prelude::*;
 
@@ -32,10 +31,14 @@ impl Default for FlowLyrics {
 
 impl FlowLyrics {
     pub fn new() -> Self {
-        let mut spectrum = Spectrum::new(16);
-        spectrum.set_bars(&[
-            0.6, 0.8, 0.5, 0.9, 0.7, 0.4, 0.75, 0.85, 0.65, 0.5, 0.8, 0.6, 0.45, 0.7, 0.55, 0.4,
-        ]);
+        let mut spectrum = Spectrum::new(64);
+        let demo: Vec<f32> = (0..64)
+            .map(|i| {
+                let x = i as f32 / 64.0;
+                ((x * std::f32::consts::PI * 4.0).sin().abs() * 0.7 + 0.15).clamp(0.0, 1.0)
+            })
+            .collect();
+        spectrum.set_bars(&demo);
         Self {
             flow: vec![
                 FlowRow {
@@ -77,7 +80,6 @@ impl FlowLyrics {
         }
     }
 
-    /// Индекс активной строки текста по текущему таймкоду `position_ms`.
     pub fn active_lyric_index(&self) -> usize {
         let mut idx = 0;
         for (i, line) in self.lyrics.iter().enumerate() {
@@ -98,7 +100,7 @@ impl Widget for &FlowLyrics {
         if w < 3 || h < 3 {
             return;
         }
-        let spec_h = (h / 5).max(4).min(h.saturating_sub(2));
+        let spec_h = (h / 4).max(4).min(h.saturating_sub(2));
         let body_h = h.saturating_sub(spec_h);
         let body_end_y = area.y + body_h;
 
@@ -146,14 +148,15 @@ impl FlowLyrics {
         }
         let y_start = area.y + 1;
         let body_rows = row_end.saturating_sub(y_start);
-        let cover_side = width.min(body_rows.saturating_sub(3)).min(16);
+        let cover_h = body_rows.saturating_sub(4).min(width / 2).min(12);
+        let cover_w = (cover_h * 2).min(width);
         let mut y_cursor = y_start;
 
-        if cover_side >= 2 {
+        if cover_h >= 2 {
             if let Some(cover) = &self.cover {
-                cover.render(Rect::new(x, y_cursor, cover_side, cover_side), buf);
+                cover.render(Rect::new(x, y_cursor, cover_w, cover_h), buf);
             }
-            y_cursor += cover_side;
+            y_cursor += cover_h;
         }
 
         let y_ctrl = y_cursor;
@@ -161,7 +164,7 @@ impl FlowLyrics {
             let play = if self.paused { "▶" } else { "❚❚" };
             let label = format!("⏮  {play}  ⏭");
             let label_w = label.chars().count();
-            let w = width as usize;
+            let w = cover_w.max(width.min(24)) as usize;
             let cx = if label_w < w {
                 x + ((w - label_w) / 2) as u16
             } else {
@@ -318,15 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_in_narrow_size() {
-        let screen = FlowLyrics::new();
-        let terminal = render(&screen, 40, 12);
-        assert!(row_has(&terminal, 0, "FLOW"));
-        assert!((1..12).any(|y| row_has(&terminal, y, "DEEZER FLOW")));
-        assert!((2..12).any(|y| row_has(&terminal, y, "this the real")));
-    }
-
-    #[test]
     fn active_lyric_line_has_turquoise_background() {
         let screen = FlowLyrics::new();
         let terminal = render(&screen, 120, 40);
@@ -342,6 +336,14 @@ mod tests {
             }
         }
         assert!(found);
+    }
+    #[test]
+    fn renders_in_narrow_size() {
+        let screen = FlowLyrics::new();
+        let terminal = render(&screen, 40, 12);
+        assert!(row_has(&terminal, 0, "FLOW"));
+        assert!((1..12).any(|y| row_has(&terminal, y, "DEEZER FLOW")));
+        assert!((2..12).any(|y| row_has(&terminal, y, "this the real")));
     }
 
     #[test]

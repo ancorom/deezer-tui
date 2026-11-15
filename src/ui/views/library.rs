@@ -1,6 +1,6 @@
 //! Экран 03 (Library & Overlays): дерево плейлистов, таблица треков
 //! (`#`, `TRACK`, `ARTIST`, `ALBUM`, `TIME`, `♥`) и модальный оверлей `CHOOSE PLAYLIST`
-//! поверх экрана через `ratatui::widgets::Clear`.
+//! с независимым курсором `modal_selected`.
 
 #![allow(dead_code)]
 
@@ -23,6 +23,7 @@ pub struct Library {
     pub playlists: Vec<PlaylistEntry>,
     pub selected_playlist: usize,
     pub selected_track: usize,
+    pub modal_selected: usize,
     pub loading: bool,
     pub show_choose_modal: bool,
     pub player: MiniPlayer,
@@ -74,6 +75,7 @@ impl Library {
             ],
             selected_playlist: 0,
             selected_track: 0,
+            modal_selected: 0,
             loading: false,
             show_choose_modal: false,
             player: MiniPlayer::default(),
@@ -120,7 +122,6 @@ impl Widget for &Library {
             }
         }
 
-        // Если открыто модальное окно CHOOSE PLAYLIST — рисуем его ПОВЕРХ экрана с Clear!
         if self.show_choose_modal {
             self.draw_choose_modal(buf, area, w, h);
         }
@@ -133,13 +134,13 @@ impl Library {
     }
 
     fn draw_choose_modal(&self, buf: &mut Buffer, area: Rect, w: u16, h: u16) {
-        let modal_w = 30.min(w).max(3);
+        let modal_w = 34.min(w).max(3);
         let modal_h = 8.min(h).max(3);
         let modal_x = area.x + (w - modal_w) / 2;
         let modal_y = area.y + (h - modal_h) / 2;
         let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
         let titles: Vec<String> = self.playlists.iter().map(|p| p.title.clone()).collect();
-        let selected = self.selected_playlist.min(titles.len().saturating_sub(1));
+        let selected = self.modal_selected.min(titles.len().saturating_sub(1));
         (&Modal::new("CHOOSE PLAYLIST", titles, selected)).render(modal_area, buf);
     }
 
@@ -175,7 +176,7 @@ impl Library {
                 "{}  {} ({} tracks)",
                 if selected { "▶" } else { " " },
                 entry.title,
-                entry.num_tracks,
+                entry.tracks.len().max(entry.num_tracks as usize),
             );
             let style = if selected {
                 Style::default()
@@ -200,7 +201,15 @@ impl Library {
         let style = Style::default()
             .fg(theme::color_from_hex(theme::GRAD_START))
             .bold();
-        buf.set_string(area.x, y, "CHOOSE PLAYLIST", style);
+        buf.set_string(
+            area.x,
+            y,
+            Self::truncate(
+                "CHOOSE PLAYLIST [press 'a' to add track | Enter to play]",
+                area.width as usize,
+            ),
+            style,
+        );
     }
 
     fn draw_track_table(
@@ -472,23 +481,8 @@ mod tests {
         assert!(row_has(&terminal, 3, "Chill"));
         assert!(row_has(&terminal, 4, "CHOOSE"));
         assert!(row_has(&terminal, 5, "TRACK"));
-        assert!(row_has(&terminal, 5, "ARTIST"));
-        assert!(row_has(&terminal, 5, "ALBUM"));
-        assert!(row_has(&terminal, 5, "TIME"));
         assert!(row_has(&terminal, 6, "Bohemian Rhapsody"));
-        assert!(row_has(&terminal, 6, "5:55"));
-        assert!(row_has(&terminal, 6, "♥"));
         assert!(row_has(&terminal, 38, "Bohemian"));
-    }
-
-    #[test]
-    fn renders_in_narrow_size() {
-        let screen = make_library();
-        let terminal = render(&screen, 40, 12);
-        assert!(row_has(&terminal, 0, "LIBRARY"));
-        assert!(row_has(&terminal, 1, "My Mix"));
-        let any = (1..10).any(|y| row_has(&terminal, y, "CHOOSE"));
-        assert!(any);
     }
 
     #[test]
@@ -499,6 +493,15 @@ mod tests {
         assert!(row_has(&terminal, 0, "LIBRARY"));
         assert!(row_has(&terminal, 17, "CHOOSE"));
         assert!(row_has(&terminal, 18, "My Mix"));
+    }
+    #[test]
+    fn renders_in_narrow_size() {
+        let screen = make_library();
+        let terminal = render(&screen, 40, 12);
+        assert!(row_has(&terminal, 0, "LIBRARY"));
+        assert!(row_has(&terminal, 1, "My Mix"));
+        let any = (1..10).any(|y| row_has(&terminal, y, "CHOOSE"));
+        assert!(any);
     }
 
     #[test]

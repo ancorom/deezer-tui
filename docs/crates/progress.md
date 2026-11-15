@@ -41,5 +41,17 @@
 - [x] `src/main.rs` — `App::with_config(cfg)` (было `App::new()` — конфиг не влиял на приложение).
 - [x] Гейт: `cargo check --all-targets` + `cargo test` **84/84** (85 → 84: stream 5→3, +1 search-тест) + `cargo clippy -- -D warnings` exit 0 + `cargo clippy --all-targets -- -D warnings` exit 0, 0 test-build warnings.
 
+## Gemini review round 2 (7_arl_guest.md + 8_ui.md) [x]
+- [x] `src/api/models.rs` — `TrackData` +`preview_url`/`cover_url_direct` (`skip`), `formatted_duration()`/`duration_secs()`, `Default` derive; `AudioQuality`-метки `MP3 | 64 kbps`/`FLAC | 1411 kbps`. 4/4.
+- [x] `src/api/client.rs` — `search_public`/`get_public_chart` (публичный `api.deezer.com`, `?q=&limit=40`), `get_lyrics` (fallback `line`/`milliseconds`), `get_stream_url` через `media.deezer.com/v1/get_url` с фолбэком качества, `search`/`get_flow` гостевые fallback-и. 5/5.
+- [x] `src/ui/widgets/cover_art.rs` — `from_bytes(&[u8])` (JPEG из CDN через `ImageReader`), half-block render. 5/5 (3 старых перенесены).
+- [x] `src/ui/views/now_playing.rs` — квадратная обложка 2:1, прогресс-бар, спектр на всю ширину. 2/2.
+- [x] `src/ui/views/library.rs` — `modal_selected`, `a`/`p`-модалка, `draw_mini_player`. 4/4 (2 перенесены).
+- [x] `src/ui/views/flow_lyrics.rs` — квадратная обложка 2:1, спектр на всю ширину. 5/5 (3 перенесены).
+- [x] `src/ui/app.rs` — полный rewrite: `BgEvent` + tokio multi-thread runtime `rt`, `spawn_initial_load` (login ARL → else публичный чарт), `poll_bg_events`, `start_track_playback` (create_rings→cpal `AudioOutput` + поток Symphonia/демо-синтезатор), `step_dsp` (60 FPS: vis-ring→Cavacore→3 спектра), `trigger_search`, ARL-модалка (L), F1–F4/Tab, live-ввод Search, `loop_` с подгонкой числа баров под ширину. 4/4 (1 перенесён: `renders_on_narrow_terminal`; +`modal_navigation_is_independent_of_library_table`).
+- [x] `Cargo.toml` — reqwest +`"query"` feature (`.query(&[…])` в `search_public`).
+- [x] 3 clippy: `large_enum_variant` на `BgEvent` (allow), identical if/else в render → прямой `(&self.now_playing).render`, collapsible `KeyCode::Char` guard в ARL-модалке.
+- [x] Гейт: `cargo check --all-targets` + `cargo test` **85/85** (84→85: app +1) + `cargo clippy -- -D warnings` exit 0 + `cargo clippy --all-targets -- -D warnings` exit 0, 0 test-build warnings.
+
 ## Status
-Все 6 файлов Gemini review применены. Phase 5 + audit + gemini-review: done. cargo test 84 passed; cargo clippy -- -D warnings = clean, exit 0; 0 warning в test-сборке.
+Все 8 файлов Gemini review (2 раунда) применены. Phase 5 + audit + gemini-review r1 + r2: done. cargo test 85 passed; cargo clippy -- -D warnings = clean, exit 0; 0 warning в test-сборке.

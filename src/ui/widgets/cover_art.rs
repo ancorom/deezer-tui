@@ -1,57 +1,61 @@
+use std::io::Cursor;
 use std::path::Path;
 
 use image::{self, imageops, DynamicImage, RgbaImage};
 use ratatui::prelude::*;
 use ratatui::style::{Color, Style};
 
-/// The glyph used to draw the cover: a black upper half block. One cell covers
-/// two vertical pixels — the foreground colour is painted on the top half and
-/// the background colour on the bottom half.
 #[allow(dead_code)]
 const HALF_BLOCK: char = '\u{2580}';
 
-/// Renders a cover image using half-blocks.
-///
-/// Each character cell is drawn as the top half-block `'▀'`: the foreground
-/// colour is the top pixel and the background colour is the bottom pixel of the
-/// 2-pixel-tall block. On every render the source image is resized to fill the
-/// cell area (width = `area.width`, height = `2 * area.height`), so the widget
-/// is always in the correct aspect ratio for the layout that hosts it.
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct CoverArt {
-    /// The cover image to draw; resized to the cell area each frame.
     img: DynamicImage,
 }
 
+impl std::fmt::Debug for CoverArt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CoverArt({}x{})", self.img.width(), self.img.height())
+    }
+}
+
 impl CoverArt {
-    /// Load a cover image from a file path.
+    /// Загружает обложку из файла на диске через `image::ImageReader`.
     #[allow(dead_code)]
     pub fn new(path: impl AsRef<Path>) -> image::ImageResult<Self> {
         let img: DynamicImage = image::ImageReader::open(path)?.decode()?;
         Ok(Self { img })
     }
 
-    /// Build a cover from an already-decoded RGBA image (convenient for tests).
-    #[allow(dead_code)]
-    pub fn from_image(img: RgbaImage) -> Self {
-        Self { img: DynamicImage::from(img) }
+    /// Декодирует JPEG/PNG обложку из буфера памяти через `image::ImageReader`.
+    pub fn from_bytes(bytes: &[u8]) -> image::ImageResult<Self> {
+        let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+        let img = reader.decode()?;
+        Ok(Self { img })
     }
 
-    /// A solid-colour cover (convenient for tests).
-    #[allow(dead_code)]
+    pub fn from_image(img: RgbaImage) -> Self {
+        Self {
+            img: DynamicImage::from(img),
+        }
+    }
+
+    /// Генерирует стильную градиентную обложку-плейсхолдер до загрузки реального JPEG.
     pub fn solid(r: u8, g: u8, b: u8) -> Self {
-        let mut rgba = RgbaImage::new(8, 8);
-        for y in 0..8 {
-            for x in 0..8 {
-                rgba[(x, y)] = image::Rgba([r, g, b, 255u8]);
+        let mut rgba = RgbaImage::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                let mix = ((x + y) as f32) / 30.0;
+                let nr = (r as f32 * (1.0 - mix * 0.4) + 127.0 * (mix * 0.4)) as u8;
+                let ng = (g as f32 * (1.0 - mix * 0.5) + 90.0 * (mix * 0.5)) as u8;
+                let nb = (b as f32 * (1.0 - mix * 0.3) + 240.0 * (mix * 0.3)) as u8;
+                rgba[(x, y)] = image::Rgba([nr, ng, nb, 255u8]);
             }
         }
         Self::from_image(rgba)
     }
 
-    /// Resize the stored image to the half-block cell area.
     fn resized_for(&self, w: u32, h: u32) -> RgbaImage {
-        // A half-block cell is 1 pixel wide and 2 pixels tall.
         let pw = w.max(1);
         let ph = (h * 2).max(1);
         self.img
@@ -90,7 +94,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
 
-    /// Build a `Terminal<TestBackend>` from a cover rendered into the whole area.
     fn render_terminal(cover: &CoverArt, w: u16, h: u16) -> Terminal<TestBackend> {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -102,7 +105,6 @@ mod tests {
         terminal
     }
 
-    /// Read the symbol and colours at (x, y) of a terminal's buffer.
     fn cell_info(
         terminal: &Terminal<TestBackend>,
         x: u16,
@@ -112,11 +114,7 @@ mod tests {
         let cell = buf.cell((x, y)).unwrap();
         let style = cell.style();
         (
-            cell
-                .symbol()
-                .chars()
-                .next()
-                .unwrap_or(' '),
+            cell.symbol().chars().next().unwrap_or(' '),
             style.fg,
             style.bg,
         )
@@ -135,7 +133,6 @@ mod tests {
     #[test]
     fn top_and_bottom_pixels_drive_fg_bg() {
         let mut img = RgbaImage::new(1, 2);
-        // top pixel: red, bottom pixel: blue.
         img[(0, 0)] = image::Rgba([255u8, 0, 0, 255]);
         img[(0, 1)] = image::Rgba([0, 0, 255u8, 255]);
         let cover = CoverArt::from_image(img);
@@ -145,7 +142,6 @@ mod tests {
         assert_eq!(fg, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(bg, Some(Color::Rgb(0, 0, 255)));
     }
-
     #[test]
     fn two_columns_two_rows() {
         // 2-wide x 2-tall pixel image with a distinct colour per pixel:
