@@ -265,7 +265,7 @@
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Ключевые UX-инварианты v2.2:
+### Ключевые UX-инварианты v2.3:
 1. **Глобальный плеер и спектр снизу:** Панель прогресса с **подсказками хоткеев** (`02:14 [←] ━━━━●─── [→] 03:02 [⏮ p] [⏸ Space] [⏭ n] FLAC Vol [-/+]: 100%`; в узкой строке — компактный `00:00/03:02 [⏮ p] ▶ [⏭ n]`), реальный битрейт (`FLAC 16-bit/44.1kHz | 1411 kbps`) и спектроанализатор отрисовываются на уровне `App` и доступны на **любой** вкладке. Нижняя строка: `q quit | 1-5 views | [/] search | [y] lyrics | [m] track menu | [f] flow modes | [o/r] sort | [i] info | [s] sidebar | [v] spectrum`.
 2. **Мгновенное управление воспроизведением:** Вне режима набора текста клавиши `Space` (Play/Pause), `n`/`>` (Next), `p`/`<` (Prev), `←`/`→` (Seek ± 5 с), `+`/`=`/`-` (Volume ±5 %), `v` (Toggle Spectrum), `s` (Toggle Sidebar), `i` (Track & Stream Info), `y` (Lyrics) работают **везде**.
 3. **Модальный фокус строки поиска:** На вкладке `[2] Search` ввод текста активируется клавишей `/` или `f` (и выключается по `Enter` — поиск — или `Esc`). Когда ввод не активен, все хоткеи плеера (`Space`, `1`–`5`, `←`/`→`) работают штатно.
@@ -279,7 +279,7 @@
 - Модальные окна (`widgets/modal.rs`):
   `ChoosePlaylist` (добавление трека в плейлист), `TrackInfoModal` (`[i]` Track & Stream Info: кодек, sample rate, битрейт, размер, режим — данные из `StreamTechInfo`). **Track Menu (v2.3, `m`/`M`)** — 5 пунктов: ❤️/💔 favorite (динамический статус), ➕ добавить в плейлист, 📻 Song Radio (`radio.getSongRadio` → очередь), ℹ️ информация, Esc. **Flow Modes (v2.3, `f`/`g`)** — My Flow / 7 настроений / 10 жанров. **Toast (v2.3):** разовое уведомление в статусной строке, 3 с, градиентный фон.
 
-## 6.4 Экраны (v2.2)
+## 6.4 Экраны (v2.3)
 - Экран 01 (Now Playing, `views/now_playing.rs`): Обложка 500×500, TrueColor 1:1-пиксели (высота `clamp(4, 26)` строк, ширина `min(26)` колонок) + метаданные (трек/исполнитель/альбом) + тех. параметры потока (Codec, Sample Rate, Bit Depth, Bitrate kbps, Stream Size MB) + панель LYRICS (автоскролл по таймкоду, подсветка текущей строки бирюзовым `#4FD1C5` с тёмным текстом; `y` — вкл/выкл).
 - Экран 02 (Search, `views/search.rs`): Строка поиска — модал ввода по `/` (или `f`), `Enter` — поиск, `Esc` — сброс фокуса. Результаты: таблица `SearchRow` (ARTIST / ALBUM / TRACK / TIME / ADDED / ♥) с колонкой `added: String` (дата добавления в Deezer, YYYY-MM-DD или "—"). Track Menu (`m`) — по выделенной строке.
 - Экран 03 (Library, `views/library.rs`): Двухпанельный фокус (плейлисты | таблица треков). Колонки: `#`, ТРЕК, ИСПОЛНИТЕЛЬ, АЛЬБОМ, **ADDED** (YYYY-MM-DD, `track.added`, ширина 12, виден при ширине ≥ 68), TIME, ♥. Заголовок `ADDED ▲/▼` на сортировке Default (по дате добавления); `o` — круг по критериям, `r` — направление. Модал CHOOSE PLAYLIST (`a`) — добавление текущего трека в выбранный плейлист.
@@ -329,7 +329,7 @@
 | `q` | Выход |
 | `Enter`, `Esc` | Play/подтвердить, закрыть/снять фокус |
 
-## 9. Что добавили v2.1/v2.2 (кратко)
+## 9. Что добавили v2.1/v2.2/v2.3 (кратко)
 - **v2.1:** глобальная очередь воспроизведения (`PlaybackQueue`), бесконечный Flow + Live Lyrics, панель lyrics (`y`), `[i]` Track & Stream Info, поиск `/`/`f`, двухпанельная Library с сортировкой (`o`/`r`), `PrefetchedTrack`-кэш (`spawn_prefetch_next`), gapless prefetch, `fetch_streaming` (256 КБ prebuffer), `StreamTechInfo`.
 - **v2.2:** in-memory буфер `DeezerStream` (`Arc<RwLock<Vec<u8>>>` + `pos`), `playback_seq: Arc<AtomicU64>`, переиспользование сессии `self.client`, `BgEvent::FlowLoadFailed`, подсказки хоткеев в player bar, адаптивный спектр (`div_ceil(w/2).clamp(8,160)`, `sample_slice`), Cavacore-интерполяция узких полос + `eq=(norm_fft*freq_tilt)/bin_count.sqrt()`, `freq_tilt=(f_hi/100.0)^0.55`, колонка ADDED (Library, `width>=68`), `TrackData::formatted_date_add()` → YYYY-MM-DD, SearchRow + `added`, quad subpixel 2×2 (`QUADRANT_GLYPHS`, `resized_quadrant`, `best_quadrant_cell`), обложки 500×500, now_playing cover `clamp(4,26)`, flow_lyrics `min(14)`, tokio `worker_threads(4)`.
 - **v2.3:** Cavacore: октавная шкала 20 Гц–20 кГц (15 полос = ⅔ окт, 30 = ⅓ окт), энергия полосы `0.65·RMS + 0.35·peak`, `freq_tilt = (f_center/300)^0.25` (clamp 0.55–2.3), `eq = norm_fft·freq_tilt`, `set_num_bars` (динамический ресайз, FFT-буферы сохраняются), спектр 1:1 без ресемплинга; обложки — TrueColor 1:1-пиксели (Lanczos3, '▀' fg/bg, quad 2×2 удалён); Track Menu (`m`/`M`: favorite, плейлист, `radio.getSongRadio`, info) + Toast (3 с); Flow Modes (`f`/`g`: My Flow / 7 moods / 10 жанров через `radio.getUserRadio`, режим запоминается); тема: `BG_ELEVATED #252842`.
