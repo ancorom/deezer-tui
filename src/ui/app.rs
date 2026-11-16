@@ -1874,18 +1874,18 @@ impl App {
         let truncated: String = hotkeys.chars().take(area.width as usize).collect();
         buf.set_string(area.left(), y, &truncated, style);
 
-        if let Some((msg, instant)) = &self.toast_message {
-            if instant.elapsed() < Duration::from_millis(3000) {
-                let toast_style = Style::default()
-                    .fg(theme::color_from_hex(theme::BG_TERMINAL))
-                    .bg(theme::color_from_hex(theme::GRAD_END))
-                    .bold();
-                let toast_text = format!(" {msg} ");
-                let tw = toast_text.chars().count() as u16;
-                if tw < area.width {
-                    let tx = area.right().saturating_sub(tw);
-                    buf.set_string(tx, y, &toast_text, toast_style);
-                }
+        if let Some((msg, instant)) = &self.toast_message
+            && instant.elapsed() < Duration::from_millis(3000)
+        {
+            let toast_style = Style::default()
+                .fg(theme::color_from_hex(theme::BG_TERMINAL))
+                .bg(theme::color_from_hex(theme::GRAD_END))
+                .bold();
+            let toast_text = format!(" {msg} ");
+            let tw = toast_text.chars().count() as u16;
+            if tw < area.width {
+                let tx = area.right().saturating_sub(tw);
+                buf.set_string(tx, y, &toast_text, toast_style);
             }
         }
     }
