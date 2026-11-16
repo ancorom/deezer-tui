@@ -11,6 +11,7 @@ use crate::ui::widgets::Spectrum;
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchRow {
+    pub track_id: String,
     pub artist: String,
     pub album: String,
     pub track: String,
@@ -319,6 +320,7 @@ mod tests {
             loading: false,
             rows: vec![
                 SearchRow {
+                    track_id: "1".into(),
                     artist: "Queen".into(),
                     album: "A Day in the Life".into(),
                     track: "Bohemian Rhapsody".into(),
@@ -327,6 +329,7 @@ mod tests {
                     favorite: true,
                 },
                 SearchRow {
+                    track_id: "2".into(),
                     artist: "Queen".into(),
                     album: "A Day in the Life".into(),
                     track: "Another One Bites the Dust".into(),

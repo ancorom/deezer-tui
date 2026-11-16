@@ -86,6 +86,7 @@ impl Library {
                     num_tracks: 2,
                     tracks: vec![
                         SearchRow {
+                            track_id: "1".into(),
                             artist: "Queen".into(),
                             album: "A Day in the Life".into(),
                             track: "Bohemian Rhapsody".into(),
@@ -94,6 +95,7 @@ impl Library {
                             favorite: true,
                         },
                         SearchRow {
+                            track_id: "2".into(),
                             artist: "Metallica".into(),
                             album: "Master of Puppets".into(),
                             track: String::from("Master of Puppets"),

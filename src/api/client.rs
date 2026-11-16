@@ -234,12 +234,38 @@ impl DeezerClient {
             .collect()
     }
 
-    /// Публичный поиск треков без авторизации (`https://api.deezer.com/search`).
-    pub async fn search_public(&self, query: &str) -> Result<SearchResults, DeezerError> {
+    /// Очищает строку поискового запроса: заменяет дефисы и спецсимволы операторов,
+    /// чтобы Deezer не воспринимал их как оператор отрицания NOT (напр. "Перекуп - BRUTALLIZM").
+    pub fn sanitize_query(query: &str) -> String {
+        let cleaned: String = query
+            .chars()
+            .map(|c| {
+                if c == '-' || c == '—' || c == '–' || c == '_' {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Публичный пагинированный поиск треков без авторизации (`https://api.deezer.com/search`).
+    pub async fn search_public_paged(
+        &self,
+        query: &str,
+        index: usize,
+        limit: usize,
+    ) -> Result<SearchResults, DeezerError> {
+        let sanitized = Self::sanitize_query(query);
+        let q = if sanitized.is_empty() { query } else { &sanitized };
+        let index_str = index.to_string();
+        let limit_str = limit.to_string();
+
         let resp = self
             .http
             .get(format!("{PUBLIC_API_URL}/search"))
-            .query(&[("q", query), ("limit", "40")])
+            .query(&[("q", q), ("index", &index_str), ("limit", &limit_str)])
             .send()
             .await
             .map_err(|e| DeezerError::Http(e.to_string()))?;
@@ -254,9 +280,58 @@ impl DeezerClient {
             .and_then(|d| d.as_array())
             .ok_or_else(|| DeezerError::Api("Missing 'data' in public search".into()))?;
 
-        let data = Self::parse_public_tracks(arr);
-        let total = data.len() as u64;
+        let mut data = Self::parse_public_tracks(arr);
+        let total = body
+            .get("total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(data.len() as u64);
+
+        // Умный фоллбэк: если запрос содержал разделитель "Title - Artist" или "Artist - Title",
+        // и первичный поиск вернул 0 результатов, пробуем искать по track:"..." или artist:"..."
+        if data.is_empty()
+            && (query.contains(" - ") || query.contains(" — ") || query.contains('-'))
+        {
+            let parts: Vec<&str> = query
+                .split(['-', '—', '–'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2 {
+                for candidate in &[
+                    format!("track:\"{}\"", parts[0]),
+                    format!("track:\"{}\"", parts[1]),
+                    format!("artist:\"{}\"", parts[1]),
+                    format!("artist:\"{}\"", parts[0]),
+                ] {
+                    if let Ok(c_resp) = self
+                        .http
+                        .get(format!("{PUBLIC_API_URL}/search"))
+                        .query(&[
+                            ("q", candidate.as_str()),
+                            ("index", &index_str),
+                            ("limit", &limit_str),
+                        ])
+                        .send()
+                        .await
+                        && let Ok(c_body) = c_resp.json::<serde_json::Value>().await
+                        && let Some(c_arr) = c_body.get("data").and_then(|d| d.as_array())
+                    {
+                        let parsed = Self::parse_public_tracks(c_arr);
+                        if !parsed.is_empty() {
+                            data = parsed;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(SearchResults { data, total })
+    }
+
+    /// Публичный поиск треков без авторизации (`https://api.deezer.com/search`).
+    pub async fn search_public(&self, query: &str) -> Result<SearchResults, DeezerError> {
+        self.search_public_paged(query, 0, 40).await
     }
 
     /// Публичный топ-чарт Deezer для заполнения экранов в режиме `GUEST`.
@@ -281,37 +356,50 @@ impl DeezerClient {
         Ok(Self::parse_public_tracks(arr))
     }
 
-    /// Поиск треков: использует `gw-light.php` при наличии сессии, иначе публичный API Deezer.
-    pub async fn search(&self, query: &str) -> Result<SearchResults, DeezerError> {
+    /// Поиск треков с поддержкой пагинации (`index` и `limit`).
+    pub async fn search_paged(
+        &self,
+        query: &str,
+        index: usize,
+        limit: usize,
+    ) -> Result<SearchResults, DeezerError> {
         if !self.is_authenticated() {
-            return self.search_public(query).await;
+            return self.search_public_paged(query, index, limit).await;
         }
 
+        let sanitized = Self::sanitize_query(query);
+        let q = if sanitized.is_empty() { query } else { &sanitized };
+
         let params = json!({
-            "query": query,
+            "query": q,
             "filter": "ALL",
             "output": "TRACK",
-            "start": 0,
-            "nb": 40,
+            "start": index,
+            "nb": limit,
         });
 
-        let results = self.gw_call("deezer.pageSearch", params).await?;
+        if let Ok(results) = self.gw_call("deezer.pageSearch", params).await
+            && let Some(track_section) = results.get("TRACK")
+        {
+            let track_array = track_section.get("data").unwrap_or(track_section);
+            if let Ok(data) = serde_json::from_value::<Vec<TrackData>>(track_array.clone())
+                && !data.is_empty()
+            {
+                let total = track_section
+                    .get("total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(data.len() as u64);
+                return Ok(SearchResults { data, total });
+            }
+        }
 
-        let track_section = results
-            .get("TRACK")
-            .ok_or_else(|| DeezerError::Api("Missing 'TRACK' in search results".into()))?;
+        // Фоллбэк на публичный пагинированный поиск
+        self.search_public_paged(query, index, limit).await
+    }
 
-        let track_array = track_section.get("data").unwrap_or(track_section);
-
-        let data: Vec<TrackData> = serde_json::from_value(track_array.clone())
-            .map_err(|e| DeezerError::Api(format!("Failed to parse search results: {e}")))?;
-
-        let total = track_section
-            .get("total")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(data.len() as u64);
-
-        Ok(SearchResults { data, total })
+    /// Поиск треков: использует `gw-light.php` при наличии сессии, иначе публичный API Deezer.
+    pub async fn search(&self, query: &str) -> Result<SearchResults, DeezerError> {
+        self.search_paged(query, 0, 40).await
     }
 
     pub async fn get_favorites(&self) -> Result<Vec<TrackData>, DeezerError> {
@@ -519,13 +607,14 @@ impl DeezerClient {
     }
 
     pub async fn get_track_radio(&self, track_id: &str) -> Result<Vec<TrackData>, DeezerError> {
-        if self.is_authenticated() {
+        // 1. Официальный gateway-метод микса по треку song.getSearchTrackMix
+        if self.is_authenticated() && !track_id.is_empty() && track_id != "0" {
             let params = json!({
                 "SNG_ID": track_id,
-                "START": 0,
-                "NB": 25,
+                "sng_id": track_id,
+                "start_with_input_track": "true",
             });
-            if let Ok(results) = self.gw_call("radio.getSongRadio", params).await {
+            if let Ok(results) = self.gw_call("song.getSearchTrackMix", params).await {
                 let data = results.get("data").unwrap_or(&results);
                 if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone())
                     && !tracks.is_empty()
@@ -535,70 +624,113 @@ impl DeezerClient {
             }
         }
 
-        // Fallback: поиск треков по текущему артисту
-        if let Ok(track) = self.get_track(track_id).await {
-            let q = format!("artist:\"{}\"", track.artist);
-            if let Ok(results) = self.search(&q).await
-                && !results.data.is_empty()
+        // 2. Радио артиста через публичный API Deezer (/artist/{id}/radio)
+        if !track_id.is_empty() && track_id != "0" {
+            let track_url = format!("{PUBLIC_API_URL}/track/{track_id}");
+            if let Ok(resp) = self.http.get(&track_url).send().await
+                && let Ok(json) = resp.json::<serde_json::Value>().await
+                && let Some(artist_id) = json
+                    .get("artist")
+                    .and_then(|a| a.get("id"))
+                    .and_then(|v| v.as_u64())
             {
-                return Ok(results.data);
+                let radio_url = format!("{PUBLIC_API_URL}/artist/{artist_id}/radio");
+                if let Ok(r_resp) = self.http.get(&radio_url).send().await
+                    && let Ok(r_json) = r_resp.json::<serde_json::Value>().await
+                    && let Some(arr) = r_json.get("data").and_then(|d| d.as_array())
+                {
+                    let parsed = Self::parse_public_tracks(arr);
+                    if !parsed.is_empty() {
+                        return Ok(parsed);
+                    }
+                }
+
+                let top_url = format!("{PUBLIC_API_URL}/artist/{artist_id}/top?limit=40");
+                if let Ok(t_resp) = self.http.get(&top_url).send().await
+                    && let Ok(t_json) = t_resp.json::<serde_json::Value>().await
+                    && let Some(arr) = t_json.get("data").and_then(|d| d.as_array())
+                {
+                    let parsed = Self::parse_public_tracks(arr);
+                    if !parsed.is_empty() {
+                        return Ok(parsed);
+                    }
+                }
             }
         }
+
+        // Fallback: общий чарт
         self.get_public_chart().await
     }
 
     pub async fn get_mood_flow(&self, mood_id: &str) -> Result<Vec<TrackData>, DeezerError> {
-        if self.is_authenticated()
-            && let Some(ref session) = self.session
+        let query = match mood_id {
+            "chill" => "Chill Out Relax",
+            "motivation" => "Motivation Energy",
+            "party" => "Party Dance",
+            "focus" => "Focus Study",
+            "romance" => "Romance Acoustic Love",
+            "sad" | "melancholy" => "Sad Songs Melancholy",
+            "workout" => "Workout Gym Fitness",
+            other => other,
+        };
+
+        // Ищем кураторские плейлисты Deezer для этого настроения
+        if let Ok(resp) = self
+            .http
+            .get(format!("{PUBLIC_API_URL}/search/playlist"))
+            .query(&[("q", query), ("limit", "3")])
+            .send()
+            .await
+            && let Ok(json) = resp.json::<serde_json::Value>().await
+            && let Some(pl_arr) = json.get("data").and_then(|d| d.as_array())
         {
-            let params = json!({
-                "user_id": session.user_id,
-                "config_id": mood_id,
-            });
-            if let Ok(results) = self.gw_call("radio.getUserRadio", params).await {
-                let data = results.get("data").unwrap_or(&results);
-                if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone())
-                    && !tracks.is_empty()
-                {
-                    return Ok(tracks);
+            for pl in pl_arr {
+                if let Some(pl_id) = pl.get("id").and_then(|v| v.as_u64()) {
+                    let tracks_url = format!("{PUBLIC_API_URL}/playlist/{pl_id}/tracks?limit=50");
+                    if let Ok(t_resp) = self.http.get(&tracks_url).send().await
+                        && let Ok(t_json) = t_resp.json::<serde_json::Value>().await
+                        && let Some(arr) = t_json.get("data").and_then(|d| d.as_array())
+                    {
+                        let parsed = Self::parse_public_tracks(arr);
+                        if !parsed.is_empty() {
+                            return Ok(parsed);
+                        }
+                    }
                 }
             }
         }
-        // Fallback: поиск по названию настроения
-        if let Ok(results) = self.search(mood_id).await
+
+        // Прямой поиск треков по настроению
+        if let Ok(results) = self.search_public(query).await
             && !results.data.is_empty()
         {
             return Ok(results.data);
         }
+
         self.get_public_chart().await
     }
 
     pub async fn get_genre_flow(&self, genre_id: &str) -> Result<Vec<TrackData>, DeezerError> {
-        if self.is_authenticated()
-            && let Some(ref session) = self.session
+        // Шаг 1: Топ-чарт именно этого жанра (напр. 98 -> Classical, 152 -> Rock)
+        let chart_url = format!("{PUBLIC_API_URL}/chart/{genre_id}/tracks?limit=50");
+        if let Ok(resp) = self.http.get(&chart_url).send().await
+            && let Ok(json) = resp.json::<serde_json::Value>().await
+            && let Some(arr) = json.get("data").and_then(|d| d.as_array())
         {
-            let params = json!({
-                "user_id": session.user_id,
-                "genre_id": genre_id,
-            });
-            if let Ok(results) = self.gw_call("radio.getUserRadio", params).await {
-                let data = results.get("data").unwrap_or(&results);
-                if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone())
-                    && !tracks.is_empty()
-                {
-                    return Ok(tracks);
-                }
+            let parsed = Self::parse_public_tracks(arr);
+            if !parsed.is_empty() {
+                return Ok(parsed);
             }
         }
 
-        // Fallback: получение радиостанций жанра через публичный API Deezer
-        let radios_url = format!("https://api.deezer.com/genre/{genre_id}/radios");
+        // Шаг 2: Тематические радиостанции жанра
+        let radios_url = format!("{PUBLIC_API_URL}/genre/{genre_id}/radios");
         if let Ok(resp) = self.http.get(&radios_url).send().await
             && let Ok(json) = resp.json::<serde_json::Value>().await
             && let Some(first_radio) = json.get("data").and_then(|d| d.get(0))
             && let Some(radio_id) = first_radio.get("id").and_then(|v| v.as_u64())
         {
-            let tracks_url = format!("https://api.deezer.com/radio/{radio_id}/tracks");
+            let tracks_url = format!("{PUBLIC_API_URL}/radio/{radio_id}/tracks?limit=50");
             if let Ok(t_resp) = self.http.get(&tracks_url).send().await
                 && let Ok(t_json) = t_resp.json::<serde_json::Value>().await
                 && let Some(arr) = t_json.get("data").and_then(|d| d.as_array())
@@ -803,6 +935,18 @@ mod tests {
         assert_eq!(user.user.user_id, "51300437");
         assert_eq!(user.user.user_name, "queen_fan");
         assert_eq!(user.api_token, "cf-token");
+    }
+
+    #[test]
+    fn test_sanitize_query() {
+        assert_eq!(
+            DeezerClient::sanitize_query("Перекуп - BRUTALLIZM"),
+            "Перекуп BRUTALLIZM"
+        );
+        assert_eq!(
+            DeezerClient::sanitize_query("Queen — Bohemian Rhapsody"),
+            "Queen Bohemian Rhapsody"
+        );
     }
 
     #[test]

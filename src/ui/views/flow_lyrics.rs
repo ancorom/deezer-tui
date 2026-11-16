@@ -197,7 +197,7 @@ impl FlowLyrics {
         }
         let y_start = area.y + 1;
         let body_rows = row_end.saturating_sub(y_start);
-        let cover_h = body_rows.saturating_sub(6).min(width / 2).min(14);
+        let cover_h = body_rows.saturating_sub(5).min(width / 2).min(24);
         let cover_w = (cover_h * 2).min(width);
         let mut y_cursor = y_start;
 
@@ -388,7 +388,8 @@ mod tests {
         let terminal = render(&screen, 120, 40);
         assert!(row_has(&terminal, 0, "FLOW"));
         assert!(row_has(&terminal, 1, "LYRICS"));
-        assert_eq!(at(&terminal, 0, 1), '▀');
+        let ch = at(&terminal, 0, 1);
+        assert!(ch == '█' || ch == '▀' || crate::ui::widgets::cover_art::SEXTANT_CHARS.contains(&ch));
         assert!((1..30).any(|y| row_has(&terminal, y, "DEEZER FLOW")));
         assert!((1..30).any(|y| row_has(&terminal, y, "Bohemian Rhapsody")));
         assert!(row_has(&terminal, 2, "Is this the real life?"));

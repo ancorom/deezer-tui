@@ -118,6 +118,7 @@ pub enum BgEvent {
     },
     AuthFailed(String),
     SearchDone(Vec<TrackData>),
+    SearchMoreLoaded(Vec<TrackData>),
     ChartLoaded(Vec<TrackData>),
     PlaylistTracksLoaded {
         playlist_id: String,
@@ -203,6 +204,9 @@ pub struct App {
     pub queue: PlaybackQueue,
     pub playing_from_flow: bool,
     pub loading_more_flow: bool,
+    pub search_loading_more: bool,
+    pub search_end_reached: bool,
+    pub search_page_index: usize,
 
     // Модальные окна и меню действий
     pub show_arl_modal: bool,
@@ -310,6 +314,9 @@ impl App {
             queue: PlaybackQueue::default(),
             playing_from_flow: false,
             loading_more_flow: false,
+            search_loading_more: false,
+            search_end_reached: false,
+            search_page_index: 0,
             show_arl_modal: false,
             arl_input: cfg.effective_arl().unwrap_or_default(),
             show_track_info_modal: false,
@@ -441,6 +448,51 @@ impl App {
         self.toast_message = Some((msg.into(), Instant::now()));
     }
 
+    pub fn find_cached_track_id(&self, title: &str, artist: &str) -> Option<String> {
+        let all = self
+            .library_tracks
+            .iter()
+            .chain(self.playlist_tracks_cache.values().flatten());
+        for t in all {
+            if t.title.eq_ignore_ascii_case(title) && t.artist.eq_ignore_ascii_case(artist) {
+                return Some(t.track_id.clone());
+            }
+        }
+        None
+    }
+
+    pub fn search_local_tracks(&self, query: &str) -> Vec<TrackData> {
+        let q_clean = DeezerClient::sanitize_query(query).to_lowercase();
+        let terms: Vec<&str> = q_clean.split_whitespace().collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let all_local = self
+            .library_tracks
+            .iter()
+            .chain(self.playlist_tracks_cache.values().flatten());
+
+        for track in all_local {
+            let title = track.title.to_lowercase();
+            let artist = track.artist.to_lowercase();
+            let album = track.album.to_lowercase();
+
+            let matches_all = terms.iter().all(|term| {
+                title.contains(term) || artist.contains(term) || album.contains(term)
+            });
+
+            if matches_all && seen.insert(track.track_id.clone()) {
+                matches.push(track.clone());
+            }
+        }
+
+        matches
+    }
+
     pub fn active_target_track(&self) -> Option<TrackData> {
         let selected_track = match self.active_tab {
             2 => self.search_tracks.get(self.search.selected).cloned(),
@@ -453,8 +505,14 @@ impl App {
                     .get(self.library.selected_playlist)
                     .and_then(|p| p.tracks.get(self.library.selected_track))
                 {
+                    let real_tid = if !row.track_id.is_empty() && row.track_id != "0" {
+                        row.track_id.clone()
+                    } else {
+                        self.find_cached_track_id(&row.track, &row.artist)
+                            .unwrap_or_else(|| "0".into())
+                    };
                     Some(TrackData {
-                        track_id: "0".into(),
+                        track_id: real_tid,
                         title: row.track.clone(),
                         artist: row.artist.clone(),
                         album: row.album.clone(),
@@ -537,10 +595,19 @@ impl App {
                 self.show_track_menu = false;
                 let client = Arc::clone(&self.client);
                 let bg_tx = self.bg_tx.clone();
-                let tid = track.track_id.clone();
+                let mut tid = track.track_id.clone();
                 let title = track.title.clone();
+                let artist = track.artist.clone();
                 self.set_toast(format!("📻 Загрузка микса по треку «{title}»..."));
                 self.rt.spawn(async move {
+                    if tid.is_empty() || tid == "0" {
+                        let q = format!("track:\"{}\" artist:\"{}\"", title, artist);
+                        if let Ok(res) = client.search_public(&q).await
+                            && let Some(first) = res.data.first()
+                        {
+                            tid = first.track_id.clone();
+                        }
+                    }
                     let tracks = client.get_track_radio(&tid).await.unwrap_or_default();
                     let _ = bg_tx.send(BgEvent::TrackRadioLoaded {
                         seed_title: title,
@@ -574,6 +641,7 @@ impl App {
         let title = track.title.clone();
 
         pl.tracks.push(SearchRow {
+            track_id: tid.clone(),
             artist: track.artist.clone(),
             album: track.album.clone(),
             track: track.title.clone(),
@@ -681,6 +749,7 @@ impl App {
             let rows: Vec<SearchRow> = tracks
                 .iter()
                 .map(|t| SearchRow {
+                    track_id: t.track_id.clone(),
                     artist: t.artist.clone(),
                     album: t.album.clone(),
                     track: t.title.clone(),
@@ -765,6 +834,7 @@ impl App {
             let rows: Vec<SearchRow> = sorted
                 .iter()
                 .map(|t| SearchRow {
+                    track_id: t.track_id.clone(),
                     artist: t.artist.clone(),
                     album: t.album.clone(),
                     track: t.title.clone(),
@@ -944,6 +1014,7 @@ impl App {
                     let fav_rows: Vec<SearchRow> = favorites
                         .iter()
                         .map(|t| SearchRow {
+                            track_id: t.track_id.clone(),
                             artist: t.artist.clone(),
                             album: t.album.clone(),
                             track: t.title.clone(),
@@ -994,6 +1065,7 @@ impl App {
                     self.search.rows = tracks
                         .iter()
                         .map(|t| SearchRow {
+                            track_id: t.track_id.clone(),
                             artist: t.artist.clone(),
                             album: t.album.clone(),
                             track: t.title.clone(),
@@ -1014,6 +1086,7 @@ impl App {
                             .iter()
                             .take(15)
                             .map(|t| SearchRow {
+                                track_id: t.track_id.clone(),
                                 artist: t.artist.clone(),
                                 album: t.album.clone(),
                                 track: t.title.clone(),
@@ -1032,19 +1105,62 @@ impl App {
                 }
                 BgEvent::SearchDone(tracks) => {
                     self.search.loading = false;
-                    self.search.selected = 0;
-                    self.search.rows = tracks
+                    // Объединяем полученные треки с уже отображенными локальными, удаляя дубликаты
+                    for t in tracks {
+                        if !self
+                            .search_tracks
+                            .iter()
+                            .any(|existing| existing.track_id == t.track_id)
+                        {
+                            self.search_tracks.push(t);
+                        }
+                    }
+                    self.search_page_index = self.search_tracks.len();
+                    self.search.rows = self
+                        .search_tracks
                         .iter()
                         .map(|t| SearchRow {
+                            track_id: t.track_id.clone(),
                             artist: t.artist.clone(),
                             album: t.album.clone(),
                             track: t.title.clone(),
                             time: t.formatted_duration(),
                             added: t.formatted_date_add(),
-                            favorite: false,
+                            favorite: self.is_track_favorite(&t.track_id),
                         })
                         .collect();
-                    self.search_tracks = tracks;
+                }
+                BgEvent::SearchMoreLoaded(more_tracks) => {
+                    self.search_loading_more = false;
+                    if more_tracks.is_empty() {
+                        self.search_end_reached = true;
+                    } else {
+                        let mut added = 0;
+                        for t in more_tracks {
+                            if !self
+                                .search_tracks
+                                .iter()
+                                .any(|existing| existing.track_id == t.track_id)
+                            {
+                                self.search_tracks.push(t.clone());
+                                self.search.rows.push(SearchRow {
+                                    track_id: t.track_id.clone(),
+                                    artist: t.artist.clone(),
+                                    album: t.album.clone(),
+                                    track: t.title.clone(),
+                                    time: t.formatted_duration(),
+                                    added: t.formatted_date_add(),
+                                    favorite: self.is_track_favorite(&t.track_id),
+                                });
+                                added += 1;
+                            }
+                        }
+                        if added == 0 {
+                            self.search_end_reached = true;
+                        } else {
+                            self.search_page_index += added;
+                        }
+                    }
                 }
                 BgEvent::PlaylistTracksLoaded {
                     playlist_id,
@@ -1640,6 +1756,28 @@ impl App {
             return;
         }
         self.search.loading = true;
+        self.search.selected = 0;
+        self.search_page_index = 0;
+        self.search_end_reached = false;
+        self.search_loading_more = false;
+
+        // 1. Мгновенный поиск совпадений в локальной медиатеке пользователя
+        let local_matches = self.search_local_tracks(&q);
+        self.search_tracks = local_matches.clone();
+        self.search.rows = local_matches
+            .iter()
+            .map(|t| SearchRow {
+                track_id: t.track_id.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                track: t.title.clone(),
+                time: t.formatted_duration(),
+                added: t.formatted_date_add(),
+                favorite: self.is_track_favorite(&t.track_id),
+            })
+            .collect();
+        self.search_page_index = self.search_tracks.len();
+
         let tx = self.bg_tx.clone();
         let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
@@ -1650,12 +1788,33 @@ impl App {
             {
                 let _ = client.login_arl(&arl).await;
             }
-            if let Ok(res) = client.search(&q).await {
+            if let Ok(res) = client.search_paged(&q, 0, 30).await {
                 let _ = tx.send(BgEvent::SearchDone(res.data));
-            } else if let Ok(res) = client.search_public(&q).await {
+            } else if let Ok(res) = client.search_public_paged(&q, 0, 30).await {
                 let _ = tx.send(BgEvent::SearchDone(res.data));
             } else {
                 let _ = tx.send(BgEvent::SearchDone(Vec::new()));
+            }
+        });
+    }
+
+    pub fn spawn_load_more_search(&mut self) {
+        let q = self.search.query.trim().to_string();
+        if q.is_empty() || self.search_loading_more || self.search_end_reached {
+            return;
+        }
+        self.search_loading_more = true;
+        let index = self.search_page_index;
+        let tx = self.bg_tx.clone();
+        let client = Arc::clone(&self.client);
+
+        self.rt.spawn(async move {
+            if let Ok(res) = client.search_paged(&q, index, 30).await {
+                let _ = tx.send(BgEvent::SearchMoreLoaded(res.data));
+            } else if let Ok(res) = client.search_public_paged(&q, index, 30).await {
+                let _ = tx.send(BgEvent::SearchMoreLoaded(res.data));
+            } else {
+                let _ = tx.send(BgEvent::SearchMoreLoaded(Vec::new()));
             }
         });
     }
@@ -2439,6 +2598,20 @@ impl App {
             }
             KeyCode::Up => self.navigate_up(),
             KeyCode::Down => self.navigate_down(),
+            KeyCode::PageDown => {
+                if self.active_tab == 2 && !self.search.rows.is_empty() {
+                    self.search.selected =
+                        (self.search.selected + 10).min(self.search.rows.len().saturating_sub(1));
+                    if self.search.selected + 5 >= self.search.rows.len() {
+                        self.spawn_load_more_search();
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                if self.active_tab == 2 && !self.search.rows.is_empty() {
+                    self.search.selected = self.search.selected.saturating_sub(10);
+                }
+            }
             KeyCode::Left => self.navigate_left(),
             KeyCode::Right => self.navigate_right(),
             KeyCode::Enter => self.press_enter(),
@@ -2590,6 +2763,9 @@ impl App {
                     && self.search.selected + 1 < self.search.rows.len()
                 {
                     self.search.selected += 1;
+                }
+                if self.search.selected + 5 >= self.search.rows.len() {
+                    self.spawn_load_more_search();
                 }
             }
             3 => {
@@ -3200,5 +3376,89 @@ mod tests {
         let terminal = render_ui(&app, 30, 8);
         assert!(row_has(&terminal, 0, "DEEZER"));
         assert!(row_has(&terminal, 7, "q quit"));
+    }
+
+    #[test]
+    fn search_local_tracks_finds_artist_and_title_with_hyphen() {
+        let mut app = App::new();
+        let favorite_track = TrackData {
+            track_id: "3862908051".into(),
+            title: "Перекуп".into(),
+            artist: "BRUTALLIZM".into(),
+            album: "НА ТАРАН!".into(),
+            ..Default::default()
+        };
+        app.library_tracks.push(favorite_track.clone());
+
+        // 1. Прямой вызов search_local_tracks с дефисом
+        let matches = app.search_local_tracks("Перекуп - BRUTALLIZM");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].track_id, "3862908051");
+        assert_eq!(matches[0].title, "Перекуп");
+        assert_eq!(matches[0].artist, "BRUTALLIZM");
+
+        // 2. Обратный порядок "BRUTALLIZM - Перекуп"
+        let matches_rev = app.search_local_tracks("BRUTALLIZM - Перекуп");
+        assert_eq!(matches_rev.len(), 1);
+        assert_eq!(matches_rev[0].track_id, "3862908051");
+
+        // 3. trigger_search немедленно заполняет search_tracks и search.rows
+        app.search.query = "Перекуп - BRUTALLIZM".into();
+        app.trigger_search();
+        assert_eq!(app.search_tracks.len(), 1);
+        assert_eq!(app.search.rows.len(), 1);
+        assert_eq!(app.search.rows[0].track_id, "3862908051");
+        assert_eq!(app.search.rows[0].track, "Перекуп");
+        assert!(app.search.rows[0].favorite);
+    }
+
+    #[test]
+    fn search_pagination_and_more_loading() {
+        let mut app = App::new();
+        app.active_tab = 2; // Search tab
+
+        // Создаем 10 треков в поиске
+        for i in 0..10 {
+            let t = TrackData {
+                track_id: format!("id_{i}"),
+                title: format!("Track {i}"),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                ..Default::default()
+            };
+            app.search_tracks.push(t);
+            app.search.rows.push(SearchRow {
+                track_id: format!("id_{i}"),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                track: format!("Track {i}"),
+                time: "3:00".into(),
+                added: "2026-11-16".into(),
+                favorite: false,
+            });
+        }
+        app.search_page_index = 10;
+        assert_eq!(app.search.selected, 0);
+
+        // Листаем вниз до 6-го элемента (selected = 5) -> selected + 5 >= 10
+        for _ in 0..5 {
+            app.navigate_down();
+        }
+        assert_eq!(app.search.selected, 5);
+
+        // Эмулируем приход следующей страницы
+        let more = vec![TrackData {
+            track_id: "id_10".into(),
+            title: "Track 10".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            ..Default::default()
+        }];
+        app.bg_tx.send(BgEvent::SearchMoreLoaded(more)).unwrap();
+        app.poll_bg_events();
+        assert_eq!(app.search_tracks.len(), 11);
+        assert_eq!(app.search.rows.len(), 11);
+        assert_eq!(app.search.rows[10].track_id, "id_10");
+        assert_eq!(app.search_page_index, 11);
     }
 }
