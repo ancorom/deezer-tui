@@ -3,6 +3,41 @@
 История версий deezer-tui. Детали по каждой фазе — в [docs/crates/progress.md](docs/crates/progress.md),
 спецификации — в [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## [v2.4] — 2026-11-16 — Релиз: sextant-обложки, настоящий Flow по жанрам/настроениям, бесконечный поиск, Track Mix
+
+### Sextant-обложки (6 субпикселей/ячейку)
+- `CoverRenderMode::Sextant` (default): сетка 2×3 — 6 субпикселей на знакоместо
+  (в 3 раза детальнее полублока ▀); `resized_pixels_sextant` (2w × 3h,
+  Lanczos3/CatmullRom/Nearest).
+- Пер-ячейка кластеризация: пара пикселей с максимальным цветовым расстоянием
+  задаёт fg (светлее) / bg (темнее); каждый субпиксель → ближайший кластер;
+  6-бит маска → глиф `SEXTANT_CHARS` (U+1FB00–U+1FB3B; маски 21/42 → `▌`/`▐`,
+  0 → space, 63 → `█`); почти монохромная ячейка (dist² ≤ 25) → `█`.
+- `HalfBlock` (▀, v2.3) — опциональный режим (`with_render_mode`).
+- Высоты: Now Playing 26 → **40** строк, Flow 14 → **24** (квадрат 1:1 сохраняется).
+
+### Track Mix (m → 📻)
+- `song.getSearchTrackMix` (SNG_ID, `start_with_input_track`); публичный fallback:
+  `/track/{id}` → artist → `/artist/{id}/radio` → `/artist/{id}/top?limit=40`
+  → public chart. Авто-резолв track_id «0» через `find_cached_track_id`.
+
+### Flow по жанрам/настроениям
+- Жанры (`get_genre_flow`): `/chart/{genre_id}/tracks?limit=50` →
+  `/genre/{id}/radios` → `/radio/{id}/tracks?limit=50` → public chart.
+- Настроения (`get_mood_flow`): кураторские плейлисты `/search/playlist?q=...`
+  → `/playlist/{id}/tracks?limit=50` → поиск треков → public chart.
+
+### Бесконечный поиск
+- `search_paged` (`deezer.pageSearch`, start/nb) + `search_public_paged`
+  (index/limit); 30/страницу; автозагрузка при `selected + 5 ≥ len` и по
+  `PageDown` (±10 строк); дедупликация по `track_id`.
+- `sanitize_query`: дефисы/тиры/`_` → пробел, схлопывание whitespace.
+- `search_local_tracks`: мгновенные совпадения в `library_tracks` + кэше
+  плейлистов (❤) — до ответа remote.
+
+### Тесты
+- 114/114 (+4: sanitize_query, локальный поиск с дефисом, пагинация, sextant).
+
 ## [v2.3] — 2026-11-16 — Релиз: Cavacore octave rework, TrueColor обложки, Track Menu, Flow Modes
 
 ### Добавлено

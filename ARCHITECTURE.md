@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — Архитектура и спецификация deezer-tui v2.3 (Редакция: Ноябрь 2026)
+# ARCHITECTURE.md — Архитектура и спецификация deezer-tui v2.4 (Редакция: Ноябрь 2026)
 
 ## 1. Технологический стек
 Проект собирается в единый монолитный бинарник на Rust (Edition 2024, MSRV 1.88). Все зависимости зафиксированы в корневом Cargo.toml:
@@ -86,25 +86,28 @@
             │                       #   PlaybackQueue (n/p), spawn_* (fetch_more_flow, prefetch,
             │                       #   initial_load, search), адаптивный спектр (set_num_bars при ресайзе),
             │                       #   Track Menu (m/M), Flow Modes (f/g, FLOW_MODES), Toast (3 с),
+            │                       #   бесконечный поиск (30/стр., PageDown, автозагрузка), search_local_tracks.
             │                       #   div_ceil(width/2).clamp(8,160), player row с хоткеями.
             ├── views/
-                ├── now_playing.rs  # Экран 1: обложка (TrueColor 1:1-пиксели, до 26 строк) + метаданные +
+                ├── now_playing.rs  # Экран 1: обложка (sextant 2×3, до 40 строк) + метаданные +
                 │                   #   тех. параметры + панель LYRICS (автопрокрутка, подсветка).
                 ├── search.rs       # Экран 2: строка поиска (модальный ввод / / f), 3 колонки
-                │                   #   результатов (SearchRow: artist/album/track/time/added/fav).
+                │                   #   результатов (SearchRow: artist/album/track/time/added/fav),
+                │                   #   бесконечный поиск 30/стр. (PageDown, автозагрузка).
                 ├── library.rs      # Экран 3: двухпанельный фокус (плейлисты | таблица треков),
                 │                   #   LibrarySortBy (Default/Title/Artist/Album, o/r),
                 │                   #   колонка ADDED (▲/▼), CHOOSE PLAYLIST модал (a).
                 ├── flow_lyrics.rs  # Экран 4: бесконечный Flow (автоподгрузка ≤3) + Live Lyrics
                 │                   #   (y toggle), Flow Modes (f/g: moods/genres), обложка
-                │                   #   до 14 строк, разделитель │.
+                │                   #   до 24 строк (v2.4), разделитель │.
                 ├── settings.rs     # Экран 5: ARL inline (L), quality FLAC/320/128, Show
                                     #   Spectrum, dB Scale. Settings::render (Widget).
             └── widgets/
                 ├── spectrum.rs     # Spectrum: subpixel-бары ▁..█, peak-hold '▪', 1:1
                 │                   #   рендер (v2.3: без sample_slice).
-                ├── cover_art.rs    # CoverArt: TrueColor 1:1-пиксели — '▀' half-block,
-                │                   #   resized_pixels w×2h, Lanczos3 (down) / CatmullRom (up).
+                ├── cover_art.rs    # CoverArt: sextant 2×3 (6 субпикселей/ячейка,
+                │                   #   U+1FB00–U+1FB3B + ▌/▐/█), кластеризация fg/bg,
+                │                   #   Lanczos3 (down) / CatmullRom (up); режим HalfBlock (▀).
                 └── modal.rs        # Modal: общее модальное окно (Track Menu (m), Flow
                                     #   Modes (f/g), ARL, CHOOSE PLAYLIST, TrackInfo).
 
@@ -275,15 +278,15 @@
 - Субсимвольный спектр (`Spectrum` / SpectrumWidget):
   Использует массив символов [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']. Полная высота столбика в субпикселях равна `(val * rows as f32 * 8.0) as usize`. Целые клетки заполняются символом '█', верхушка — остатком от деления на 8, а выше удержанного пика ставится точка '▪'. **v2.3:** 1:1-рендер — cavacore-полосы рисуются напрямую (`sample_slice` убран), число полос задаётся в Cavacore (`set_num_bars`), `fit_bars = div_ceil(w/2).min(bars.len())`.
 - Рендерер обложек (`CoverArtWidget`):
-  **TrueColor 1:1-пиксели (v2.3):** `resized_pixels` ресайзит изображение под пиксельную сетку терминала w × 2h (Lanczos3 при даунскейле, CatmullRom при апскейле, Nearest при точном совпадении); каждая ячейка рисуется полублоком '▀' — fg = верхний субпиксель, bg = нижний субпиксель: честные 24-битные цвета на каждый субпиксель без дITHER-аппроксимаций. Quad subpixel 2×2 v2.2 (`QUADRANT_GLYPHS`, `best_quadrant_cell`) удалён. Обложки 500×500 (клиент: `cover_big`→`cover_medium`→`cover`; MPRIS — 500×500).
+  **TrueColor 1:1-пиксели (v2.3):** `resized_pixels` ресайзит изображение под пиксельную сетку терминала w × 2h (Lanczos3 при даунскейле, CatmullRom при апскейле, Nearest при точном совпадении); каждая ячейка рисуется полублоком '▀' — fg = верхний субпиксель, bg = нижний субпиксель: честные 24-битные цвета на каждый субпиксель без дITHER-аппроксимаций. Quad subpixel 2×2 v2.2 (`QUADRANT_GLYPHS`, `best_quadrant_cell`) удалён. **Sextant (v2.4, default):** `CoverRenderMode::Sextant` — сетка 2×3 (6 субпикселей/ячейка, 3× разрешение): `resized_pixels_sextant` (2w × 3h, Lanczos3/CatmullRom/Nearest); на ячейку — пара пикселей с максимальным цветовым расстоянием задаёт два кластера (fg = светлее, bg = темнее), каждый субпиксель присоединяется к ближайшему кластеру → 6-бит маска → глиф `SEXTANT_CHARS` (U+1FB00–U+1FB3B; маски 21/42 → `▌`/`▐`, 0 → space, 63 → `█`); почти монохромная ячейка (dist² ≤ 25) → `█`. `HalfBlock` (▀, v2.3) — опциональный режим (`with_render_mode`). Обложки 500×500 (клиент: `cover_big`→`cover_medium`→`cover`; MPRIS — 500×500).
 - Модальные окна (`widgets/modal.rs`):
-  `ChoosePlaylist` (добавление трека в плейлист), `TrackInfoModal` (`[i]` Track & Stream Info: кодек, sample rate, битрейт, размер, режим — данные из `StreamTechInfo`). **Track Menu (v2.3, `m`/`M`)** — 5 пунктов: ❤️/💔 favorite (динамический статус), ➕ добавить в плейлист, 📻 Song Radio (`radio.getSongRadio` → очередь), ℹ️ информация, Esc. **Flow Modes (v2.3, `f`/`g`)** — My Flow / 7 настроений / 10 жанров. **Toast (v2.3):** разовое уведомление в статусной строке, 3 с, градиентный фон.
+  `ChoosePlaylist` (добавление трека в плейлист), `TrackInfoModal` (`[i]` Track & Stream Info: кодек, sample rate, битрейт, размер, режим — данные из `StreamTechInfo`). **Track Menu (v2.3, `m`/`M`)** — 5 пунктов: ❤️/💔 favorite (динамический статус), ➕ добавить в плейлист, 📻 Song Radio (`song.getSearchTrackMix`; fallback /artist/{id}/radio → /top → public chart → очередь), ℹ️ информация, Esc. **Flow Modes (v2.3, `f`/`g`)** — My Flow / 7 настроений / 10 жанров. **Toast (v2.3):** разовое уведомление в статусной строке, 3 с, градиентный фон.
 
 ## 6.4 Экраны (v2.3)
-- Экран 01 (Now Playing, `views/now_playing.rs`): Обложка 500×500, TrueColor 1:1-пиксели (высота `clamp(4, 26)` строк, ширина `min(26)` колонок) + метаданные (трек/исполнитель/альбом) + тех. параметры потока (Codec, Sample Rate, Bit Depth, Bitrate kbps, Stream Size MB) + панель LYRICS (автоскролл по таймкоду, подсветка текущей строки бирюзовым `#4FD1C5` с тёмным текстом; `y` — вкл/выкл).
-- Экран 02 (Search, `views/search.rs`): Строка поиска — модал ввода по `/` (или `f`), `Enter` — поиск, `Esc` — сброс фокуса. Результаты: таблица `SearchRow` (ARTIST / ALBUM / TRACK / TIME / ADDED / ♥) с колонкой `added: String` (дата добавления в Deezer, YYYY-MM-DD или "—"). Track Menu (`m`) — по выделенной строке.
+- Экран 01 (Now Playing, `views/now_playing.rs`): Обложка 500×500, sextant 2×3 (высота `clamp(4, 40)` строк, ширина `min(26)` колонок) + метаданные (трек/исполнитель/альбом) + тех. параметры потока (Codec, Sample Rate, Bit Depth, Bitrate kbps, Stream Size MB) + панель LYRICS (автоскролл по таймкоду, подсветка текущей строки бирюзовым `#4FD1C5` с тёмным текстом; `y` — вкл/выкл).
+- Экран 02 (Search, `views/search.rs`): Строка поиска — модал ввода по `/` (или `f`), `Enter` — поиск, `Esc` — сброс фокуса. Результаты: таблица `SearchRow` (ARTIST / ALBUM / TRACK / TIME / ADDED / ♥) с колонкой `added: String` (дата добавления в Deezer, YYYY-MM-DD или "—"). Track Menu (`m`) — по выделенной строке. **Бесконечный поиск (v2.4):** 30/страницу (`search_paged`/`search_public_paged`, index/limit), автозагрузка при `selected + 5 ≥ len` и по `PageDown` (±10 строк), дедупликация по `track_id`; `sanitize_query` (дефисы/тиры/`_` → пробел); `search_local_tracks` — мгновенные совпадения в `library_tracks` + кэше плейлистов (❤).
 - Экран 03 (Library, `views/library.rs`): Двухпанельный фокус (плейлисты | таблица треков). Колонки: `#`, ТРЕК, ИСПОЛНИТЕЛЬ, АЛЬБОМ, **ADDED** (YYYY-MM-DD, `track.added`, ширина 12, виден при ширине ≥ 68), TIME, ♥. Заголовок `ADDED ▲/▼` на сортировке Default (по дате добавления); `o` — круг по критериям, `r` — направление. Модал CHOOSE PLAYLIST (`a`) — добавление текущего трека в выбранный плейлист.
-- Экран 04 (Flow & Live Lyrics, `views/flow_lyrics.rs`): Бесконечный Flow (автоподгрузка при ≤3 треках; обложка `min(14)` строк) + Live Lyrics справа (разделитель `│`), автоскролл, подсветка. При старте трека lyrics очищается; для инструментальных — по центру "No synchronized lyrics available". **Flow Modes (v2.3):** модал `f` (вне Search) / `g` (глобально) — My Flow, 7 настроений (chill/motivation/party/focus/romance/melancholy/workout) и 10 жанров через `radio.getUserRadio` (`get_mood_flow`/`get_genre_flow`, fallback — поиск / public chart); выбранный режим запоминается (`spawn_fetch_more_flow` читает `current_flow_mode_idx`).
+- Экран 04 (Flow & Live Lyrics, `views/flow_lyrics.rs`): Бесконечный Flow (автоподгрузка при ≤3 треках; обложка `min(24)` строк) + Live Lyrics справа (разделитель `│`), автоскролл, подсветка. При старте трека lyrics очищается; для инструментальных — по центру "No synchronized lyrics available". **Flow Modes (v2.3):** модал `f` (вне Search) / `g` (глобально) — My Flow, 7 настроений (chill/motivation/party/focus/romance/melancholy/workout) и 10 жанров (`get_genre_flow`: /chart/{genre_id}/tracks?limit=50 → /genre/{id}/radios → /radio/{id}/tracks; fallback — public chart) и 7 настроений (`get_mood_flow`: кураторские плейлисты /search/playlist?q=... → /playlist/{id}/tracks; fallback — поиск треков / public chart); выбранный режим запоминается (`spawn_fetch_more_flow` читает `current_flow_mode_idx`).
 - Экран 05 (Settings, `views/settings.rs`): ARL-токен **inline** (`L` — перейти к вводу; статус `Deezer HiFi / Premium / Free / Guest`), качество (`FLAC 1411 kbps`, `MP3 320 kbps`, `MP3 128 kbps`), переключатели `Show Spectrum`, `dB Scale`, `Show Lyrics`, `Sidebar Collapsed`.
 
 ## 7. MPRIS и конфигурация
@@ -318,6 +321,7 @@
 | `/`, `f` (на Search) | Фокус строки поиска; `Enter` — поиск, `Esc` — снять |
 | `f` (вне Search) / `g` | Модал Flow Modes (настроения/жанры) |
 | `m` / `M` | Track Menu (Now Playing / Search / Library / Flow): ❤️ favorite, ➕ плейлист, 📻 Song Radio, ℹ️ info |
+| `PageDown` / `PageUp` (Search) | ±10 строк; PageDown у конца — загрузка следующей страницы (30/страницу) |
 | `y` | Toggle панели lyrics |
 | `s` | Toggle сайдбара навигации |
 | `v` | Toggle спектра |
@@ -333,3 +337,4 @@
 - **v2.1:** глобальная очередь воспроизведения (`PlaybackQueue`), бесконечный Flow + Live Lyrics, панель lyrics (`y`), `[i]` Track & Stream Info, поиск `/`/`f`, двухпанельная Library с сортировкой (`o`/`r`), `PrefetchedTrack`-кэш (`spawn_prefetch_next`), gapless prefetch, `fetch_streaming` (256 КБ prebuffer), `StreamTechInfo`.
 - **v2.2:** in-memory буфер `DeezerStream` (`Arc<RwLock<Vec<u8>>>` + `pos`), `playback_seq: Arc<AtomicU64>`, переиспользование сессии `self.client`, `BgEvent::FlowLoadFailed`, подсказки хоткеев в player bar, адаптивный спектр (`div_ceil(w/2).clamp(8,160)`, `sample_slice`), Cavacore-интерполяция узких полос + `eq=(norm_fft*freq_tilt)/bin_count.sqrt()`, `freq_tilt=(f_hi/100.0)^0.55`, колонка ADDED (Library, `width>=68`), `TrackData::formatted_date_add()` → YYYY-MM-DD, SearchRow + `added`, quad subpixel 2×2 (`QUADRANT_GLYPHS`, `resized_quadrant`, `best_quadrant_cell`), обложки 500×500, now_playing cover `clamp(4,26)`, flow_lyrics `min(14)`, tokio `worker_threads(4)`.
 - **v2.3:** Cavacore: октавная шкала 20 Гц–20 кГц (15 полос = ⅔ окт, 30 = ⅓ окт), энергия полосы `0.65·RMS + 0.35·peak`, `freq_tilt = (f_center/300)^0.25` (clamp 0.55–2.3), `eq = norm_fft·freq_tilt`, `set_num_bars` (динамический ресайз, FFT-буферы сохраняются), спектр 1:1 без ресемплинга; обложки — TrueColor 1:1-пиксели (Lanczos3, '▀' fg/bg, quad 2×2 удалён); Track Menu (`m`/`M`: favorite, плейлист, `radio.getSongRadio`, info) + Toast (3 с); Flow Modes (`f`/`g`: My Flow / 7 moods / 10 жанров через `radio.getUserRadio`, режим запоминается); тема: `BG_ELEVATED #252842`.
+- **v2.4:** Sextant-обложки (2×3, 6 субпикселей/ячейка, U+1FB00–U+1FB3B + ▌/▐/█, кластеризация fg/bg, `CoverRenderMode`, обложки now_playing до 40 строк, flow до 24); Track Mix — `song.getSearchTrackMix` + публичный каскад (/track → /artist/{id}/radio → /top → public chart), авто-резолв track_id; Flow Modes — жанры: /chart/{genre_id}/tracks + /genre/{id}/radios → /radio/{id}/tracks, настроения: кураторские плейлисты /search/playlist → /playlist/{id}/tracks; поиск: `search_paged`/`search_public_paged` (30/страницу, PageDown, автозагрузка, дедупликация), `sanitize_query` (дефисы), `search_local_tracks` (медиатека + плейлисты, ❤).

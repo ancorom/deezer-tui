@@ -16,8 +16,8 @@ runtime dependencies beyond ALSA/PipeWire.
 | --- | --- |
 | Playback | HiFi login by ARL token (no token → guest mode: 30 s MP3 previews); FLAC 1411 kbps, MP3 320/128 fallback; seek ±5 s; gapless prefetch of the next track (starts 20 s before the end) |
 | Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log-octave bands 20 Hz–20 kHz (15 bars = ⅔ octave per step, 30 = ⅓), band energy 0.65·RMS + 0.35·peak, Monstercat spatial filter, gravity falloff, autosens, optional dB scale; dynamic bar count (`set_num_bars`) and 1:1 rendering — no resampling |
-| Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale). **Track Menu** (`m`/`M`: favorite, add to playlist, Song Radio, info) and **Flow Modes** (`f`/`g`: My Flow / 7 moods / 10 genres) work from any track |
-| Covers | 500×500 HD covers rendered as TrueColor 1:1 pixels — each cell is a `▀` half-block with fg = top subpixel, bg = bottom subpixel (Lanczos3 downscale, CatmullRom upscale) |
+| Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale). **Track Menu** (`m`/`M`: favorite, add to playlist, Song Radio, info) and **Flow Modes** (`f`/`g`: My Flow / 7 moods / 10 genres) work from any track. Search — instant local library/playlist matching + infinite pagination (30/page, `PageDown`) |
+| Covers | 500×500 HD covers rendered as sextant 2×3 cells (6 subpixels per cell, 3× resolution of half-block art) — Unicode sextants U+1FB00–U+1FB3B + `▌`/`▐`/`█`, per-cell fg/bg color clustering, Lanczos3 downscale / CatmullRom upscale; optional HalfBlock mode |
 | System | MPRIS over D-Bus (souvlaki/zbus): hardware media keys, GNOME/KDE now-playing widgets, `playerctl` works out of the box |
 | Resilience | Generation counter (`playback_seq`) prevents races on rapid track switching; in-memory decrypted stream buffer — no temp files, no FD sharing |
 
@@ -56,6 +56,7 @@ Terminal 256-color or TrueColor; minimum comfortable size ~80×24, everything is
 | `←` / `→` | Seek ∓5 s (on screens without panel focus) |
 | `+`/`=` , `-` | Volume ±5 % |
 | `/` (or `f` on Search) | Focus search input; `Enter` — search, `Esc` — unfocus |
+| `PageDown` / `PageUp` (Search) | Jump ±10 rows; PageDown near the end loads the next page (30/page) |
 | `f` (elsewhere) / `g` | Flow Modes modal (My Flow / moods / genres) |
 | `m` / `M` | Track Menu: ❤️ favorite, ➕ playlist, 📻 Song Radio, ℹ️ info |
 | `y` | Toggle lyrics panel |
@@ -133,7 +134,7 @@ src/
     ├── theme.rs          # TrueColor palette + turquoise→violet gradient
     ├── widgets/
     │   ├── spectrum.rs   # sub-symbol bar widget with peak holds, 1:1 rendering (v2.3)
-    │   ├── cover_art.rs  # TrueColor 1:1-pixel cover renderer (Lanczos3, '▀' half-blocks)
+    │   ├── cover_art.rs  # sextant 2×3 cover renderer (U+1FB00–U+1FB3B, fg/bg clustering)
     │   └── modal.rs      # popups: Choose Playlist, Track Menu, Flow Modes, Track & Stream Info
     └── views/
         ├── now_playing.rs  # cover + metadata + lyrics panel
@@ -146,7 +147,7 @@ src/
 ## Development
 
 ```sh
-cargo test                                   # 110 tests (render tests: 120×40 and 40×12)
+cargo test                                   # 114 tests (render tests: 120×40 and 40×12)
 cargo clippy --all-targets -- -D warnings   # zero-warning policy
 cargo build --release
 ```
@@ -163,12 +164,13 @@ Milestones and per-phase changelog — [CHANGELOG.md](CHANGELOG.md). Per-phase p
 cavacore на Rust). Один бинарник, без GUI-toolkit; единственный внешний запрос к
 системе — ALSA/PipeWire для вывода звука.
 
-Пять вкладок: **Now Playing** (крупная обложка 500×500, TrueColor 1:1-пиксели +
-синхронные lyrics), **Search**, **Library** (плейлисты + сортируемая таблица треков
+Пять вкладок: **Now Playing** (крупная обложка 500×500, sextant 2×3 — 6 субпикселей
+на ячейку + синхронные lyrics), **Search**, **Library** (плейлисты + сортируемая таблица треков
 с колонкой ADDED), **Flow** (бесконечные рекомендации + живые lyrics), **Settings**
 (ARL-токен, качество, спектр, dB-масштаб). С любого трека — **Track Menu** (`m`/`M`:
 избранное, плейлист, Song Radio, инфо) и **Flow Modes** (`f`/`g`: My Flow /
-настроения / жанры). Интеграция MPRIS: аппаратные клавиши мультимедиа, виджеты
+настроения / жанры). Поиск: мгновенные совпадения по локальной медиатеке и
+бесконечная подгрузка результатов (30/страницу, `PageDown`). Интеграция MPRIS: аппаратные клавиши мультимедиа, виджеты
 «сейчас играет» GNOME/KDE, `playerctl`. Gapless-предзагрузка следующего трека
 начинается за 20 секунд до конца текущего; счётчик поколений `playback_seq`
 устраняет гонки при быстром переключении треков.
