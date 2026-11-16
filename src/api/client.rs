@@ -518,6 +518,104 @@ impl DeezerClient {
             .map_err(|e| DeezerError::Api(format!("Failed to parse flow: {e}")))
     }
 
+    pub async fn get_track_radio(&self, track_id: &str) -> Result<Vec<TrackData>, DeezerError> {
+        if self.is_authenticated() {
+            let params = json!({
+                "SNG_ID": track_id,
+                "START": 0,
+                "NB": 25,
+            });
+            if let Ok(results) = self.gw_call("radio.getSongRadio", params).await {
+                let data = results.get("data").unwrap_or(&results);
+                if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone()) {
+                    if !tracks.is_empty() {
+                        return Ok(tracks);
+                    }
+                }
+            }
+        }
+
+        // Fallback: поиск треков по текущему артисту
+        if let Ok(track) = self.get_track(track_id).await {
+            let q = format!("artist:\"{}\"", track.artist);
+            if let Ok(results) = self.search(&q).await {
+                if !results.data.is_empty() {
+                    return Ok(results.data);
+                }
+            }
+        }
+        self.get_public_chart().await
+    }
+
+    pub async fn get_mood_flow(&self, mood_id: &str) -> Result<Vec<TrackData>, DeezerError> {
+        if self.is_authenticated() {
+            if let Some(ref session) = self.session {
+                let params = json!({
+                    "user_id": session.user_id,
+                    "config_id": mood_id,
+                });
+                if let Ok(results) = self.gw_call("radio.getUserRadio", params).await {
+                    let data = results.get("data").unwrap_or(&results);
+                    if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone()) {
+                        if !tracks.is_empty() {
+                            return Ok(tracks);
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: поиск по названию настроения
+        if let Ok(results) = self.search(mood_id).await {
+            if !results.data.is_empty() {
+                return Ok(results.data);
+            }
+        }
+        self.get_public_chart().await
+    }
+
+    pub async fn get_genre_flow(&self, genre_id: &str) -> Result<Vec<TrackData>, DeezerError> {
+        if self.is_authenticated() {
+            if let Some(ref session) = self.session {
+                let params = json!({
+                    "user_id": session.user_id,
+                    "genre_id": genre_id,
+                });
+                if let Ok(results) = self.gw_call("radio.getUserRadio", params).await {
+                    let data = results.get("data").unwrap_or(&results);
+                    if let Ok(tracks) = serde_json::from_value::<Vec<TrackData>>(data.clone()) {
+                        if !tracks.is_empty() {
+                            return Ok(tracks);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: получение радиостанций жанра через публичный API Deezer
+        let radios_url = format!("https://api.deezer.com/genre/{genre_id}/radios");
+        if let Ok(resp) = self.http.get(&radios_url).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(first_radio) = json.get("data").and_then(|d| d.get(0)) {
+                    if let Some(radio_id) = first_radio.get("id").and_then(|v| v.as_u64()) {
+                        let tracks_url = format!("https://api.deezer.com/radio/{radio_id}/tracks");
+                        if let Ok(t_resp) = self.http.get(&tracks_url).send().await {
+                            if let Ok(t_json) = t_resp.json::<serde_json::Value>().await {
+                                if let Some(arr) = t_json.get("data").and_then(|d| d.as_array()) {
+                                    let parsed = Self::parse_public_tracks(arr);
+                                    if !parsed.is_empty() {
+                                        return Ok(parsed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.get_public_chart().await
+    }
+
     pub async fn get_lyrics(&self, track_id: &str) -> Result<Lyrics, DeezerError> {
         let session = self
             .session

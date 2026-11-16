@@ -24,6 +24,7 @@ pub struct FlowLyrics {
     pub show_lyrics: bool,
     pub spectrum: Spectrum,
     pub cover: Option<CoverArt>,
+    pub flow_mode_label: String,
 }
 
 impl Default for FlowLyrics {
@@ -81,6 +82,7 @@ impl FlowLyrics {
             show_lyrics: true,
             spectrum,
             cover: Some(CoverArt::solid(0x4F, 0xD1, 0xC5)),
+            flow_mode_label: String::from("My Flow"),
         }
     }
 
@@ -151,7 +153,10 @@ impl Widget for &FlowLyrics {
             .fg(theme::color_from_hex(theme::GRAD_END))
             .bold();
         let lyr_state = if self.show_lyrics { "ON" } else { "OFF" };
-        let header = format!("FLOW • Infinite Recommendations  [y: Lyrics {lyr_state}]");
+        let header = format!(
+            "FLOW ● {}  │ [f] Flow Mode  [m] Track Menu  [y: Lyrics {}]",
+            self.flow_mode_label, lyr_state
+        );
         buf.set_string(area.x, area.y, FlowLyrics::truncate(&header, w as usize), title_style);
 
         if h < 3 {

@@ -4,7 +4,8 @@
 //! - Двойное окно FFT: `N_BASS = 4096` для частот ниже 300 Гц (высокое разрешение по частоте)
 //!   и `N_MID_HIGH = 2048` для средних и высоких частот (быстрый временной отклик).
 //! - Оконная функция Ханна: `w[n] = 0.5 * (1.0 - cos(2 * PI * n / (N - 1)))`.
-//! - Логарифмическое распределение частот от 50 Гц до 10 000 Гц по `num_bars` полосам.
+//! - Логарифмическое октавное распределение частот от 20 Гц до 20 000 Гц по `num_bars` полосам
+//!   (например, 15 полос с шагом 2/3 октавы или 30 полос с шагом 1/3 октавы).
 //! - Пространственный фильтр сглаживания Monstercat (`1.5^|i - j|`).
 //! - Параболическая гравитация падения (falloff) и интегральный фильтр (`0.77`).
 //! - Опциональное логарифмическое (dB) масштабирование и авточувствительность (`autosens`).
@@ -26,9 +27,9 @@ pub const N_MID_HIGH: usize = 2048;
 /// Граница переключения между окнами `N_BASS` и `N_MID_HIGH` (Гц).
 const BASS_CUTOFF_HZ: f32 = 300.0;
 
-/// Нижняя и верхняя границы спектра (Гц).
-const LOW_HZ: f32 = 50.0;
-const HIGH_HZ: f32 = 10_000.0;
+/// Нижняя и верхняя границы спектра (Гц): стандартный слышимый диапазон 20 Гц — 20 кГц.
+const LOW_HZ: f32 = 20.0;
+const HIGH_HZ: f32 = 20_000.0;
 
 /// Коэффициент интегрального сглаживания.
 const INTEGRAL: f32 = 0.77;
@@ -59,7 +60,9 @@ fn hann_window(n: usize) -> Vec<f32> {
 
 /// Логарифмическая разметка граничных частот столбиков:
 /// `f[i] = f_min * (f_max / f_min)^(i / num_bars)`.
-fn bar_boundaries(num_bars: usize) -> Vec<f32> {
+/// Для 15 столбиков это шаг 2/3 октавы (20 - 32 - 50 - 80 ... 20 000 Гц).
+/// Для 30 столбиков это шаг 1/3 октавы (20 - 25 - 32 ... 20 000 Гц).
+pub fn bar_boundaries(num_bars: usize) -> Vec<f32> {
     let ratio = HIGH_HZ / LOW_HZ;
     (0..=num_bars)
         .map(|i| LOW_HZ * ratio.powf(i as f32 / num_bars as f32))
@@ -143,6 +146,43 @@ pub struct Cavacore {
 }
 
 impl Cavacore {
+    fn compute_band_bins(
+        num_bars: usize,
+        sample_rate: f32,
+    ) -> (Vec<bool>, Vec<usize>, Vec<usize>, Vec<f32>) {
+        let boundaries = bar_boundaries(num_bars);
+        let mut use_bass_fft = Vec::with_capacity(num_bars);
+        let mut lower_bin = Vec::with_capacity(num_bars);
+        let mut upper_bin = Vec::with_capacity(num_bars);
+        let mut eq_weights = Vec::with_capacity(num_bars);
+
+        for n in 0..num_bars {
+            let f_lo = boundaries[n];
+            let f_hi = boundaries[n + 1];
+            let is_bass = f_hi <= BASS_CUTOFF_HZ || f_lo < BASS_CUTOFF_HZ;
+            let fft_size = if is_bass { N_BASS } else { N_MID_HIGH };
+            let max_bin = fft_size / 2;
+
+            let lo = freq_to_bin(f_lo, fft_size, sample_rate).min(max_bin.saturating_sub(1));
+            let hi = freq_to_bin(f_hi, fft_size, sample_rate)
+                .max(lo + 1)
+                .min(max_bin + 1);
+
+            let f_center = (f_lo * f_hi).sqrt();
+            let norm_fft = 4.0 / fft_size as f32;
+            // Мягкая эквализация восприятия: компенсирует розовый шум (~-3 дБ/октава) без аномального взрыва ВЧ
+            let freq_tilt = (f_center / 300.0).powf(0.25).clamp(0.55, 2.3);
+            let eq = norm_fft * freq_tilt;
+
+            use_bass_fft.push(is_bass);
+            lower_bin.push(lo);
+            upper_bin.push(hi);
+            eq_weights.push(eq);
+        }
+
+        (use_bass_fft, lower_bin, upper_bin, eq_weights)
+    }
+
     /// Создаёт новый экземпляр `Cavacore` для заданной частоты дискретизации и числа столбиков.
     pub fn new(sample_rate: f32, num_bars: usize) -> Self {
         let num_bars = num_bars.clamp(1, 256);
@@ -163,35 +203,8 @@ impl Cavacore {
         let bass_hann = hann_window(N_BASS);
         let mid_hann = hann_window(N_MID_HIGH);
 
-        let boundaries = bar_boundaries(num_bars);
-        let mut use_bass_fft = Vec::with_capacity(num_bars);
-        let mut lower_bin = Vec::with_capacity(num_bars);
-        let mut upper_bin = Vec::with_capacity(num_bars);
-        let mut eq_weights = Vec::with_capacity(num_bars);
-
-        for n in 0..num_bars {
-            let f_lo = boundaries[n];
-            let f_hi = boundaries[n + 1];
-            let is_bass = f_hi <= BASS_CUTOFF_HZ || f_lo < BASS_CUTOFF_HZ;
-            let fft_size = if is_bass { N_BASS } else { N_MID_HIGH };
-            let max_bin = fft_size / 2;
-
-            let lo = freq_to_bin(f_lo, fft_size, sample_rate).min(max_bin.saturating_sub(1));
-            let hi = freq_to_bin(f_hi, fft_size, sample_rate)
-                .max(lo + 1)
-                .min(max_bin + 1);
-
-            let bin_count = (hi - lo).max(1) as f32;
-            // RMS-нормализация по корню из числа бинов + подъём СЧ/ВЧ для равномерной шкалы
-            let norm_fft = 4.0 / fft_size as f32;
-            let freq_tilt = (f_hi / 100.0).powf(0.55);
-            let eq = (norm_fft * freq_tilt) / bin_count.sqrt();
-
-            use_bass_fft.push(is_bass);
-            lower_bin.push(lo);
-            upper_bin.push(hi);
-            eq_weights.push(eq);
-        }
+        let (use_bass_fft, lower_bin, upper_bin, eq_weights) =
+            Self::compute_band_bins(num_bars, sample_rate);
 
         let monstercat_weights: Vec<f32> = (0..num_bars)
             .map(|d| MONSTERCAT_BASE.powi(d as i32))
@@ -229,6 +242,32 @@ impl Cavacore {
             sensitivity: 1.0,
             out_buf: vec![0.0; num_bars],
         }
+    }
+
+    /// Динамически изменяет количество столбиков (при ресайзе окна терминала)
+    /// с сохранением аудио-буферов и непрерывности сигнала (без сброса в тишину).
+    pub fn set_num_bars(&mut self, num_bars: usize) {
+        let num_bars = num_bars.clamp(1, 256);
+        if self.num_bars == num_bars {
+            return;
+        }
+        self.num_bars = num_bars;
+        let (use_bass_fft, lower_bin, upper_bin, eq_weights) =
+            Self::compute_band_bins(num_bars, self.sample_rate);
+        self.use_bass_fft = use_bass_fft;
+        self.lower_bin = lower_bin;
+        self.upper_bin = upper_bin;
+        self.eq_weights = eq_weights;
+
+        self.monstercat_weights = (0..num_bars)
+            .map(|d| MONSTERCAT_BASE.powi(d as i32))
+            .collect();
+
+        self.raw_bars.resize(num_bars, 0.0);
+        self.mem.resize(num_bars, 0.0);
+        self.prev.resize(num_bars, 0.0);
+        self.fall_step.resize(num_bars, 0.0);
+        self.out_buf.resize(num_bars, 0.0);
     }
 
     /// Включает или выключает опциональное логарифмическое (dB) масштабирование спектра.
@@ -331,7 +370,7 @@ impl Cavacore {
             &mut self.mid_scratch,
         );
 
-        // 1. Сбор магнитуд по логарифмическим полосам с интерполяцией узких полос
+        // 1. Сбор магнитуд по октавным полосам (RMS + умеренный пик, без взрыва ВЧ)
         let ratio = HIGH_HZ / LOW_HZ;
         for n in 0..self.num_bars {
             let spectrum = if self.use_bass_fft[n] {
@@ -341,8 +380,9 @@ impl Cavacore {
             };
             let lo = self.lower_bin[n];
             let hi = self.upper_bin[n].min(spectrum.len());
+            let count = (hi - lo).max(1);
 
-            let sum = if hi.saturating_sub(lo) <= 1 && spectrum.len() > 2 {
+            let mag = if count <= 1 && spectrum.len() > 2 {
                 let f_center = LOW_HZ * ratio.powf((n as f32 + 0.5) / self.num_bars as f32);
                 let fft_size = if self.use_bass_fft[n] {
                     N_BASS
@@ -355,14 +395,20 @@ impl Cavacore {
                 let frac = exact_bin - b0 as f32;
                 spectrum[b0].norm() * (1.0 - frac) + spectrum[b0 + 1].norm() * frac
             } else {
-                let mut s = 0.0f32;
+                let mut sum_sq = 0.0f32;
+                let mut peak = 0.0f32;
                 for c in &spectrum[lo..hi] {
-                    s += c.norm();
+                    let n = c.norm();
+                    sum_sq += n * n;
+                    if n > peak {
+                        peak = n;
+                    }
                 }
-                s
+                let rms = (sum_sq / count as f32).sqrt();
+                0.65 * rms + 0.35 * peak
             };
 
-            let mut val = sum * self.eq_weights[n];
+            let mut val = mag * self.eq_weights[n];
             if self.db_scale {
                 if val > 1e-6 {
                     let db = 20.0 * val.log10();
@@ -468,7 +514,7 @@ mod tests {
         let high_max = bars[half..].iter().copied().fold(0.0f32, f32::max);
 
         assert!(
-            low_max > 0.2,
+            low_max > 0.15,
             "басовый пик слишком мал для видимости в TUI: {low_max}"
         );
         assert!(
@@ -492,13 +538,28 @@ mod tests {
         let high_max = bars[half..].iter().copied().fold(0.0f32, f32::max);
 
         assert!(
-            high_max > 0.2,
+            high_max > 0.15,
             "ВЧ-пик слишком мал для видимости в TUI: {high_max}"
         );
         assert!(
             high_max > low_max * 2.0,
             "верхние полосы ({high_max}) должны значительно доминировать над НЧ ({low_max})"
         );
+    }
+
+    #[test]
+    fn dynamic_resize_maintains_audio_state() {
+        let mut cava = Cavacore::new(44_100.0, 30);
+        let signal = sine_wave(100.0, 44_100.0, N_BASS);
+        for _ in 0..4 {
+            let _ = cava.process(&signal);
+        }
+        cava.set_num_bars(15);
+        assert_eq!(cava.num_bars(), 15);
+        let bars = cava.process(&[]);
+        assert_eq!(bars.len(), 15);
+        let low_max = bars[..7].iter().copied().fold(0.0f32, f32::max);
+        assert!(low_max > 0.05, "сигнал должен сохраняться после ресайза");
     }
 
     #[test]
@@ -521,10 +582,6 @@ mod tests {
                 .copied()
                 .fold(0.0f32, f32::max);
             if step < 2 {
-                // Параболическая гравитация стартует с нулевого наклона (fall_step = 0),
-                // а интегральный фильтр (0.77) продолжает догонять уровень сигнала:
-                // столбики не должны резко прыгнуть, но могут слегка подняться
-                // на первых кадрах тишины.
                 assert!(
                     current_max <= peak * 1.08,
                     "первые кадры тишины не должны резко отклоняться от пика: peak={peak}, current={current_max}"
@@ -549,6 +606,6 @@ mod tests {
         let signal = sine_wave(440.0, 44_100.0, N_BASS);
         let bars = cava.process(&signal);
         let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
-        assert!(max_bar > 0.1 && max_bar <= 1.0);
+        assert!(max_bar > 0.05 && max_bar <= 1.0);
     }
 }

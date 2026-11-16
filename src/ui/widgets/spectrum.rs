@@ -122,18 +122,19 @@ impl Widget for &Spectrum {
         }
         let total_rows = h as u32;
         let total_subpixels = total_rows * 8;
-        let fit_bars = (w as usize).div_ceil(2).min(self.bars.len());
+        let fit_bars = (w as usize).div_ceil(2);
+        let n_bars = self.bars.len().min(fit_bars);
 
-        for b in 0..fit_bars {
+        for b in 0..n_bars {
             let col = (b * 2) as u16;
             if col >= w {
                 break;
             }
             let x = area.x + col;
-            let v = Spectrum::sample_slice(&self.bars, b, fit_bars).clamp(0.0, 1.0);
+            let v = self.bars[b].clamp(0.0, 1.0);
             let style = Spectrum::bar_style(v);
             let total_fill = (v * (total_subpixels as f32)) as u32;
-            let ph = Spectrum::sample_slice(&self.peak_holds, b, fit_bars).clamp(0.0, 1.0);
+            let ph = self.peak_holds.get(b).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             let ph_row = (ph * (total_rows as f32)).min(total_rows as f32 - 1.0) as u32;
 
             for r in 0..total_rows {

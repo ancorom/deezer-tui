@@ -14,6 +14,7 @@ use ratatui::style::{Color, Style};
 
 pub const BG_TERMINAL: u32 = 0x13151F;
 pub const BG_CARD: u32 = 0x1E2233;
+pub const BG_ELEVATED: u32 = 0x252842;
 pub const BORDER: u32 = 0x3E445E;
 pub const TEXT_PRIMARY: u32 = 0xECEFF4;
 pub const TEXT_SECONDARY: u32 = 0x94A3B8;

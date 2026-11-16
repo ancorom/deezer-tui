@@ -184,7 +184,7 @@ impl NowPlaying {
 
         if cursor_y < area.bottom() {
             let lyr_state = if self.show_lyrics { "ON" } else { "OFF" };
-            let hints = format!("[y] Lyrics: {lyr_state}   [i] Track Info   [v] Spectrum");
+            let hints = format!("[y] Lyrics: {lyr_state}   [m] Track Menu   [i] Track Info   [v] Spectrum");
             let truncated: String = hints.chars().take(max_w).collect();
             buf.set_string(area.x, cursor_y, &truncated, dim_style);
         }

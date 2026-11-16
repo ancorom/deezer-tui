@@ -125,6 +125,22 @@ pub enum BgEvent {
     },
     FlowMoreLoaded(Vec<TrackData>),
     FlowLoadFailed,
+    TrackRadioLoaded {
+        seed_title: String,
+        tracks: Vec<TrackData>,
+    },
+    FlowModeTracksLoaded {
+        mode_label: String,
+        tracks: Vec<TrackData>,
+    },
+    PlaylistModified {
+        message: String,
+    },
+    FavoriteToggled {
+        track_id: String,
+        is_favorite: bool,
+        title: String,
+    },
     TrackStarted {
         req_id: u64,
         track: TrackData,
@@ -141,6 +157,27 @@ pub enum BgEvent {
     },
     PlaybackError(String),
 }
+
+pub const FLOW_MODES: &[(&str, &str, bool, &str)] = &[
+    ("🎵 My Flow (Персональный бесконечный поток)", "my_flow", false, "standard"),
+    ("🧘 Настроение: Chill (Релакс и спокойствие)", "mood_chill", false, "chill"),
+    ("⚡ Настроение: Motivation (Бодрость и энергия)", "mood_motivation", false, "motivation"),
+    ("🎉 Настроение: Party (Вечеринка и драйв)", "mood_party", false, "party"),
+    ("🎯 Настроение: Focus (Концентрация и работа)", "mood_focus", false, "focus"),
+    ("💖 Настроение: Romance (Романтический вечер)", "mood_romance", false, "romance"),
+    ("🌧️ Настроение: Melancholy (Грусть и размышления)", "mood_melancholy", false, "sad"),
+    ("🏃 Настроение: Workout (Спорт и тренировки)", "mood_workout", false, "workout"),
+    ("🎸 Жанр: Rock (Рок-музыка)", "genre_rock", true, "152"),
+    ("🎤 Жанр: Pop (Поп-хиты)", "genre_pop", true, "132"),
+    ("🎧 Жанр: Rap & Hip-Hop (Рэп и хип-хоп)", "genre_rap", true, "116"),
+    ("🎛️ Жанр: Electronic & Dance (Электроника и клуб)", "genre_electronic", true, "113"),
+    ("🤘 Жанр: Metal (Тяжёлый метал)", "genre_metal", true, "464"),
+    ("🎷 Жанр: Jazz & Blues (Джаз и блюз)", "genre_jazz", true, "129"),
+    ("🎻 Жанр: Classical (Классическая музыка)", "genre_classical", true, "98"),
+    ("🌴 Жанр: Reggae (Регги)", "genre_reggae", true, "144"),
+    ("🪕 Жанр: Indie & Alternative (Инди)", "genre_indie", true, "85"),
+    ("🔥 Жанр: Soundtracks (Музыка из кино)", "genre_soundtracks", true, "173"),
+];
 
 pub struct App {
     pub now_playing: NowPlaying,
@@ -167,10 +204,19 @@ pub struct App {
     pub playing_from_flow: bool,
     pub loading_more_flow: bool,
 
-    // Модальные окна
+    // Модальные окна и меню действий
     pub show_arl_modal: bool,
     pub arl_input: String,
     pub show_track_info_modal: bool,
+    pub show_track_menu: bool,
+    pub track_menu_target: Option<TrackData>,
+    pub track_menu_selected: usize,
+    pub show_playlist_picker: bool,
+    pub playlist_picker_selected: usize,
+    pub show_flow_mode_modal: bool,
+    pub flow_mode_selected: usize,
+    pub current_flow_mode_idx: usize,
+    pub toast_message: Option<(String, Instant)>,
 
     // DSP, синхронизация прогресса, защита от гонок и аудиодвижок
     pub cavacore: Cavacore,
@@ -267,6 +313,15 @@ impl App {
             show_arl_modal: false,
             arl_input: cfg.effective_arl().unwrap_or_default(),
             show_track_info_modal: false,
+            show_track_menu: false,
+            track_menu_target: None,
+            track_menu_selected: 0,
+            show_playlist_picker: false,
+            playlist_picker_selected: 0,
+            show_flow_mode_modal: false,
+            flow_mode_selected: 0,
+            current_flow_mode_idx: 0,
+            toast_message: None,
             cavacore,
             vis_consumer: None,
             audio_output: None,
@@ -351,6 +406,7 @@ impl App {
         let tx = self.bg_tx.clone();
         let mut client = (*self.client).clone();
         let arl_opt = self.config.effective_arl();
+        let mode_idx = self.current_flow_mode_idx;
         self.rt.spawn(async move {
             if !client.is_authenticated()
                 && let Some(arl) = arl_opt
@@ -358,13 +414,216 @@ impl App {
             {
                 let _ = client.login_arl(&arl).await;
             }
-            if let Ok(more) = client.get_flow().await
+            let res = if let Some(mode) = FLOW_MODES.get(mode_idx) {
+                let (_, code, is_genre, param) = *mode;
+                if code == "my_flow" {
+                    client.get_flow().await
+                } else if is_genre {
+                    client.get_genre_flow(param).await
+                } else {
+                    client.get_mood_flow(param).await
+                }
+            } else {
+                client.get_flow().await
+            };
+
+            if let Ok(more) = res
                 && !more.is_empty()
             {
                 let _ = tx.send(BgEvent::FlowMoreLoaded(more));
             } else {
                 let _ = tx.send(BgEvent::FlowLoadFailed);
             }
+        });
+    }
+
+    pub fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast_message = Some((msg.into(), Instant::now()));
+    }
+
+    pub fn active_target_track(&self) -> Option<TrackData> {
+        let selected_track = match self.active_tab {
+            2 => self.search_tracks.get(self.search.selected).cloned(),
+            3 => {
+                if let Some(track) = self.library_tracks.get(self.library.selected_track) {
+                    Some(track.clone())
+                } else if let Some(row) = self
+                    .library
+                    .playlists
+                    .get(self.library.selected_playlist)
+                    .and_then(|p| p.tracks.get(self.library.selected_track))
+                {
+                    Some(TrackData {
+                        track_id: "0".into(),
+                        title: row.track.clone(),
+                        artist: row.artist.clone(),
+                        album: row.album.clone(),
+                        duration: row.time.clone(),
+                        ..Default::default()
+                    })
+                } else {
+                    self.current_track.clone()
+                }
+            }
+            4 => self.flow_tracks.get(self.flow_lyrics.selected_flow).cloned(),
+            _ => self.current_track.clone(),
+        };
+
+        selected_track
+            .or_else(|| self.current_track.clone())
+            .or_else(|| self.queue.tracks.get(self.queue.current_index).cloned())
+    }
+
+    pub fn is_track_favorite(&self, track_id: &str) -> bool {
+        if track_id.is_empty() || track_id == "0" {
+            return false;
+        }
+        self.library_tracks.iter().any(|t| t.track_id == track_id)
+    }
+
+    pub fn execute_track_menu_action(&mut self) {
+        let Some(track) = self.track_menu_target.clone() else {
+            self.show_track_menu = false;
+            return;
+        };
+
+        match self.track_menu_selected {
+            0 => {
+                // Избранное
+                self.show_track_menu = false;
+                let client = Arc::clone(&self.client);
+                let bg_tx = self.bg_tx.clone();
+                let tid = track.track_id.clone();
+                let title = track.title.clone();
+                let is_fav = self.is_track_favorite(&tid);
+
+                if is_fav {
+                    self.library_tracks.retain(|t| t.track_id != tid);
+                    self.set_toast(format!("💔 «{title}» удален из Любимых"));
+                    self.rt.spawn(async move {
+                        let _ = client.remove_favorite(&tid).await;
+                        let _ = bg_tx.send(BgEvent::FavoriteToggled {
+                            track_id: tid,
+                            is_favorite: false,
+                            title,
+                        });
+                    });
+                } else {
+                    self.library_tracks.push(track.clone());
+                    self.set_toast(format!("❤️ «{title}» добавлен в Любимые"));
+                    self.rt.spawn(async move {
+                        let _ = client.add_favorite(&tid).await;
+                        let _ = bg_tx.send(BgEvent::FavoriteToggled {
+                            track_id: tid,
+                            is_favorite: true,
+                            title,
+                        });
+                    });
+                }
+            }
+            1 => {
+                // Добавить в плейлист
+                if self.library.playlists.is_empty() {
+                    self.show_track_menu = false;
+                    self.set_toast("Нет доступных плейлистов");
+                } else {
+                    self.show_track_menu = false;
+                    self.show_playlist_picker = true;
+                    self.playlist_picker_selected = 0;
+                }
+            }
+            2 => {
+                // Запустить микс по треку
+                self.show_track_menu = false;
+                let client = Arc::clone(&self.client);
+                let bg_tx = self.bg_tx.clone();
+                let tid = track.track_id.clone();
+                let title = track.title.clone();
+                self.set_toast(format!("📻 Загрузка микса по треку «{title}»..."));
+                self.rt.spawn(async move {
+                    let tracks = client.get_track_radio(&tid).await.unwrap_or_default();
+                    let _ = bg_tx.send(BgEvent::TrackRadioLoaded {
+                        seed_title: title,
+                        tracks,
+                    });
+                });
+            }
+            3 => {
+                // Информация о треке
+                self.show_track_menu = false;
+                self.show_track_info_modal = true;
+            }
+            _ => {
+                // Закрыть
+                self.show_track_menu = false;
+            }
+        }
+    }
+
+    pub fn execute_add_to_selected_playlist(&mut self) {
+        self.show_playlist_picker = false;
+        let Some(track) = self.track_menu_target.clone() else {
+            return;
+        };
+        let Some(pl) = self.library.playlists.get_mut(self.playlist_picker_selected) else {
+            return;
+        };
+        let pl_id = pl.id.clone();
+        let pl_title = pl.title.clone();
+        let tid = track.track_id.clone();
+        let title = track.title.clone();
+
+        pl.tracks.push(SearchRow {
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            track: track.title.clone(),
+            time: track.formatted_duration(),
+            added: track.formatted_date_add(),
+            favorite: false,
+        });
+        pl.num_tracks = pl.tracks.len() as u64;
+
+        self.set_toast(format!("✓ «{title}» добавлен в «{pl_title}»"));
+
+        let client = Arc::clone(&self.client);
+        let bg_tx = self.bg_tx.clone();
+        self.rt.spawn(async move {
+            let msg = if pl_id == "fav" {
+                let _ = client.add_favorite(&tid).await;
+                format!("❤️ «{title}» добавлен в Избранное")
+            } else {
+                let _ = client.add_to_playlist(&pl_id, &[&tid]).await;
+                format!("✓ «{title}» сохранён в «{pl_title}»")
+            };
+            let _ = bg_tx.send(BgEvent::PlaylistModified { message: msg });
+        });
+    }
+
+    pub fn execute_select_flow_mode(&mut self) {
+        self.show_flow_mode_modal = false;
+        self.current_flow_mode_idx = self.flow_mode_selected;
+        let Some(mode) = FLOW_MODES.get(self.flow_mode_selected) else {
+            return;
+        };
+        let (label, code, is_genre, param) = *mode;
+        self.flow_lyrics.flow_mode_label = label.to_string();
+        self.set_toast(format!("Загрузка Flow: {label}..."));
+
+        let client = Arc::clone(&self.client);
+        let bg_tx = self.bg_tx.clone();
+        let mode_label = label.to_string();
+        self.rt.spawn(async move {
+            let tracks = if code == "my_flow" {
+                client.get_flow().await.unwrap_or_default()
+            } else if is_genre {
+                client.get_genre_flow(param).await.unwrap_or_default()
+            } else {
+                client.get_mood_flow(param).await.unwrap_or_default()
+            };
+            let _ = bg_tx.send(BgEvent::FlowModeTracksLoaded {
+                mode_label,
+                tracks,
+            });
         });
     }
 
@@ -628,9 +887,6 @@ impl App {
         if let Some(ref mut consumer) = self.vis_consumer {
             while let Ok(s) = consumer.pop() {
                 samples.push(s);
-                if samples.len() >= 2048 {
-                    break;
-                }
             }
         }
 
@@ -826,6 +1082,58 @@ impl App {
                 }
                 BgEvent::FlowLoadFailed => {
                     self.loading_more_flow = false;
+                }
+                BgEvent::TrackRadioLoaded { seed_title, tracks } => {
+                    if !tracks.is_empty() {
+                        self.playing_from_flow = false;
+                        self.flow_lyrics.flow = tracks
+                            .iter()
+                            .map(|t| FlowRow {
+                                title: t.title.clone(),
+                                artist: t.artist.clone(),
+                            })
+                            .collect();
+                        self.flow_tracks = tracks.clone();
+                        self.flow_lyrics.selected_flow = 0;
+                        if let Some(track) = self.queue.set_queue(tracks, 0) {
+                            self.start_track_playback(track);
+                        }
+                        self.set_toast(format!("📻 Запущен микс по треку «{seed_title}»"));
+                    } else {
+                        self.set_toast(format!("Не удалось найти микс для «{seed_title}»"));
+                    }
+                }
+                BgEvent::FlowModeTracksLoaded { mode_label, tracks } => {
+                    if !tracks.is_empty() {
+                        self.flow_lyrics.flow_mode_label = mode_label.clone();
+                        self.flow_lyrics.flow = tracks
+                            .iter()
+                            .map(|t| FlowRow {
+                                title: t.title.clone(),
+                                artist: t.artist.clone(),
+                            })
+                            .collect();
+                        self.flow_tracks = tracks.clone();
+                        self.flow_lyrics.selected_flow = 0;
+                        self.playing_from_flow = true;
+                        if let Some(track) = self.queue.set_queue(tracks, 0) {
+                            self.start_track_playback(track);
+                        }
+                        self.set_toast(format!("✓ Включен поток: {mode_label}"));
+                    } else {
+                        self.set_toast(format!("Не удалось загрузить поток: {mode_label}"));
+                    }
+                }
+                BgEvent::PlaylistModified { message } => {
+                    self.set_toast(message);
+                }
+                BgEvent::FavoriteToggled { track_id, is_favorite, title } => {
+                    if is_favorite {
+                        self.set_toast(format!("❤️ «{title}» добавлен в Любимые"));
+                    } else {
+                        self.library_tracks.retain(|t| t.track_id != track_id);
+                        self.set_toast(format!("💔 «{title}» удален из Любимых"));
+                    }
                 }
                 BgEvent::TrackStarted {
                     req_id,
@@ -1562,9 +1870,24 @@ impl App {
             .fg(theme::color_from_hex(theme::TEXT_SECONDARY))
             .bg(theme::color_from_hex(theme::BG_TERMINAL));
         let hotkeys =
-            "q quit | 1-5 views | [/] search | [y] lyrics | [o/r] sort | [i] track info | [s] sidebar | [v] spectrum";
+            "q quit | 1-5 views | [/] search | [y] lyrics | [m] track menu | [f] flow modes | [o/r] sort | [i] info | [s] sidebar | [v] spectrum";
         let truncated: String = hotkeys.chars().take(area.width as usize).collect();
         buf.set_string(area.left(), y, &truncated, style);
+
+        if let Some((msg, instant)) = &self.toast_message {
+            if instant.elapsed() < Duration::from_millis(3000) {
+                let toast_style = Style::default()
+                    .fg(theme::color_from_hex(theme::BG_TERMINAL))
+                    .bg(theme::color_from_hex(theme::GRAD_END))
+                    .bold();
+                let toast_text = format!(" {msg} ");
+                let tw = toast_text.chars().count() as u16;
+                if tw < area.width {
+                    let tx = area.right().saturating_sub(tw);
+                    buf.set_string(tx, y, &toast_text, toast_style);
+                }
+            }
+        }
     }
 
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
@@ -1668,6 +1991,77 @@ impl App {
                     ))
                         .render(m_area, buf);
                 }
+
+                if self.show_track_menu {
+                    let target_name = self
+                        .track_menu_target
+                        .as_ref()
+                        .map(|t| format!("{} — {}", t.title, t.artist))
+                        .unwrap_or_else(|| "Track".into());
+                    let is_fav = self
+                        .track_menu_target
+                        .as_ref()
+                        .map(|t| self.is_track_favorite(&t.track_id))
+                        .unwrap_or(false);
+                    let fav_opt = if is_fav {
+                        "💔  Удалить из Любимых треков"
+                    } else {
+                        "❤️   Добавить в Любимые треки"
+                    };
+                    let options = vec![
+                        fav_opt.to_string(),
+                        "➕  Добавить в плейлист...".to_string(),
+                        "📻  Запустить Микс по треку".to_string(),
+                        "ℹ️   Информация о треке и потоке".to_string(),
+                        "✕   Закрыть меню [Esc]".to_string(),
+                    ];
+                    let title = format!(" МЕНЮ ТРЕКА: {target_name} ");
+                    let mw = (title.chars().count() as u16 + 6).min(inner.width).max(48);
+                    let mh = (options.len() as u16 + 3).min(inner.height).max(5);
+                    let mx = inner.x + (inner.width.saturating_sub(mw)) / 2;
+                    let my = inner.y + (inner.height.saturating_sub(mh)) / 2;
+                    let m_area = Rect::new(mx, my, mw, mh);
+                    (&Modal::new(title, options, self.track_menu_selected)).render(m_area, buf);
+                }
+
+                if self.show_playlist_picker {
+                    let rows: Vec<String> = self
+                        .library
+                        .playlists
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| format!("{}. {} ({} треков)", i + 1, p.title, p.num_tracks))
+                        .collect();
+                    let mw = 56.min(inner.width).max(3);
+                    let mh = (rows.len() as u16 + 3).clamp(5, inner.height.saturating_sub(2));
+                    let mx = inner.x + (inner.width.saturating_sub(mw)) / 2;
+                    let my = inner.y + (inner.height.saturating_sub(mh)) / 2;
+                    let m_area = Rect::new(mx, my, mw, mh);
+                    (&Modal::new(
+                        " ВЫБЕРИТЕ ПЛЕЙЛИСТ [Enter: Добавить, Esc: Отмена] ",
+                        rows,
+                        self.playlist_picker_selected,
+                    ))
+                        .render(m_area, buf);
+                }
+
+                if self.show_flow_mode_modal {
+                    let rows: Vec<String> = FLOW_MODES
+                        .iter()
+                        .map(|(label, _, _, _)| label.to_string())
+                        .collect();
+                    let mw = 64.min(inner.width).max(3);
+                    let mh = (rows.len() as u16 + 3).clamp(6, inner.height.saturating_sub(2));
+                    let mx = inner.x + (inner.width.saturating_sub(mw)) / 2;
+                    let my = inner.y + (inner.height.saturating_sub(mh)) / 2;
+                    let m_area = Rect::new(mx, my, mw, mh);
+                    (&Modal::new(
+                        " ВЫБОР РЕЖИМА FLOW [Enter: Включить, Esc: Отмена] ",
+                        rows,
+                        self.flow_mode_selected,
+                    ))
+                        .render(m_area, buf);
+                }
             }
         }
     }
@@ -1690,10 +2084,14 @@ impl App {
                 let area = frame.area();
                 let desired_bars = ((area.width as usize).div_ceil(2)).clamp(8, 160);
                 if self.cavacore.num_bars() != desired_bars && area.width >= 16 {
-                    self.cavacore = Cavacore::new(self.config.sample_rate_hz, desired_bars)
-                        .with_db_scale(self.config.db_scale);
+                    self.cavacore.set_num_bars(desired_bars);
                     let resized_bars = self.cavacore.process(&[]);
+                    self.global_spectrum = Spectrum::new(desired_bars);
                     self.global_spectrum.set_bars(resized_bars);
+                    self.now_playing.spectrum = Spectrum::new(desired_bars);
+                    self.now_playing.spectrum.set_bars(resized_bars);
+                    self.flow_lyrics.spectrum = Spectrum::new(desired_bars);
+                    self.flow_lyrics.spectrum.set_bars(resized_bars);
                 }
                 self.render(frame.buffer_mut(), area);
             });
@@ -1741,6 +2139,91 @@ impl App {
             match k.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('i') | KeyCode::Char('I') => {
                     self.show_track_info_modal = false;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.show_track_menu {
+            let options_count = 5;
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('M') => {
+                    self.show_track_menu = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.track_menu_selected > 0 {
+                        self.track_menu_selected -= 1;
+                    } else {
+                        self.track_menu_selected = options_count - 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.track_menu_selected + 1 < options_count {
+                        self.track_menu_selected += 1;
+                    } else {
+                        self.track_menu_selected = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.execute_track_menu_action();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.show_playlist_picker {
+            let count = self.library.playlists.len();
+            match k.code {
+                KeyCode::Esc => {
+                    self.show_playlist_picker = false;
+                    self.show_track_menu = true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.playlist_picker_selected > 0 {
+                        self.playlist_picker_selected -= 1;
+                    } else if count > 0 {
+                        self.playlist_picker_selected = count - 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.playlist_picker_selected + 1 < count {
+                        self.playlist_picker_selected += 1;
+                    } else {
+                        self.playlist_picker_selected = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.execute_add_to_selected_playlist();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if self.show_flow_mode_modal {
+            let count = FLOW_MODES.len();
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.show_flow_mode_modal = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.flow_mode_selected > 0 {
+                        self.flow_mode_selected -= 1;
+                    } else {
+                        self.flow_mode_selected = count - 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.flow_mode_selected + 1 < count {
+                        self.flow_mode_selected += 1;
+                    } else {
+                        self.flow_mode_selected = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.execute_select_flow_mode();
                 }
                 _ => {}
             }
@@ -1861,8 +2344,26 @@ impl App {
                 self.active_tab = 2;
                 self.set_search_input_focus(true);
             }
-            KeyCode::Char('f') | KeyCode::Char('F') if self.active_tab == 2 => {
-                self.set_search_input_focus(true);
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                if self.active_tab == 2 {
+                    self.set_search_input_focus(true);
+                } else {
+                    self.show_flow_mode_modal = true;
+                    self.flow_mode_selected = self.current_flow_mode_idx;
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') => {
+                self.show_flow_mode_modal = true;
+                self.flow_mode_selected = self.current_flow_mode_idx;
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                if let Some(track) = self.active_target_track() {
+                    self.track_menu_target = Some(track);
+                    self.track_menu_selected = 0;
+                    self.show_track_menu = true;
+                } else {
+                    self.set_toast("Нет выбранного трека для меню");
+                }
             }
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('1') => self.active_tab = 1,
@@ -2270,7 +2771,14 @@ impl App {
     }
 
     fn press_escape(&mut self) {
-        if self.show_arl_modal {
+        if self.show_track_menu {
+            self.show_track_menu = false;
+        } else if self.show_playlist_picker {
+            self.show_playlist_picker = false;
+            self.show_track_menu = true;
+        } else if self.show_flow_mode_modal {
+            self.show_flow_mode_modal = false;
+        } else if self.show_arl_modal {
             self.show_arl_modal = false;
         } else if self.show_track_info_modal {
             self.show_track_info_modal = false;
@@ -2547,6 +3055,143 @@ mod tests {
             app.library.selected_track, 0,
             "фоновая таблица треков не должна двигаться при открытом модальном окне!"
         );
+    }
+
+    #[test]
+    fn track_context_menu_opens_navigates_and_toggles_favorite() {
+        let mut app = App::new();
+        app.active_tab = 1;
+        app.current_track = Some(TrackData {
+            track_id: "42".into(),
+            title: "Test Track".into(),
+            artist: "Test Artist".into(),
+            ..Default::default()
+        });
+
+        // Открытие меню по 'm'
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_track_menu);
+        assert_eq!(app.track_menu_selected, 0);
+
+        // Навигация вниз/вверх
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.track_menu_selected, 1);
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.track_menu_selected, 0);
+
+        // Добавление в избранное по Enter
+        assert!(!app.is_track_favorite("42"));
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_track_menu);
+        assert!(app.is_track_favorite("42"));
+        assert!(app.toast_message.is_some());
+
+        // Повторное открытие и закрытие по Esc
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_track_menu);
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_track_menu);
+    }
+
+    #[test]
+    fn playlist_picker_modal_and_add_to_playlist() {
+        let mut app = App::new();
+        app.active_tab = 1;
+        app.current_track = Some(TrackData {
+            track_id: "99".into(),
+            title: "Song 99".into(),
+            artist: "Artist 99".into(),
+            album: "Album 99".into(),
+            ..Default::default()
+        });
+        app.library.playlists = vec![PlaylistEntry {
+            id: "pl_1".into(),
+            title: "Road Trip".into(),
+            num_tracks: 0,
+            tracks: Vec::new(),
+        }];
+
+        // Открываем меню трека
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        // Переходим на пункт 1: "Добавить в плейлист..."
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!app.show_track_menu);
+        assert!(app.show_playlist_picker);
+        assert_eq!(app.playlist_picker_selected, 0);
+
+        // Выбираем плейлист
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_playlist_picker);
+        assert_eq!(app.library.playlists[0].num_tracks, 1);
+        assert_eq!(app.library.playlists[0].tracks[0].track, "Song 99");
+    }
+
+    #[test]
+    fn flow_mode_modal_selects_mood_and_genre() {
+        let mut app = App::new();
+        app.active_tab = 4; // Flow view
+
+        // Нажатие 'f' открывает выбор режимов Flow
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_flow_mode_modal);
+        assert_eq!(app.flow_mode_selected, 0);
+
+        // Листаем до Настроения: Chill (индекс 1)
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.flow_mode_selected, 1);
+
+        // Выбираем по Enter
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_flow_mode_modal);
+        assert!(app.flow_lyrics.flow_mode_label.contains("Chill"));
+        assert_eq!(app.current_flow_mode_idx, 1);
+    }
+
+    #[test]
+    fn cavacore_exact_octave_frequencies_15_and_30() {
+        use crate::dsp::cavacore::bar_boundaries;
+
+        let b15 = bar_boundaries(15);
+        assert_eq!(b15.len(), 16);
+        assert!((b15[0] - 20.0).abs() < 1e-3);
+        assert!((b15[15] - 20_000.0).abs() < 1e-2);
+
+        // Проверяем соответствие 15 стандартным полосам эквалайзера 2/3 октавы
+        // 1: 20-31.7 Гц (~25 Гц центр)
+        assert!((b15[1] - 31.7).abs() < 0.5);
+        // 2: 31.7-50.2 Гц (~40 Гц центр)
+        assert!((b15[2] - 50.2).abs() < 0.5);
+        // 3: 50.2-79.6 Гц (~63 Гц центр)
+        assert!((b15[3] - 79.6).abs() < 0.5);
+        // 4: 79.6-126.2 Гц (~100 Гц центр)
+        assert!((b15[4] - 126.2).abs() < 0.5);
+        // 9: 796-1262 Гц (~1 кГц центр)
+        assert!((b15[9] - 1261.9).abs() < 2.0);
+        // 15: 12619-20000 Гц (~16 кГц центр)
+        assert!((b15[14] - 12619.1).abs() < 10.0);
+
+        let b30 = bar_boundaries(30);
+        assert_eq!(b30.len(), 31);
+        assert!((b30[0] - 20.0).abs() < 1e-3);
+        assert!((b30[30] - 20_000.0).abs() < 1e-2);
+        // Шаг 1/3 октавы (половина шага 2/3)
+        assert!((b30[2] - b15[1]).abs() < 1e-3);
+        assert!((b30[4] - b15[2]).abs() < 1e-3);
     }
 
     #[test]
