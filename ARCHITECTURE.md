@@ -18,7 +18,6 @@
     ├── TODO.md                     # Атомарный чеклист задач по фазам (1..11, все [x]).
     ├── README.md                   # Публичный README для GitHub (EN + RU).
     ├── CHANGELOG.md               # История версий v2.0 → v2.2 по фазам.
-    ├── merge_crates_docs.sh        # Скрипт сборки ALL_CRATES_DOCS.md из docs/crates/.
     ├── .cargo/config.toml          # Локальные настройки cargo (профайлы сборки).
     ├── docs/
     │   ├── crates/                 # cargo-doc-md: markdown-доки по всем крейтам (справка API).
@@ -132,10 +131,11 @@
 1. Инициализация сессии:
    - Пользователь указывает куку arl в ~/.config/deezer-tui/config.toml (или переменной окружения DEEZER_ARL).
    - Отправляется запрос POST [https://www.deezer.com/ajax/gw-light.php?method=deezer.getUserData&input=3&api_version=1.0&api_token=](https://www.deezer.com/ajax/gw-light.php?method=deezer.getUserData&input=3&api_version=1.0&api_token=) с заголовком Cookie: arl=<ARL>.
-   - Из JSON-ответа извлекаются:
-     - results.checkForm -> сохраняется как api_token для всех последующих вызовов gw-light.php.
-     - results.SESSION_ID -> кука sid.
+   - Из JSON-ответа (results) парсится `UserData`:
+     - results.checkForm -> `api_token` для всех последующих вызовов gw-light.php.
      - results.USER.OPTIONS.license_token -> токен лицензии для запроса аудиопотока.
+     - results.USER.USER_ID / USER.USER_NAME -> `Session { api_token, license_token, user_id, user_name }`.
+     - Валидация: `USER_ID == "0"` или пустой `api_token` -> `DeezerError::Auth` (ARL недействителен/устарел).
 2. Получение метаданных трека:
    - Вызов gw-light.php с методом song.getData и телом {"SNG_ID": "<id>"} возвращает SNG_ID, TRACK_TOKEN, ALB_PICTURE и FILESIZE_FLAC.
 3. Получение прямой ссылки на зашифрованный FLAC CDN:
@@ -164,19 +164,31 @@
         key
     }
 
-    pub fn decrypt_chunk(chunk: &mut [u8], key: &[u8; 16]) {
-        if chunk.len() == 2048 {
-            let iv = [0u8, 1, 2, 3, 4, 5, 6, 7];
-            let dec = Decryptor::<Blowfish>::new_from_slices(key, &iv).expect("valid key/iv");
-            let _ = dec.decrypt_padded_mut::<NoPadding>(chunk);
+    /// Расшифровывает один 2048-байтовый чанк на месте, если `chunk_idx % 3 == 0` и `chunk.len() == 2048`.
+    pub fn decrypt_chunk(chunk: &mut [u8], chunk_idx: usize, key: &[u8; 16]) -> Result<(), Error> {
+        if !chunk_idx.is_multiple_of(3) || chunk.len() != CHUNK_SIZE {
+            return Ok(());
         }
+        let bf = blowfish::Blowfish::new_from_slice(key)?;
+        let cipher = BlowfishCbcDec::inner_iv_init(bf, GenericArray::from_slice(&IV));
+        cipher.decrypt_padded_mut::<NoPadding>(chunk)?;
+        Ok(())
+    }
+
+    /// Расшифровывает весь буфер потока по чанкам `CHUNK_SIZE` (каждый `chunk_idx % 3 == 0`).
+    pub fn decrypt_stream(data: &mut [u8], key: &[u8; 16]) -> Result<(), Error> {
+        let (chunks, _rest) = data.as_chunks_mut::<CHUNK_SIZE>();
+        for (block_idx, block) in chunks.iter_mut().enumerate() {
+            decrypt_chunk(block, block_idx, key)?;
+        }
+        Ok(())
     }
 
 - Правило потоковой расшифровки и кэширования:
   - Аудиопоток делится на блоки фиксированного размера 2048 байт (chunk_index = byte_offset / 2048).
   - Если chunk_index % 3 == 0 И размер прочитанного блока равен ровно 2048 байт, вызывается decrypt_chunk(chunk, &key).
   - Все остальные блоки (chunk_index % 3 != 0 или финальный неполный блок меньше 2048 байт) остаются без изменений.
-  - Расшифрованные чанки записываются в кэш-файл tempfile, что позволяет декодеру symphonia выполнять мгновенный Seek вперёд и назад.
+  - Расшифрованные чанки лежат в in-memory буфере `DeezerStream` (`Arc<RwLock<Vec<u8>>>`, v2.2) с независимым курсором `pos: usize` — мгновенный Seek вперёд/назад без временных файлов и без гонки двух FD на один OS offset.
 
 ## 5. Математическая спецификация Cavacore (src/dsp/cavacore.rs)
 Полный порт актуального алгоритма из docs/reference/cava/cavacore.c на чистый Rust:
@@ -268,7 +280,7 @@
 - Файл конфига: `~/.config/deezer-tui/config.toml` (serde + toml; создаётся при первом сохранении).
   | Поле | Тип | Назначение |
   | --- | --- | --- |
-  | `arl` | `Option<String>` | ARL-токен Deezer для HiFi guest-логина |
+  | `arl` | `Option<String>` | ARL-токен Deezer (кука веб-сайта): HiFi-логин; без токена — guest-режим (30-сек MP3-превью) |
   | `volume` | `f32` | Громкость 0.0–1.0 |
   | `sample_rate_hz` | `f32` | Частота вывода (44100; FLAC ресэмплируется) |
   | `preferred_quality` | `String` | `FLAC` / `MP3_320` / `MP3_128` |

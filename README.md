@@ -14,7 +14,7 @@ runtime dependencies beyond ALSA/PipeWire.
 
 | Area | What you get |
 | --- | --- |
-| Playback | Deezer HiFi guest login by ARL token; FLAC 1411 kbps, MP3 320/128 fallback; seek ±5 s; gapless prefetch of the next track (starts 20 s before the end) |
+| Playback | HiFi login by ARL token (no token → guest mode: 30 s MP3 previews); FLAC 1411 kbps, MP3 320/128 fallback; seek ±5 s; gapless prefetch of the next track (starts 20 s before the end) |
 | Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log bands 50 Hz–10 kHz, Monstercat spatial filter, gravity falloff, autosens, optional dB scale; adapts bar count to any window width |
 | Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale) |
 | Covers | 500×500 HD covers rendered as 2×2 quad subpixels (16 quadrant glyphs) — 2× horizontal resolution of classic half-block art |
@@ -77,7 +77,7 @@ Terminal 256-color or TrueColor; minimum comfortable size ~80×24, everything is
 | --- | --- | --- |
 | `arl` | `String?` | Deezer ARL cookie for HiFi guest login |
 | `volume` | `f32` | Master volume, `0.0–1.0` |
-| `sample_rate_hz` | `f32` | Device sample rate (default 48000; FLAC is resampled to it) |
+| `sample_rate_hz` | `f32` | Sample rate for the Cavacore DSP (default 44100 — Deezer HiFi FLAC standard; cpal output explicitly requests 44100) |
 | `preferred_quality` | `String` | `"FLAC"` (1411 kbps), `"MP3_320"`, `"MP3_128"` |
 | `show_spectrum` | `bool` | Global spectrum on/off |
 | `show_lyrics` | `bool` | Lyrics panel on/off (key `y`) |
@@ -148,8 +148,8 @@ cargo clippy --all-targets -- -D warnings   # zero-warning policy
 cargo build --release
 ```
 
-Milestones and per-phase changelog — [CHANGELOG.md](CHANGELOG.md). Original spec and
-crate-level docs: [1_2_deezer_tui.md](1_2_deezer_tui.md), `docs/crates/`.
+Milestones and per-phase changelog — [CHANGELOG.md](CHANGELOG.md). Per-phase progress:
+[docs/crates/progress.md](docs/crates/progress.md). Crate-level API docs: `docs/crates/`.
 
 ---
 
