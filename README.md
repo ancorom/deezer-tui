@@ -15,9 +15,9 @@ runtime dependencies beyond ALSA/PipeWire.
 | Area | What you get |
 | --- | --- |
 | Playback | HiFi login by ARL token (no token → guest mode: 30 s MP3 previews); FLAC 1411 kbps, MP3 320/128 fallback; seek ±5 s; gapless prefetch of the next track (starts 20 s before the end) |
-| Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log bands 50 Hz–10 kHz, Monstercat spatial filter, gravity falloff, autosens, optional dB scale; adapts bar count to any window width |
-| Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale) |
-| Covers | 500×500 HD covers rendered as 2×2 quad subpixels (16 quadrant glyphs) — 2× horizontal resolution of classic half-block art |
+| Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log-octave bands 20 Hz–20 kHz (15 bars = ⅔ octave per step, 30 = ⅓), band energy 0.65·RMS + 0.35·peak, Monstercat spatial filter, gravity falloff, autosens, optional dB scale; dynamic bar count (`set_num_bars`) and 1:1 rendering — no resampling |
+| Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale). **Track Menu** (`m`/`M`: favorite, add to playlist, Song Radio, info) and **Flow Modes** (`f`/`g`: My Flow / 7 moods / 10 genres) work from any track |
+| Covers | 500×500 HD covers rendered as TrueColor 1:1 pixels — each cell is a `▀` half-block with fg = top subpixel, bg = bottom subpixel (Lanczos3 downscale, CatmullRom upscale) |
 | System | MPRIS over D-Bus (souvlaki/zbus): hardware media keys, GNOME/KDE now-playing widgets, `playerctl` works out of the box |
 | Resilience | Generation counter (`playback_seq`) prevents races on rapid track switching; in-memory decrypted stream buffer — no temp files, no FD sharing |
 
@@ -56,6 +56,8 @@ Terminal 256-color or TrueColor; minimum comfortable size ~80×24, everything is
 | `←` / `→` | Seek ∓5 s (on screens without panel focus) |
 | `+`/`=` , `-` | Volume ±5 % |
 | `/` (or `f` on Search) | Focus search input; `Enter` — search, `Esc` — unfocus |
+| `f` (elsewhere) / `g` | Flow Modes modal (My Flow / moods / genres) |
+| `m` / `M` | Track Menu: ❤️ favorite, ➕ playlist, 📻 Song Radio, ℹ️ info |
 | `y` | Toggle lyrics panel |
 | `s` | Toggle navigation sidebar |
 | `v` | Toggle spectrum |
@@ -126,12 +128,13 @@ src/
 │   └── cavacore.rs       # cavacore port: FFT, bands, spatial filter, gravity, autosens
 ├── mpris.rs              # MPRIS over souvlaki/zbus (media keys, desktop integration)
 └── ui/
-    ├── app.rs            # AppShell: 5 tabs, global player bar + spectrum, event loop
+    ├── app.rs            # AppShell: 5 tabs, global player bar + spectrum, event loop,
+    │                     #   Track Menu (m/M), Flow Modes (f/g), toast notifications
     ├── theme.rs          # TrueColor palette + turquoise→violet gradient
     ├── widgets/
-    │   ├── spectrum.rs   # sub-symbol bar widget with peak holds, width-adaptive
-    │   ├── cover_art.rs  # 2×2 quad subpixel cover renderer
-    │   └── modal.rs      # popups: Choose Playlist, Track & Stream Info
+    │   ├── spectrum.rs   # sub-symbol bar widget with peak holds, 1:1 rendering (v2.3)
+    │   ├── cover_art.rs  # TrueColor 1:1-pixel cover renderer (Lanczos3, '▀' half-blocks)
+    │   └── modal.rs      # popups: Choose Playlist, Track Menu, Flow Modes, Track & Stream Info
     └── views/
         ├── now_playing.rs  # cover + metadata + lyrics panel
         ├── search.rs       # search input + results table
@@ -143,7 +146,7 @@ src/
 ## Development
 
 ```sh
-cargo test                                   # 105 tests (render tests: 120×40 and 40×12)
+cargo test                                   # 110 tests (render tests: 120×40 and 40×12)
 cargo clippy --all-targets -- -D warnings   # zero-warning policy
 cargo build --release
 ```
@@ -160,12 +163,14 @@ Milestones and per-phase changelog — [CHANGELOG.md](CHANGELOG.md). Per-phase p
 cavacore на Rust). Один бинарник, без GUI-toolkit; единственный внешний запрос к
 системе — ALSA/PipeWire для вывода звука.
 
-Пять вкладок: **Now Playing** (крупная обложка 500×500 в quad subpixel 2×2 + синхронные
-lyrics), **Search**, **Library** (плейлисты + сортируемая таблица треков с колонкой
-ADDED), **Flow** (бесконечные рекомендации + живые lyrics), **Settings** (ARL-токен,
-качество, спектр, dB-масштаб). Интеграция MPRIS: аппаратные клавиши мультимедиа,
-виджеты «сейчас играет» GNOME/KDE, `playerctl`. Gapless-предзагрузка следующего
-трека начинается за 20 секунд до конца текущего; счётчик поколений `playback_seq`
+Пять вкладок: **Now Playing** (крупная обложка 500×500, TrueColor 1:1-пиксели +
+синхронные lyrics), **Search**, **Library** (плейлисты + сортируемая таблица треков
+с колонкой ADDED), **Flow** (бесконечные рекомендации + живые lyrics), **Settings**
+(ARL-токен, качество, спектр, dB-масштаб). С любого трека — **Track Menu** (`m`/`M`:
+избранное, плейлист, Song Radio, инфо) и **Flow Modes** (`f`/`g`: My Flow /
+настроения / жанры). Интеграция MPRIS: аппаратные клавиши мультимедиа, виджеты
+«сейчас играет» GNOME/KDE, `playerctl`. Gapless-предзагрузка следующего трека
+начинается за 20 секунд до конца текущего; счётчик поколений `playback_seq`
 устраняет гонки при быстром переключении треков.
 
 Быстрый старт: `cargo build --release && ./target/release/deezer-tui`; ARL-токен —

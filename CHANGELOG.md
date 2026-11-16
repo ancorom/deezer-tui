@@ -3,6 +3,40 @@
 История версий deezer-tui. Детали по каждой фазе — в [docs/crates/progress.md](docs/crates/progress.md),
 спецификации — в [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## [v2.3] — 2026-11-16 — Релиз: Cavacore octave rework, TrueColor обложки, Track Menu, Flow Modes
+
+### Добавлено
+- **Cavacore octave rework:** диапазон полос 50 Гц–10 кГц → **20 Гц–20 кГц** (полный
+  слышимый, октавная шкала: 15 полос = ⅔ октавы/шаг, 30 полос = ⅓); энергия полосы
+  `mag = 0.65 * rms + 0.35 * peak` (вместо Σ|c|); `freq_tilt = (f_center/300)^0.25`
+  (clamp 0.55–2.3, `f_center = √(f_lo·f_hi)`), `eq = norm_fft * freq_tilt`
+  (v2.2-ное деление на `bin_count.sqrt()` убрано); `set_num_bars(desired_bars)` —
+  динамический ресайз (FFT-буферы и окна сохраняются, `mem`/`prev` ресайзятся);
+  `Spectrum::render` — 1:1 без ресемплинга (`sample_slice` в render-пути убран).
+- **TrueColor обложки:** quad subpixel 2×2 (`QUADRANT_GLYPHS`, `best_quadrant_cell`,
+  `resized_quadrant`) заменён на `resized_pixels(w, h)` — Lanczos3 (даунскейл) /
+  CatmullRom (апскейл) / Nearest (точное совпадение) под сетку w × 2h; рендер —
+  полублок `▀` на ячейку: fg = верхний субпиксель, bg = нижний (честные 24-битные
+  цвета). Тема: +`BG_ELEVATED #252842`.
+- **Track Menu** (`m`/`M`, любой активный трек — Now Playing / Search / Library / Flow):
+  ❤️/💔 favorite (динамический), ➕ добавить в плейлист (модал CHOOSE PLAYLIST),
+  📻 Song Radio (`radio.getSongRadio` → `BgEvent::TrackRadioLoaded` → очередь + play),
+  ℹ️ Track & Stream Info, Esc. Тост-уведомления в статусной строке (3 с, градиент).
+- **Flow Modes** (`f` вне Search / `g` глобально; `f` на Search — фокус поиска):
+  My Flow + 7 настроений (chill/motivation/party/focus/romance/melancholy/workout) +
+  10 жанров (rock/pop/rap/electronic/metal/jazz/classical/reggae/indie/soundtracks)
+  через `radio.getUserRadio` (`get_mood_flow`/`get_genre_flow`, fallback — поиск /
+  public chart); выбранный режим запоминается (`spawn_fetch_more_flow` читает
+  `current_flow_mode_idx`), лейбл режима — `flow_lyrics.flow_mode_label`.
+
+### Фиксы
+- Clippy `collapsible_if` (13 шт., `src/api/client.rs` + toast в `app.rs`) — let-chains
+  `if let Ok(x) = … && !x.is_empty()` (Rust 2024).
+
+### Тесты
+110/110 (+5: `dynamic_resize_maintains_audio_state`, тесты cover-art 1:1,
+`playlist_picker_modal_and_add_to_playlist` и др.), clippy clean, 0 build-предупреждений.
+
 ## [v2.2] — 2026-11-16 — Релиз: дебаг по диагнозу (4 проблемы)
 
 ### Фиксы
