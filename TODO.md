@@ -1,4 +1,4 @@
-# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.0)
+# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.4 — фазы 1..13 закрыты)
 
 Выполняй задачи строго сверху вниз по одной за итерацию. После прохождения cargo test и cargo clippy --all-targets -- -D warnings меняй [ ] на [x].
 
@@ -98,3 +98,28 @@
 * [x] **Шаг 11.6 (`src/ui/views/now_playing.rs`, `src/ui/views/flow_lyrics.rs`):** Увеличенные обложки: NowPlaying до 26 строк (104x52 субпикселя 2x2), FlowLyrics до 14 (56x28).
 
 * [x] **Шаг 11.7 (`src/ui/app.rs`):** `playback_seq: Arc<AtomicU64>` (req_id против гонок при быстром n/Enter, устаревшие `TrackStarted`/`TrackEnded` отбрасываются), переиспользование авторизованного `self.client` (без `login_arl` на каждый трек; свежий `get_track` при истёкшем `TRACK_TOKEN`), `BgEvent::FlowLoadFailed` + `.take(15)` убран (flow 1:1 с `flow_tracks`), player row с хоткеями `[←]` `[→]` `[⏮ p]` `[⏸ Space]` `[⏭ n]` `Vol [-/+]`, адаптивный спектр `div_ceil(width/2).clamp(8, 160)`, tokio `worker_threads(4)`.
+
+## Фаза 12: Релиз v2.3 — Cavacore octave rework, TrueColor обложки, Track Menu, Flow Modes
+
+* [x] **Шаг 12.1 (`src/dsp/cavacore.rs`):** Octave rework — диапазон полос 50 Гц–10 кГц → **20 Гц–20 кГц** (полный слышимый; октавная шкала: 15 полос = ⅔ октавы/шаг, 30 полос = ⅓), энергия полосы `mag = 0.65 * rms + 0.35 * peak` (вместо Σ|c|), `freq_tilt = (f_center/300)^0.25` (clamp 0.55–2.3, `f_center = √(f_lo·f_hi)`), `eq = norm_fft * freq_tilt` (v2.2-ное деление на `bin_count.sqrt()` убрано), `set_num_bars(desired_bars)` — динамический ресайз (FFT-буферы и окна сохраняются, `mem`/`prev` ресайзятся). Тест `dynamic_resize_maintains_audio_state`.
+
+* [x] **Шаг 12.2 (`src/ui/widgets/cover_art.rs`, `src/ui/theme.rs`, `src/ui/widgets/spectrum.rs`):** TrueColor обложки — quad subpixel 2×2 (`QUADRANT_GLYPHS`, `best_quadrant_cell`, `resized_quadrant`) заменён на `resized_pixels(w, h)`: Lanczos3 (даунскейл) / CatmullRom (апскейл) / Nearest (точное совпадение) под сетку w × 2h; рендер — полублок `▀` на ячейку (fg = верхний субпиксель, bg = нижний, честные 24-битные цвета). Тема: `+BG_ELEVATED #252842`. `Spectrum::render` — 1:1 без ресемплинга (`sample_slice` из render-пути убран). Тесты cover-art 1:1.
+
+* [x] **Шаг 12.3 (`src/ui/app.rs`):** **Track Menu** (`m`/`M`, любой активный трек — Now Playing / Search / Library / Flow): ❤️/💔 favorite (динамический), ➕ добавить в плейлист (модал `CHOOSE PLAYLIST`), 📻 Song Radio (`radio.getSongRadio` → `BgEvent::TrackRadioLoaded` → очередь + play), ℹ️ Track & Stream Info, Esc. Тост-уведомления в статусной строке (3 с, градиент). Тесты `track_context_menu_opens_navigates_and_toggles_favorite`, `playlist_picker_modal_and_add_to_playlist`.
+
+* [x] **Шаг 12.4 (`src/api/client.rs`, `src/ui/app.rs`, `src/ui/views/flow_lyrics.rs`):** **Flow Modes** (`f` вне Search / `g` глобально; `f` на Search — фокус поиска): My Flow + 7 настроений (chill/motivation/party/focus/romance/melancholy/workout) + 10 жанров (rock/pop/rap/electronic/metal/jazz/classical/reggae/indie/soundtracks) через `radio.getUserRadio` (`get_mood_flow` / `get_genre_flow`, fallback — поиск / public chart); выбранный режим запоминается (`spawn_fetch_more_flow` читает `current_flow_mode_idx`), лейбл режима — `flow_lyrics.flow_mode_label`.
+
+* [x] **Шаг 12.5 (`src/api/client.rs`, `src/ui/app.rs`):** Clippy `collapsible_if` (13 шт.) → let-chains `if let Ok(x) = … && !x.is_empty()` (Rust 2024). Гейт: `cargo test` **110/110** (+5), `cargo clippy --all-targets -- -D warnings` clean.
+
+## Фаза 13: Релиз v2.4 — sextant-обложки, Track Mix, настоящие жанровые/настроений Flow, бесконечный поиск
+
+* [x] **Шаг 13.1 (`src/ui/widgets/cover_art.rs`):** `CoverRenderMode::Sextant` (default) — сетка 2×3, **6 субпикселей на знакоместо** (в 3 раза детальнее полублока ▀); `resized_pixels_sextant` (2w × 3h, Lanczos3/CatmullRom/Nearest); пер-ячейка кластеризация: пара пикселей с максимальным цветовым расстоянием задаёт fg (светлее) / bg (темнее), каждый субпиксель → ближайший кластер, 6-бит маска → глиф `SEXTANT_CHARS` (U+1FB00–U+1FB3B; маски 21/42 → `▌`/`▐`, 0 → space, 63 → `█`); почти монохромная ячейка (`dist² ≤ 25`) → `█`. `HalfBlock` (▀, v2.3) — опциональный режим (`with_render_mode`). Высоты: Now Playing 26 → **40** строк, Flow 14 → **24** (квадрат 1:1 сохраняется). +1 тест sextant.
+
+* [x] **Шаг 13.2 (`src/api/client.rs`):** **Track Mix** (`m` → 📻): `song.getSearchTrackMix` (SNG_ID, `start_with_input_track`) + публичный fallback `/track/{id}` → artist → `/artist/{id}/radio` → `/artist/{id}/top?limit=40` → public chart; авто-резолв `track_id` «0» через `find_cached_track_id`.
+
+* [x] **Шаг 13.3 (`src/api/client.rs`):** Настоящие Flow по жанрам/настроениям: жанры (`get_genre_flow`) — `/chart/{genre_id}/tracks?limit=50` → `/genre/{id}/radios` → `/radio/{id}/tracks?limit=50` → public chart; настроения (`get_mood_flow`) — кураторские плейлисты `/search/playlist?q=...` → `/playlist/{id}/tracks?limit=50` → поиск треков → public chart.
+
+* [x] **Шаг 13.4 (`src/api/client.rs`, `src/ui/views/search.rs`, `src/ui/app.rs`):** **Бесконечный поиск** — `search_paged` (`deezer.pageSearch`, start/nb) + `search_public_paged` (index/limit), 30/страницу, автозагрузка при `selected + 5 ≥ len` и по `PageDown` (±10 строк), дедупликация по `track_id`; `sanitize_query` (дефисы/тиры/`_` → пробел, схлопывание whitespace); `search_local_tracks` — мгновенные совпадения в `library_tracks` + кэше плейлистов (❤) до ответа remote. +3 теста (`sanitize_query`, локальный поиск с дефисом, пагинация).
+
+* [x] **Шаг 13.5:** Гейт релиза v2.4: `cargo test` **114/114** (+4), `cargo clippy --all-targets -- -D warnings` clean, `cargo build --release`.
+

@@ -17,3 +17,13 @@ ALL_CRATES_DOCS.md
 *.swp
 .idea/
 .vscode/
+
+# external doc sources mirrored for Mnemon Project Documents provenance
+docs/external/
+
+# Одноразовые дампы контекста для внешних LLM-ревью (генерируются вручную, восстановимы)
+project_dump*.txt
+
+# Локальный корпус внешних LLM-ревью (диагнозы и слайсы кода) — не публикуется
+# Ссылки в PLAN.md и docs/crates/progress.md указывают на локальную копию
+gemini_review/

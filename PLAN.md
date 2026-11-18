@@ -51,6 +51,7 @@
 ## v2.0 — Доработка до пользовательского релиза (по результатам живого тестирования v1.0)
 
 Диагностика всех 8 багов — в `gemini_review/v2/v2_0.md`. Пофайловые инструкции с полным кодом — в `gemini_review/v2/Phases 6-7.md`.
+Корпус `gemini_review/` — локальный (вне git, в `.gitignore`): это ответы внешних LLM-ревью; ссылки ниже указывают на локальную копию, в репозиторий они не публикуются.
 
 ## Фаза 6: Реалтайм-синхронизация аудио, мгновенная пауза, Seek и очередь треков
 **Цель:** Полностью устранить задержку пробела (1.5 с), рассинхрон спектра со звуком, зависание прогресс-бара после 30 с и добавить перемотку `Seek` + автопереход к следующему треку.
@@ -83,3 +84,73 @@
   1. Расширить `AppConfig` в `src/config.rs` полями `audio_quality` (`FLAC`, `MP3_320`, `MP3_128`), `show_spectrum: bool`, `db_scale: bool`, `sidebar_collapsed: bool`.
   2. Создать экран `src/ui/views/settings.rs` (`[5] Settings`): выбор качества звука, ввод/проверка `ARL`-куки со статусом аккаунта, переключатели спектра и `dB`-масштабирования.
   3. Добавить попап `[i] Track & Stream Info` с полными данными о текущем треке (ID, альбом, реальный кодек, частота дискретизации, глубина бит, вычисленный битрейт в kbps, размер потока в МБ, статус шифрования `BF_CBC_STRIPE`).
+
+---
+
+## v2.1 — Релиз: масштабный дебаг (5 diagnosed-багов)
+
+Диагностика — в `gemini_review/v2.1/handcut/`, пофайловые слайсы с полным кодом — в `gemini_review/v2.1/steps/`. Детали шагов 10.1–10.9 — в `TODO.md` (Фаза 10) и `docs/crates/progress.md`.
+
+## Фаза 10: Убить CPU-зомби, вернуть звук на старте, наполнить Library, убрать дубли панелей
+**Цель:** Закрыть 5 багов живого тестирования: 100% CPU после смены трека, тишина на старте, пустая Library/плейлисты, дубль Now Playing, макет Flow.
+- **Задачи:**
+  1. `push_all_cancelable` со `stop_flag`/`is_abandoned` вместо busy-spin (`src/audio/decoder.rs`).
+  2. `fetch_streaming`: пребуфер 256 КБ + background tokio-задача, `Read`/`Seek` ждут дописанных байтов (`src/audio/stream.rs`).
+  3. `get_playlists` поэлементно из `deezer.pageProfile` + публичный fallback с дедупликацией; алиасы `PlaylistData` и `deserialize_u64_flexible` (`src/api/client.rs`, `src/api/models.rs`).
+  4. Now Playing: левая панель + `LYRICS [Y]`; Flow: один спектр, разделитель `│`, `wrap_text` (`src/ui/views/now_playing.rs`, `src/ui/views/flow_lyrics.rs`).
+  5. Сортировка Library (`o`/`r`), PrefetchedTrack-кэш, бесконечный Flow, глобальные `show_lyrics`/`position_ms` (`src/ui/app.rs`).
+- **Критерии валидации:**
+  - После быстрой смены трека CPU не уходит в 100%; звук начинается сразу после пребуфера; плейлисты и их треки не пустые; на Flow нет второго спектра и наложений колонок.
+  - Гейт: `cargo test` 105/105, `cargo clippy --all-targets -- -D warnings` clean.
+
+---
+
+## v2.2 — Релиз: дебаг по диагнозу Gemini (4 проблемы)
+
+Диагностика — в `gemini_review/v2.2/handcut/`, слайсы — в `gemini_review/v2.2/steps/`. Детали шагов 11.1–11.7 — в `TODO.md` (Фаза 11) и `docs/crates/progress.md`.
+
+## Фаза 11: Фриз при быстром `n`/`Enter`, масштабируемый EQ, колонка ADDED, подсказки хоткеев
+**Цель:** Устранить гонки при смене трека, сделать спектр пригодным для любого ресайза, добавить дату добавления и подсказки клавиш.
+- **Задачи:**
+  1. `DeezerStream` на in-memory буфере `Arc<RwLock<Vec<u8>>>` с независимым курсором `pos` + счётчик поколений `playback_seq` (`src/audio/stream.rs`, `src/ui/app.rs`).
+  2. Дробная интерполяция FFT-бинов + `freq_tilt`, ресемплирование полос под ширину окна (`src/dsp/cavacore.rs`, `src/ui/widgets/spectrum.rs`).
+  3. `TrackData::formatted_date_add()` + колонка `ADDED` с сортировкой (`src/api/models.rs`, `src/ui/views/library.rs`, `src/ui/views/search.rs`).
+  4. Player row с хоткеями, обложки 500×500 + quad subpixel 2×2 (`src/ui/app.rs`, `src/ui/widgets/cover_art.rs`, `src/mpris.rs`).
+- **Критерии валидации:**
+  - Двойное `n`/`Enter` в Flow не вешает плеер и не портит FLAC-заголовок; спектр умещает весь диапазон при любом ресайзе без «провалов»; колонка ADDED показывает `YYYY-MM-DD`; подсказки `[←] [→] [⏮ p] [⏸ Space] [⏭ n] Vol [-/+]` видны.
+  - Гейт: `cargo test` 105/105 (тесты обновлены in-place), clippy clean.
+
+---
+
+## v2.3 — Релиз: Cavacore octave rework, TrueColor обложки, Track Menu, Flow Modes
+
+Детали шагов 12.1–12.5 — в `TODO.md` (Фаза 12), история — в `CHANGELOG.md`.
+
+## Фаза 12: Полный слышимый диапазон, честные 24-битные обложки, меню трека, режимы Flow
+**Цель:** Довести спектр и обложки до качества, при котором детали не теряются на любом терминале, и добавить управляющие элементы вокруг активного трека.
+- **Задачи:**
+  1. Cavacore: 20 Гц–20 кГц по октавной шкале, `mag = 0.65·rms + 0.35·peak`, `freq_tilt = (f_center/300)^0.25`, `set_num_bars` динамический (`src/dsp/cavacore.rs`).
+  2. Обложки TrueColor: `resized_pixels` (Lanczos3/CatmullRom/Nearest) + полублок `▀` с fg/bg на субпиксель; `BG_ELEVATED #252842`; спектр 1:1 (`src/ui/widgets/cover_art.rs`, `src/ui/theme.rs`, `src/ui/widgets/spectrum.rs`).
+  3. Track Menu `m`/`M`: favorite, ➕ в плейлист, 📻 Song Radio, ℹ️ Track Info + тосты (`src/ui/app.rs`).
+  4. Flow Modes `f`/`g`: My Flow + 7 настроений + 10 жанров, запоминание режима, лейбл (`src/api/client.rs`, `src/ui/app.rs`, `src/ui/views/flow_lyrics.rs`).
+- **Критерии валидации:**
+  - `dynamic_resize_maintains_audio_state` проходит; обложки не «размытые блобы» (1:1 тесты cover-art); `m` открывает меню на любой вкладке и меняет состояние favorite; `g` переключает режим Flow и следующий досегруженный трок берётся из того же режима.
+  - Гейт: `cargo test` 110/110 (+5), `cargo clippy --all-targets -- -D warnings` clean.
+
+---
+
+## v2.4 — Релиз: sextant-обложки, Track Mix, настоящие жанровые/настроений Flow, бесконечный поиск
+
+Детали шагов 13.1–13.5 — в `TODO.md` (Фаза 13), история — в `CHANGELOG.md`.
+
+## Фаза 13: Троекратная детализация обложек, реальный Track Mix и Flow, пагинация поиска
+**Цель:** Увеличить плотность пикселей обложек и сделать Flow/поиск настоящими, а не демо-заглушками.
+- **Задачи:**
+  1. `CoverRenderMode::Sextant` (2×3 = 6 субпикселей/ячейку, `SEXTANT_CHARS` U+1FB00–U+1FB3B, пер-ячейка кластеризация fg/bg) + опциональный `HalfBlock`; Now Playing 40 строк, Flow 24 (`src/ui/widgets/cover_art.rs`).
+  2. Track Mix через `song.getSearchTrackMix` + публичный fallback artist-radio/top/chart (`src/api/client.rs`).
+  3. `get_genre_flow` / `get_mood_flow` через chart→radios→tracks и кураторские плейлисты (`src/api/client.rs`).
+  4. `search_paged`/`search_public_paged` (30/страницу, автозагрузка и `PageDown`, дедупликация), `sanitize_query`, `search_local_tracks` (`src/api/client.rs`, `src/ui/views/search.rs`, `src/ui/app.rs`).
+- **Критерии валидации:**
+  - Обложки в sextant-режиме детальнее полублока и сохраняют квадрат 1:1; `m → 📻` даёт микс по реальному треку (в т.ч. для гостевых `track_id = 0`); жанровый/настроенийный Flow возвращает треки этого жанра/настроения; поиск досгружает страницы при подходе к концу списка, запрос с дефисом находит совпадения в локальной фонотеке мгновенно.
+  - Гейт: `cargo test` 114/114 (+4), clippy clean, `cargo build --release`.
+
