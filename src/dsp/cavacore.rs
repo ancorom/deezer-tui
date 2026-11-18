@@ -6,9 +6,19 @@
 //! - Оконная функция Ханна: `w[n] = 0.5 * (1.0 - cos(2 * PI * n / (N - 1)))`.
 //! - Логарифмическое октавное распределение частот от 20 Гц до 20 000 Гц по `num_bars` полосам
 //!   (например, 15 полос с шагом 2/3 октавы или 30 полос с шагом 1/3 октавы).
-//! - Пространственный фильтр сглаживания Monstercat (`1.5^|i - j|`).
-//! - Параболическая гравитация падения (falloff) и интегральный фильтр (`0.77`).
-//! - Опциональное логарифмическое (dB) масштабирование и авточувствительность (`autosens`).
+//! - Энергия полосы (v2.5): сумма магнитуд `Σ|X_k|` по бинам полосы плюс полка
+//!   пикового бина `PEAK_BLEND * max|X_k|` — равная энергия на октаву и заметные
+//!   ВЧ-транзиенты (RMS-усреднение по всем бинам размазывало разреженное содержимое
+//!   широких ВЧ-полос, правая половина спектра оставалась плоской).
+//! - По-полосный AGC (v2.5): долгосрочный уровень полосы приводится к среднему уровню
+//!   спектра (`AGC_STRENGTH = 0.7`), относительный порог тишины `REL_SILENCE_GATE`
+//!   гасит шумовую полку и утечку FFT. Без них один общий множитель усиления оставляет
+//!   ВЧ в 30–40 дБ ниже баса, и «подпрыгивает» только самый громкий столбик.
+//! - Пространственный фильтр сглаживания Monstercat (`1.35^|i - j|`).
+//! - Параболическая гравитация падения (falloff) и интегральный фильтр (`0.62`).
+//! - Логарифмическое (dB) масштабирование по умолчанию (`db_scale = true`, окно 52 дБ);
+//!   в линейном режиме — мягкая компрессия `scaled^0.45`.
+//! - Авточувствительность (`autosens`) с симметричной мёртвой зоной [0.4, 0.85].
 //! - Полное отсутствие аллокаций памяти внутри `process()` и `process_stereo()`.
 
 #![allow(dead_code)]
@@ -32,20 +42,71 @@ const LOW_HZ: f32 = 20.0;
 const HIGH_HZ: f32 = 20_000.0;
 
 /// Коэффициент интегрального сглаживания.
-const INTEGRAL: f32 = 0.77;
+/// 0.62 (а не 0.77): постоянная времени ~40 мс вместо ~70 мс, иначе короткие
+/// ВЧ-транзиенты (шляпки, щелчки, атака синтезатора) успевают усредниться
+/// до незаметного «подскока» на пару пикселей.
+const INTEGRAL: f32 = 0.62;
 
 /// База пространственного затухания фильтра Monstercat.
-const MONSTERCAT_BASE: f32 = 1.5;
+/// 1.35 (а не 1.5): бас размазывается по соседям заметно слабее, поэтому «стена
+/// баса» не затирает средние и высокие полосы.
+const MONSTERCAT_BASE: f32 = 1.35;
 
-/// Коэффициенты авточувствительности (`autosens`).
-const AUTOSENS_DOWN: f32 = 0.985;
-const AUTOSENS_UP: f32 = 1.001;
+/// Полка пикового бина в энергии полосы: короткие ВЧ-транзиенты (шляпки, щелчки,
+/// атака синтеза) сосредоточены в 1–2 бинах и при суммировании по широкой полосе
+/// почти не влияют на сумму, поэтому пик добавляется отдельным слагаемым.
+const PEAK_BLEND: f32 = 0.35;
 
+/// Эквизация восприятия: опорная частота и экспонента компенсации наклона
+/// музыкального спектра. Реальный наклон музыки ≈ −5 дБ/октава выше ~120 Гц
+/// (вдвое выше частоты — примерно в 0.56 раза меньше амплитуды), поэтому
+/// компенсация ×1.28 на октаву (экспонента 0.35) вместе с логарифмической шкалой
+/// даёт «прыгающие» ВЧ вместо плоской правой половины спектра.
+const FREQ_TILT_REF_HZ: f32 = 120.0;
+const FREQ_TILT_EXP: f32 = 0.18;
+const FREQ_TILT_MIN: f32 = 0.85;
+const FREQ_TILT_MAX: f32 = 2.2;
+
+/// По-полосная авточувствительность (AGC): долгосрочный уровень каждой полосы
+/// приводится к среднему уровню спектра, иначе одно общее усиление на все полосы
+/// оставляет ВЧ в 30–40 дБ ниже баса и они «почти не подпрыгивают».
+const AGC_REF_ATTACK: f32 = 0.06;
+const AGC_REF_RELEASE: f32 = 0.008;
+const AGC_MIN: f32 = 0.35;
+const AGC_MAX: f32 = 4.5;
+/// Сила AGC: `gain = (среднее_по_спектру / уровень_полосы)^AGC_STRENGTH`.
+/// 0.7 — компромисс: полосы видны и «прыгают», но бас остаётся visibly крупнее.
+const AGC_STRENGTH: f32 = 0.7;
+/// Относительный порог тишины: полоса ниже 0.4 % от самой громкой полосы кадра
+/// считается нулевой (обрезает шумовую полку и утечку FFT, а не только нули).
+const REL_SILENCE_GATE: f32 = 0.004;
+
+/// Коэффициенты авточувствительности (`autosens`). Прежние 0.985 вниз / 1.001 вверх
+/// давали сильную асимметрию (падение ~1.5 с, восстановление ~35 с), из-за чего
+/// один громкий столбик занижал весь спектр.
+const AUTOSENS_DOWN: f32 = 0.99;
+const AUTOSENS_UP: f32 = 1.005;
+/// Мёртвая зона авточувствительности в амплитудных единицах (после AGC, до
+/// логарифмической шкалы): пока пик внутри окна [LOW, HIGH] (~6 дБ), чувствительность
+/// не меняется — динамика трека сохраняется, а не сжимается к одной высоте.
+const AUTOSENS_TARGET_HIGH: f32 = 0.85;
+const AUTOSENS_TARGET_LOW: f32 = 0.4;
+/// Пределы авточувствительности: не дают тихому треку раскачать спектр в 10 раз.
+const AUTOSENS_MIN: f32 = 0.25;
+const AUTOSENS_MAX: f32 = 8.0;
 /// Коэффициент параболической гравитации падения столбиков.
 const GRAVITY: f32 = 0.025;
 
-/// Динамический диапазон для опционального dB-скейлинга (в децибелах).
-const DB_DYNAMIC_RANGE: f32 = 60.0;
+/// Коэффициент мягкой компрессии для линейного (не-dB) режима: `val^0.45`.
+/// Показатель меньше 1 поднимает тихие полосы, сохраняя «удар» баса.
+const LIN_COMPRESSION: f32 = 0.45;
+
+/// Динамический диапазон для логарифмического (dB) масштабирования (в децибелах).
+/// 52 дБ: чем уже окно, тем сильнее заметен подскок полосы (+10 дБ ≈ +0.19 высоты).
+const DB_DYNAMIC_RANGE: f32 = 52.0;
+/// Порог тишины в амплитудных единицах: ниже него столбик остаётся нулевым
+/// (иначе логарифмическая шкала показала бы шум квантования как сигнал).
+const DB_SILENCE_FLOOR: f32 = 1e-4;
 
 /// Вычисление коэффициентов окна Ханна длины `n`.
 fn hann_window(n: usize) -> Vec<f32> {
@@ -131,7 +192,7 @@ pub struct Cavacore {
     upper_bin: Vec<usize>,
     eq_weights: Vec<f32>,
 
-    // Предвычисленные веса Monstercat: 1.5^d
+    // Предвычисленные веса Monstercat: MONSTERCAT_BASE^d
     monstercat_weights: Vec<f32>,
     raw_bars: Vec<f32>,
 
@@ -140,6 +201,8 @@ pub struct Cavacore {
     prev: Vec<f32>,
     fall_step: Vec<f32>,
     sensitivity: f32,
+    /// Долгосрочный уровень каждой полосы (для по-полосного AGC).
+    band_ref: Vec<f32>,
 
     // Выходной буфер высот столбиков в диапазоне [0.0, 1.0]
     out_buf: Vec<f32>,
@@ -170,8 +233,11 @@ impl Cavacore {
 
             let f_center = (f_lo * f_hi).sqrt();
             let norm_fft = 4.0 / fft_size as f32;
-            // Мягкая эквализация восприятия: компенсирует розовый шум (~-3 дБ/октава) без аномального взрыва ВЧ
-            let freq_tilt = (f_center / 300.0).powf(0.25).clamp(0.55, 2.3);
+            // Эквализация восприятия: компенсирует наклон спектра реальной музыки
+            // (~−5 дБ/октава) относительно опорной частоты FREQ_TILT_REF_HZ.
+            let freq_tilt = (f_center / FREQ_TILT_REF_HZ)
+                .powf(FREQ_TILT_EXP)
+                .clamp(FREQ_TILT_MIN, FREQ_TILT_MAX);
             let eq = norm_fft * freq_tilt;
 
             use_bass_fft.push(is_bass);
@@ -240,6 +306,7 @@ impl Cavacore {
             prev: vec![0.0; num_bars],
             fall_step: vec![0.0; num_bars],
             sensitivity: 1.0,
+            band_ref: vec![0.0; num_bars],
             out_buf: vec![0.0; num_bars],
         }
     }
@@ -264,6 +331,7 @@ impl Cavacore {
             .collect();
 
         self.raw_bars.resize(num_bars, 0.0);
+        self.band_ref.resize(num_bars, 0.0);
         self.mem.resize(num_bars, 0.0);
         self.prev.resize(num_bars, 0.0);
         self.fall_step.resize(num_bars, 0.0);
@@ -302,6 +370,7 @@ impl Cavacore {
         self.fall_step.fill(0.0);
         self.out_buf.fill(0.0);
         self.sensitivity = 1.0;
+        self.band_ref.fill(0.0);
     }
 
     /// Основной метод обработки моно-сэмплов (например, напрямую из `VisRingBuffer`).
@@ -370,8 +439,14 @@ impl Cavacore {
             &mut self.mid_scratch,
         );
 
-        // 1. Сбор магнитуд по октавным полосам (RMS + умеренный пик, без взрыва ВЧ)
+        // 1. Энергия октавных полос: сумма магнитуд по бинам (равная энергия на
+        //    октаву) плюс полка пикового бина для коротких ВЧ-транзиентов.
+        //    RMS-усреднение по всем бинам полосы размазывало разреженное содержимое
+        //    широких ВЧ-полос (полоса 10–20 кГц — сотни бинов), из-за чего правая
+        //    половина спектра оставалась плоской, а доминировал самый громкий столбик.
         let ratio = HIGH_HZ / LOW_HZ;
+        let mut peak_lin = 0.0f32;
+        let mut peak_eq = 0.0f32;
         for n in 0..self.num_bars {
             let spectrum = if self.use_bass_fft[n] {
                 &self.bass_out
@@ -395,34 +470,72 @@ impl Cavacore {
                 let frac = exact_bin - b0 as f32;
                 spectrum[b0].norm() * (1.0 - frac) + spectrum[b0 + 1].norm() * frac
             } else {
-                let mut sum_sq = 0.0f32;
+                let mut sum = 0.0f32;
                 let mut peak = 0.0f32;
                 for c in &spectrum[lo..hi] {
-                    let n = c.norm();
-                    sum_sq += n * n;
-                    if n > peak {
-                        peak = n;
+                    let m = c.norm();
+                    sum += m;
+                    if m > peak {
+                        peak = m;
                     }
                 }
-                let rms = (sum_sq / count as f32).sqrt();
-                0.65 * rms + 0.35 * peak
+                sum + PEAK_BLEND * peak
             };
 
-            let mut val = mag * self.eq_weights[n];
-            if self.db_scale {
-                if val > 1e-6 {
-                    let db = 20.0 * val.log10();
-                    val = ((db + DB_DYNAMIC_RANGE) / DB_DYNAMIC_RANGE).clamp(0.0, 1.0);
-                } else {
-                    val = 0.0;
-                }
+            let lin = mag * self.eq_weights[n];
+            if lin > peak_lin {
+                peak_lin = lin;
             }
 
-            self.raw_bars[n] = val * self.sensitivity;
+            // Долгосрочный уровень полосы: быстрый вход, медленный выход, чтобы AGC
+            // не «дышал» в такт музыке и не сжимал динамику.
+            let ref_i = &mut self.band_ref[n];
+            let toward = if lin > *ref_i { AGC_REF_ATTACK } else { AGC_REF_RELEASE };
+            *ref_i += (lin - *ref_i) * toward;
+
+            self.raw_bars[n] = lin;
+        }
+
+        // Средний долгосрочный уровень спектра — опорная точка по-полосного AGC.
+        let mut ref_sum = 0.0f32;
+        for r in &self.band_ref {
+            ref_sum += *r;
+        }
+        let ref_mean = ref_sum / self.num_bars as f32;
+
+        // 2. По-полосный AGC + логарифмическая (dB) шкала по умолчанию или мягкая
+        //    компрессия в линейной. Без них самый громкий столбик съедает весь
+        //    диапазон высот, и остальные полосы почти не «прыгают».
+        for n in 0..self.num_bars {
+            let lin = self.raw_bars[n];
+            let scaled = if lin <= peak_lin * REL_SILENCE_GATE {
+                0.0
+            } else {
+                let ref_i = self.band_ref[n].max(1e-7);
+                let gain = (ref_mean / ref_i)
+                    .clamp(AGC_MIN, AGC_MAX)
+                    .powf(AGC_STRENGTH)
+                    .max(0.05);
+                let eq = lin * gain;
+                if eq > peak_eq {
+                    peak_eq = eq;
+                }
+                eq * self.sensitivity
+            };
+
+            let val = if scaled <= DB_SILENCE_FLOOR {
+                0.0
+            } else if self.db_scale {
+                ((20.0 * scaled.log10()) + DB_DYNAMIC_RANGE) / DB_DYNAMIC_RANGE
+            } else {
+                scaled.powf(LIN_COMPRESSION)
+            };
+
+            self.raw_bars[n] = val.clamp(0.0, 1.0);
         }
 
         // 2. Пространственный фильтр сглаживания Monstercat (без аллокаций):
-        // bars[i] = max_j(bars[j] / 1.5^|i - j|)
+        // bars[i] = max_j(bars[j] / MONSTERCAT_BASE^|i - j|)
         for i in 0..self.num_bars {
             let mut peak = self.raw_bars[i];
             for j in 0..self.num_bars {
@@ -435,16 +548,12 @@ impl Cavacore {
             self.out_buf[i] = peak;
         }
 
-        // 3. Параболическая гравитация падения, интегральное сглаживание (0.77) и autosens
+        // 3. Параболическая гравитация падения, интегральное сглаживание (0.77)
+        //    и авточувствительность по сырой амплитуде (не по уже сжатой высоте).
         let mut overshoot = false;
-        let mut has_signal = false;
 
         for i in 0..self.num_bars {
             let mut v = self.out_buf[i];
-            if v > 1e-5 {
-                has_signal = true;
-            }
-
             if v < self.prev[i] {
                 let factor = (1.0 - GRAVITY * self.fall_step[i].powi(2)).max(0.0);
                 v = (self.prev[i] * factor).max(v);
@@ -466,12 +575,23 @@ impl Cavacore {
             }
         }
 
-        if self.autosens && has_signal {
-            if overshoot {
-                self.sensitivity = (self.sensitivity * AUTOSENS_DOWN).clamp(0.05, 10.0);
-            } else {
-                self.sensitivity = (self.sensitivity * AUTOSENS_UP).clamp(0.05, 10.0);
+        if overshoot && self.autosens {
+            // Жёсткий антиклиппинг: если высоты всё же упёрлись в потолок, сбрасываем
+            // чувствительность быстрее, иначе спектр «прилипает» к максимуму.
+            self.sensitivity =
+                (self.sensitivity * (AUTOSENS_DOWN * 0.9)).clamp(AUTOSENS_MIN, AUTOSENS_MAX);
+        }
+
+        if self.autosens && peak_eq > 1e-5 {
+            let scaled_peak = peak_eq * self.sensitivity;
+            // Мёртвая зона: пока пик в пределах [TARGET_LOW, TARGET_HIGH], чувствительность
+            // не меняется — динамика трека сохраняется, а не «сжимается» до одной высоты.
+            if scaled_peak > AUTOSENS_TARGET_HIGH {
+                self.sensitivity *= AUTOSENS_DOWN;
+            } else if scaled_peak < AUTOSENS_TARGET_LOW {
+                self.sensitivity *= AUTOSENS_UP;
             }
+            self.sensitivity = self.sensitivity.clamp(AUTOSENS_MIN, AUTOSENS_MAX);
         }
 
         &self.out_buf
@@ -607,5 +727,149 @@ mod tests {
         let bars = cava.process(&signal);
         let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
         assert!(max_bar > 0.05 && max_bar <= 1.0);
+    }
+    /// Шумовой генератор для имитации широкополосных ВЧ-транзиентов.
+    fn noise(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((*seed >> 8) as f32 / 8_388_608.0) - 1.0
+    }
+
+    /// Микс «электроника»: громкий бас 60 Гц, средний пэд 1 кГц, слабые шляпки 9 кГц.
+    fn music_mix(sr: f32, len: usize, seed: &mut u32, hats_on: bool) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / sr;
+                let bass = 0.80 * (2.0 * PI * 60.0 * t).sin();
+                let pad = 0.12 * (2.0 * PI * 1_000.0 * t).sin();
+                let hat = if hats_on {
+                    0.05 * noise(seed) * (2.0 * PI * 9_000.0 * t).sin()
+                } else {
+                    0.0
+                };
+                bass + pad + hat
+            })
+            .collect()
+    }
+
+    /// Регрессия на «плоскую правую половину спектра»: при громком басе ВЧ-полосы
+    /// обязаны оставаться заметными и подпрыгивать на транзиентах шляпок.
+    #[test]
+    fn loud_bass_does_not_flatten_high_bands() {
+        let sr = 44_100.0;
+        let mut cava = Cavacore::new(sr, 15);
+        let mut seed = 4242u32;
+
+        for _ in 0..24 {
+            let s = music_mix(sr, 735, &mut seed, true);
+            let _ = cava.process(&s);
+        }
+        let s = music_mix(sr, 735, &mut seed, true);
+        let with_hats = cava.process(&s).to_vec();
+
+        for _ in 0..6 {
+            let s = music_mix(sr, 735, &mut seed, false);
+            let _ = cava.process(&s);
+        }
+        let s = music_mix(sr, 735, &mut seed, false);
+        let without_hats = cava.process(&s).to_vec();
+
+        let hi_band = |bars: &[f32]| bars[11..15].iter().copied().fold(0.0f32, f32::max);
+        let hi_on = hi_band(&with_hats);
+        let hi_off = hi_band(&without_hats);
+
+        assert!(with_hats[2] > 0.4, "бас должен оставаться заметным: {}", with_hats[2]);
+        assert!(
+            hi_on > 0.2,
+            "ВЧ-полосы не должны быть плоскими из-за доминирующего баса: on={hi_on}, off={hi_off}"
+        );
+        assert!(
+            hi_on - hi_off > 0.05,
+            "шляпки должны заметно «подпрыгивать»: on={hi_on}, off={hi_off}"
+        );
+    }
+
+    /// Регрессия на «вспыхивающие от утечки ВЧ»: чистый бас не должен засвечивать
+    /// полосу выше ~3 кГц (относительный порог тишины + узкое окно dB).
+    #[test]
+    fn pure_bass_keeps_high_bands_dark() {
+        let sr = 44_100.0;
+        let mut cava = Cavacore::new(sr, 15);
+        let mut high = [0.0f32; 4];
+        for _ in 0..30 {
+            let s = sine_wave(60.0, sr, 735);
+            let bars = cava.process(&s).to_vec();
+            for (dst, &v) in high.iter_mut().zip(&bars[11..15]) {
+                *dst = dst.max(v);
+            }
+        }
+        let max_high = high.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            max_high < 0.15,
+            "полосы 3–20 кГц должны быть тёмными при чистом басе: {max_high}"
+        );
+    }
+
+    /// Регрессия на «доминирует самый громкий элемент»: не-басовый микс (лид 1.5 кГц)
+    /// не должен гасить средины и ВЧ — все трети спектра обязаны быть заметными.
+    #[test]
+    fn sustained_lead_does_not_flatten_other_bands() {
+        let sr = 44_100.0;
+        let mut cava = Cavacore::new(sr, 15);
+        let mut seed = 777u32;
+        let mut peaks = [0.0f32; 15];
+
+        for _ in 0..30 {
+            let s = (0..735)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    let lead = 0.32 * (2.0 * PI * 1_500.0 * t).sin();
+                    let piano = 0.10 * (2.0 * PI * 440.0 * t).sin();
+                    let hat = 0.03 * noise(&mut seed) * (2.0 * PI * 8_000.0 * t).sin();
+                    lead + piano + hat
+                })
+                .collect::<Vec<f32>>();
+            let bars = cava.process(&s).to_vec();
+            for (dst, &v) in peaks.iter_mut().zip(&bars) {
+                *dst = dst.max(v);
+            }
+        }
+
+        let avg = |from: usize, to: usize| -> f32 {
+            peaks[from..to].iter().sum::<f32>() / (to - from) as f32
+        };
+        assert!(avg(0, 5) > 0.15, "низы должны быть видны: {}", avg(0, 5));
+        assert!(avg(5, 10) > 0.2, "средины должны быть видны: {}", avg(5, 10));
+        assert!(avg(10, 15) > 0.2, "верхи должны быть видны: {}", avg(10, 15));
+    }
+
+    /// Регрессия на асимметрию авточувствительности: тихий участок обязан поднять
+    /// чувствительность, а громкий — вернуть её назад за секунды, а не за десятки секунд.
+    #[test]
+    fn autosens_recovers_after_loud_passage() {
+        let sr = 44_100.0;
+        let mut cava = Cavacore::new(sr, 15);
+
+        let quiet = sine_wave(60.0, sr, 735)
+            .into_iter()
+            .map(|s| s * 0.05)
+            .collect::<Vec<f32>>();
+        for _ in 0..90 {
+            let _ = cava.process(&quiet);
+        }
+        let raised = cava.sensitivity;
+        assert!(
+            raised > 1.2,
+            "тихий участок должен поднять авточувствительность: {raised}"
+        );
+
+        for _ in 0..120 {
+            let s = sine_wave(60.0, sr, 735);
+            let _ = cava.process(&s);
+        }
+        assert!(
+            cava.sensitivity < raised * 0.7,
+            "громкий участок должен вернуть чувствительность вниз: {raised} -> {}",
+            cava.sensitivity
+        );
     }
 }

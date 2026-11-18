@@ -123,3 +123,11 @@
 
 * [x] **Шаг 13.5:** Гейт релиза v2.4: `cargo test` **114/114** (+4), `cargo clippy --all-targets -- -D warnings` clean, `cargo build --release`.
 
+## Фаза 14: v2.5 — динамический диапазон спектра (полосы «прыгают», а не только бас)
+
+* [x] **Шаг 14.1 (`src/dsp/cavacore.rs`):** Энергия полосы `Σ|X_k| + 0.35·max|X_k|` вместо RMS-среднего (равная энергия на октаву + полка транзиентов); наклон `(f_center/120)^0.18` (clamp 0.85–2.2) вместо `(f_center/300)^0.25` (0.55–2.3); шкала (dB или линейная) применяется **после** усиления.
+
+* [x] **Шаг 14.2 (`src/dsp/cavacore.rs`):** По-полосный AGC (`band_ref` EMA 0.06/0.008 → `gain = (ref_mean/ref)^0.7`, clamp 0.35–4.5) + относительный порог тишины `0.004` (шумовая полка и утечка FFT → 0); dB-окно 60 → 52 дБ, линейный режим — компрессия `x^0.45`; `autosens` с симметричной мёртвой зоной 0.4–0.85 по сырого пика (rates 0.99/1.005, clamp 0.25–8.0) вместо асимметричных 0.985/1.001; Monstercat 1.5 → 1.35; `INTEGRAL` 0.77 → 0.62.
+
+* [x] **Шаг 14.3 (`src/config.rs`, тесты):** `db_scale` по умолчанию `true` (`#[serde(default = "default_db_scale")]`); +4 регрессии: `loud_bass_does_not_flatten_high_bands`, `pure_bass_keeps_high_bands_dark`, `sustained_lead_does_not_flatten_other_bands`, `autosens_recovers_after_loud_passage`. Гейт: `cargo test` **118/118**, `cargo clippy --all-targets -- -D warnings` exit 0, build без warning'ов.
+

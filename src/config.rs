@@ -34,7 +34,9 @@ pub struct AppConfig {
     #[serde(default = "default_show_lyrics")]
     pub show_lyrics: bool,
     /// Использовать ли логарифмическую шкалу децибел (`dB`) для спектра.
-    #[serde(default)]
+    /// По умолчанию `true`: линейная шкала даёт слишком большой динамический
+    /// диапазон и «самый громкий столбик» подавляет остальные полосы.
+    #[serde(default = "default_db_scale")]
     pub db_scale: bool,
     /// Свёрнут ли левый сайдбар навигации (переключается по `s`).
     #[serde(default)]
@@ -61,6 +63,10 @@ fn default_show_lyrics() -> bool {
     true
 }
 
+fn default_db_scale() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -70,7 +76,7 @@ impl Default for AppConfig {
             preferred_quality: default_preferred_quality(),
             show_spectrum: default_show_spectrum(),
             show_lyrics: default_show_lyrics(),
-            db_scale: false,
+            db_scale: default_db_scale(),
             sidebar_collapsed: false,
         }
     }
@@ -193,7 +199,7 @@ mod tests {
         assert_eq!(config.preferred_quality, "FLAC");
         assert!(config.show_spectrum);
         assert!(config.show_lyrics);
-        assert!(!config.db_scale);
+        assert!(config.db_scale);
         assert!(!config.sidebar_collapsed);
     }
 
