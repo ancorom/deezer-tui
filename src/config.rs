@@ -10,6 +10,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api::models::AudioQuality;
+use crate::dsp::cavacore::SpectrumScale;
+
+/// Минимальная и максимальная высота панели спектра в строках терминала.
+pub const SPECTRUM_ROWS_MIN: u16 = 2;
+pub const SPECTRUM_ROWS_MAX: u16 = 12;
 
 /// Конфигурация приложения: arl-токен, громкость, качество потока и параметры UI/DSP.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,6 +43,16 @@ pub struct AppConfig {
     /// диапазон и «самый громкий столбик» подавляет остальные полосы.
     #[serde(default = "default_db_scale")]
     pub db_scale: bool,
+    /// Шкала высот столбиков спектра: `"legacy"` (от 0 dBFS, окно 52 дБ),
+    /// `"track_peak"` (от медленного пика трека, окно 30 дБ) или `"frame_peak"`
+    /// (от пика кадра, окно 30 дБ). Переопредляется `DEEZER_TUI_SPECTRUM_SCALE`.
+    #[serde(default = "default_spectrum_scale")]
+    pub spectrum_scale: String,
+    /// Высота панели спектра в строках терминала: `None` — автоматически (4–6 строк
+    /// в зависимости от высоты окна), `Some(n)` — фиксированная (2–12).
+    /// Переопределяется `DEEZER_TUI_SPECTRUM_ROWS` (`0` — авто).
+    #[serde(default)]
+    pub spectrum_rows: Option<u16>,
     /// Свёрнут ли левый сайдбар навигации (переключается по `s`).
     #[serde(default)]
     pub sidebar_collapsed: bool,
@@ -67,6 +82,10 @@ fn default_db_scale() -> bool {
     true
 }
 
+fn default_spectrum_scale() -> String {
+    SpectrumScale::TrackPeak.as_str().to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -77,6 +96,8 @@ impl Default for AppConfig {
             show_spectrum: default_show_spectrum(),
             show_lyrics: default_show_lyrics(),
             db_scale: default_db_scale(),
+            spectrum_scale: default_spectrum_scale(),
+            spectrum_rows: None,
             sidebar_collapsed: false,
         }
     }
@@ -128,6 +149,24 @@ impl AppConfig {
         }
     }
 
+    /// Активная шкала высот спектра: `DEEZER_TUI_SPECTRUM_SCALE` важнее `config.toml`,
+    /// а некорректное значение приводит к `TrackPeak`.
+    pub fn effective_spectrum_scale(&self) -> SpectrumScale {
+        scale_from_setting(
+            &self.spectrum_scale,
+            env::var("DEEZER_TUI_SPECTRUM_SCALE").ok().as_deref(),
+        )
+    }
+
+    /// Активная высота панели спектра: `DEEZER_TUI_SPECTRUM_ROWS` важнее `config.toml`,
+    /// `0` или некорректное значение означает автоматическую высоту.
+    pub fn effective_spectrum_rows(&self) -> Option<u16> {
+        rows_from_setting(
+            self.spectrum_rows,
+            env::var("DEEZER_TUI_SPECTRUM_ROWS").ok().as_deref(),
+        )
+    }
+
     /// Сохранение конфигурации по стандартному пути.
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::path())
@@ -175,6 +214,31 @@ impl AppConfig {
 }
 
 /// Нормализация громкости в диапазон `0.0..=1.0`.
+/// Разрешение значения шкалы с учётом переопределения переменной окружения.
+fn scale_from_setting(setting: &str, env_value: Option<&str>) -> SpectrumScale {
+    if let Some(v) = env_value.filter(|v| !v.trim().is_empty())
+        && let Ok(mode) = v.trim().parse::<SpectrumScale>()
+    {
+        return mode;
+    }
+    setting
+        .trim()
+        .parse::<SpectrumScale>()
+        .unwrap_or(SpectrumScale::TrackPeak)
+}
+
+/// Разрешение высоты панели спектра: `0` и некорректные значения = авто.
+fn rows_from_setting(setting: Option<u16>, env_value: Option<&str>) -> Option<u16> {
+    let raw = env_value
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .or(setting);
+    match raw {
+        Some(0) | None => None,
+        Some(n) => Some(n.clamp(SPECTRUM_ROWS_MIN, SPECTRUM_ROWS_MAX)),
+    }
+}
+
 pub fn normalize_volume(v: f32) -> f32 {
     if v.is_nan() {
         default_volume()
@@ -186,6 +250,23 @@ pub fn normalize_volume(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_and_rows_resolution() {
+        use crate::dsp::cavacore::SpectrumScale;
+        assert_eq!(scale_from_setting("legacy", None), SpectrumScale::Legacy);
+        assert_eq!(scale_from_setting("bogus", None), SpectrumScale::TrackPeak);
+        assert_eq!(
+            scale_from_setting("legacy", Some("frame_peak")),
+            SpectrumScale::FramePeak
+        );
+        assert_eq!(rows_from_setting(None, None), None);
+        assert_eq!(rows_from_setting(Some(8), None), Some(8));
+        assert_eq!(rows_from_setting(Some(99), None), Some(SPECTRUM_ROWS_MAX));
+        assert_eq!(rows_from_setting(Some(8), Some("0")), None);
+        assert_eq!(rows_from_setting(Some(8), Some("3")), Some(3));
+        assert_eq!(rows_from_setting(Some(1), None), Some(SPECTRUM_ROWS_MIN));
+    }
 
     #[test]
     fn load_missing_file_returns_defaults() {
@@ -224,6 +305,8 @@ mod tests {
             show_spectrum: false,
             show_lyrics: false,
             db_scale: true,
+            spectrum_scale: "frame_peak".into(),
+            spectrum_rows: Some(8),
             sidebar_collapsed: true,
         };
         config.save_to(&cfg_path).expect("save_to failed");

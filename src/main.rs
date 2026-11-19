@@ -52,7 +52,7 @@ fn main() -> Result<()> {
         has_arl = cfg.effective_arl().is_some(),
         "конфигурация загружена"
     );
-    let mut app = App::with_config(cfg);
+    let mut app = App::with_loaded_config(cfg);
     app.run()?;
     Ok(())
 }

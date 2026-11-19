@@ -1,4 +1,4 @@
-# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.4 — фазы 1..13 закрыты)
+# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.6 — фазы 1..15 закрыты)
 
 Выполняй задачи строго сверху вниз по одной за итерацию. После прохождения cargo test и cargo clippy --all-targets -- -D warnings меняй [ ] на [x].
 
@@ -131,3 +131,10 @@
 
 * [x] **Шаг 14.3 (`src/config.rs`, тесты):** `db_scale` по умолчанию `true` (`#[serde(default = "default_db_scale")]`); +4 регрессии: `loud_bass_does_not_flatten_high_bands`, `pure_bass_keeps_high_bands_dark`, `sustained_lead_does_not_flatten_other_bands`, `autosens_recovers_after_loud_passage`. Гейт: `cargo test` **118/118**, `cargo clippy --all-targets -- -D warnings` exit 0, build без warning'ов.
 
+## Фаза 15: v2.6 — три шкалы высоты спектра и настраиваемая высота панели
+
+* [x] **Шаг 15.1 (`src/dsp/cavacore.rs`):** `SpectrumScale` (`Legacy` / `TrackPeak` / `FramePeak`) + относительное окно `REL_WINDOW = 30` дБ: `TrackPeak` нормируется от EMA-пика громкости всего трека (`TRACK_PEAK_ATTACK 0.05` / `TRACK_PEAK_RELEASE 0.0005`), `FramePeak` — от пика кадра; в обоих отключены по-полосный AGC, `sens` и `autosens`, пороги `REL_SILENCE_PEAK 1e-4` и `REL_BAND_GATE 0.01`, Monstercat `REL_SPREAD_BASE 2.0`, `INTEGRAL 0.5`; API `with_scale_mode`/`set_scale_mode` со сбросом сглаживания.
+
+* [x] **Шаг 15.2 (`src/config.rs`, `src/ui/views/settings.rs`, `src/ui/app.rs`):** `config.spectrum_scale` (по умолчанию `track_peak`) и `config.spectrum_rows` (`None` = AUTO) с env-переопределениями `DEEZER_TUI_SPECTRUM_SCALE`/`DEEZER_TUI_SPECTRUM_ROWS`; строки Settings **Spectrum Height Scale** и **Spectrum Panel Rows** (`◄►`/`Enter`), ручная высота ограничивается свободной высотой окна через `App::spectrum_rows_for`; запись конфига только при загрузке с диска (`App::persist_config`).
+
+* [x] **Шаг 15.3 (тесты):** +10 тестов (нули в тише для относительных шкал, сброс сглаживания при смене шкалы, трек-эталон против кадр-эталона, контраст TrackPeak против Legacy, разрешение шкалы/строк, две строки Settings и их циклы, применение шкалы и высоты панели в раскладке). Гейт: `cargo build` без warning'ов, `cargo test` **128/128**, `cargo clippy --all-targets -- -D warnings` exit 0.

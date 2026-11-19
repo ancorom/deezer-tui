@@ -75,8 +75,10 @@
         │                           #   интерполяция узких полос, eq = norm_fft·(f_center/120)^0.18
         │                           #   (clamp 0.85–2.2), по-полосный AGC + относительный порог
         │                           #   тишины (v2.5), Monstercat spatial filter (1.35^d), gravity
-        │                           #   falloff, autosens (мёртвая зона 0.4–0.85), dB scale по
-        │                           #   умолчанию (окно 52 дБ) / линейный x^0.45, set_num_bars.
+        │                           #   falloff, autosens (мёртвая зона 0.4–0.85), три шкалы
+        │                           #   высоты: TrackPeak / FramePeak (окно 30 дБ от пика
+        │                           #   трека / кадра) и Legacy (0 dBFS, 52 дБ), линейный
+        │                           #   x^0.45, set_num_bars.
         │                           #   process(&[f32]).
         └── ui/
             ├── mod.rs              # pub-экспорт: app, theme, views, widgets.
@@ -226,13 +228,13 @@
    **Энергия полосы v2.5:** для широких полос `mag = Σ|X_k| + PEAK_BLEND * max|X_k|` по `[lo..hi]`, `PEAK_BLEND = 0.35`. Сумма магнитуд даёт **равную энергию на октаву** (розовый шум → ровные столбики), а RMS-усреднение (`Σ|X_k|²/count`) из v2.3 размазывало разреженное содержимое широких ВЧ-полос: полоса 10–20 кГц — ~460 бинов `N_MID_HIGH` с несколькими активными бинами → правая треть спектра была плоской. Полка пикового бина возвращает «прыгающие» ВЧ-транзиенты (шляпки, щелчки, атака).
 4. Фильтр пространственного сглаживания Monstercat:
    Для каждого столбика i соседние столбики j подтягиваются к локальным пикам:
-   bars[i] = bars[i].max(bars[j] / 1.35_f32.powi((i as i32 - j as i32).abs()))  (v2.5: база 1.5 → 1.35 — раньше «стена баса» перетекала в соседние полосы)
+   bars[i] = bars[i].max(bars[j] / spread_base.powi((i as i32 - j as i32).abs()))  (v2.5: база 1.5 → 1.35 — раньше «стена баса» перетекала в соседние полосы; v2.6: в относительных шкалах база `REL_SPREAD_BASE = 2.0` — соседи получают 50 %/25 % вместо 74 %/55 %, и тёмные полосы возвращаются)
 5. Гравитация падения (Falloff) и интегральный фильтр:
    - Если новое значение v_new[i] меньше v_prev[i], столбик опускается с квадратичным ускорением:
      v_fall[i] = v_prev[i] * (1.0 - gravity * fall_step[i].powi(2))
      где fall_step[i] увеличивается на 1.0 каждый кадр падения и сбрасывается в 0.0 при новом пике.
    - Финальное сглаживание:
-     out[i] = mem[i] * 0.62 + v[i] * (1.0 - 0.62)   (v2.5: 0.77 → 0.62 — постоянная времени ~40 мс вместо ~70 мс, короткие ВЧ-транзиенты больше не усредняются «в плоскость»)
+     out[i] = mem[i] * integral + v[i] * (1.0 - integral)   (v2.5: 0.77 → 0.62 — постоянная времени ~40 мс вместо ~70 мс; v2.6: в относительных шкалах `REL_INTEGRAL = 0.5` — одиночные пики не размазываются)
 6. Авточувствительность (autosens, v2.5):
    Была асимметричной (0.985 при перегрузке против 1.001 без неё): один громкий кадрец
    тянул все столбики вниз на секунды, а обратно чувствительность возвращалась ~35 с.
@@ -258,6 +260,24 @@
      не «схватываются» на потолке. Порог тишины шкалы `DB_SILENCE_FLOOR = 1e-4`.
    - Поле `config.db_scale` теперь по умолчанию `true` (в существующем `config.toml`
      `db_scale = false` сохраняется; переключение — `c` на вкладке Settings).
+7b. Шкалы высоты `SpectrumScale` (v2.6):
+   Замер на реальном MP3 (15 полос, 25 с сигнала, 60 FPS) показал, что v2.5 держит честные
+   децибелы, но не даёт контраста: средняя высота 0.70–0.78, полос ниже 0.2 — ноль, σ 0.10–0.18.
+   - `Legacy` — v2.5: окно `(20·log10(scaled) + 52) / 52` от 0 dBFS с по-полосным AGC,
+     `sens` и `autosens`. Честно, но всё сжато в середину.
+   - `TrackPeak` (значение по умолчанию) — окно `REL_WINDOW = 30` дБ от **долгосрочного
+     пика громкости трека** `slow_peak` (EMA: attack `TRACK_PEAK_ATTACK = 0.05`, release
+     `TRACK_PEAK_RELEASE = 0.0005`): полоса в −30 дБ от пика трека уходит в ноль, полоса
+     в −10 дБ — на ⅔ высоты. Тихие места трека не поднимаются в потолок (регрессия
+     `track_peak_keeps_track_loudness_as_reference`).
+   - `FramePeak` — то же окно от пика **текущего кадра** (манера cava: самый громкий
+     столбик всегда в потолке), поэтому тихий фрагмент после громкого даёт полную высоту.
+   - В обеих относительных шкалах AGC, `sens` и `autosens` выключены: нормировка от пика
+     — единственное усиление, иначе «завышение» возвращается. Порог тишины всего кадра
+     `REL_SILENCE_PEAK = 1e-4`, порог полосы `REL_BAND_GATE = 0.01` (−40 дБ от пика кадра).
+   - `set_scale_mode()` пересобирает веса Monstercat и обнуляет `mem`/`prev`/`fall_step`/
+     `band_ref`/`slow_peak`/`sensitivity`.
+
 8. Динамическое число полос (v2.3):
    `set_num_bars(desired_bars)` — пересчёт границ, bin-индексов и EQ-весов; `mem`/`prev` ресайзятся (новые полосы обнулены), FFT-буферы и окна Ханна сохраняются (аудио-состояние не сбрасывается); вызывает App при ресайзе окна. `Spectrum::render` отрисовывает полосы 1:1 — без ресемплинга (`sample_slice` убран).
 
@@ -331,9 +351,11 @@
   | `preferred_quality` | `String` | `FLAC` / `MP3_320` / `MP3_128` |
   | `show_spectrum` | `bool` | Спектр вкл/выкл |
   | `show_lyrics` | `bool` | Панель lyrics вкл/выкл |
-  | `db_scale` | `bool` | dB-масштаб в спектре (по умолчанию `true`, переключение `c`) |
+  | `db_scale` | `bool` | dB-масштаб в спектре (по умолчанию `true`, переключение `c`; действует только на шкалу `Legacy`) |
+  | `spectrum_scale` | `String` | шкала высот: `track_peak` (по умолчанию) / `frame_peak` / `legacy` (переключение `◄►` в Settings) |
+  | `spectrum_rows` | `Option<u16>` | высота панели спектра: `null` = AUTO (4–6 строк), иначе 2…12 |
   | `sidebar_collapsed` | `bool` | Сайдбар свёрнут |
-- Переменные окружения: `DEEZER_ARL` (перекрывает `arl` из файла), `DEEZER_TUI_LOG_DIR` (перекрывает каталог логов).
+- Переменные окружения: `DEEZER_ARL` (перекрывает `arl` из файла), `DEEZER_TUI_LOG_DIR` (перекрывает каталог логов), `DEEZER_TUI_SPECTRUM_SCALE` (`legacy`/`track_peak`/`frame_peak`), `DEEZER_TUI_SPECTRUM_ROWS` (`0` = AUTO, иначе 2…12).
 - Лог: `~/.config/deezer-tui/deezer-tui.log` (tracing → tracing-appender daily rolling).
 
 ## 8. Полная карта хоткеев (v2.3)
@@ -359,7 +381,8 @@
 | `q` | Выход |
 | `Enter`, `Esc` | Play/подтвердить, закрыть/снять фокус |
 
-## 9. Что добавили v2.1/v2.2/v2.3/v2.4/v2.5 (кратко)
+## 9. Что добавили v2.1/v2.2/v2.3/v2.4/v2.5/v2.6 (кратко)
+- **v2.6:** три шкалы высоты спектра `SpectrumScale` (`TrackPeak` — окно 30 дБ от EMA-пика громкости трека, по умолчанию; `FramePeak` — окно 30 дБ от пика кадра, манера cava; `Legacy` — 0 dBFS / 52 дБ из v2.5), в относительных шкалах AGC/sens/autosens выключены, `REL_SILENCE_PEAK 1e-4`, `REL_BAND_GATE 0.01`, Monstercat 2.0, `INTEGRAL 0.5`; две новые строки Settings (шкала высот, высота панели), `config.spectrum_scale`/`config.spectrum_rows` + env `DEEZER_TUI_SPECTRUM_SCALE`/`DEEZER_TUI_SPECTRUM_ROWS`, `App::spectrum_rows_for`, сохранение конфига только при загрузке с диска (`App::persist_config`).
 - **v2.1:** глобальная очередь воспроизведения (`PlaybackQueue`), бесконечный Flow + Live Lyrics, панель lyrics (`y`), `[i]` Track & Stream Info, поиск `/`/`f`, двухпанельная Library с сортировкой (`o`/`r`), `PrefetchedTrack`-кэш (`spawn_prefetch_next`), gapless prefetch, `fetch_streaming` (256 КБ prebuffer), `StreamTechInfo`.
 - **v2.2:** in-memory буфер `DeezerStream` (`Arc<RwLock<Vec<u8>>>` + `pos`), `playback_seq: Arc<AtomicU64>`, переиспользование сессии `self.client`, `BgEvent::FlowLoadFailed`, подсказки хоткеев в player bar, адаптивный спектр (`div_ceil(w/2).clamp(8,160)`, `sample_slice`), Cavacore-интерполяция узких полос + `eq=(norm_fft*freq_tilt)/bin_count.sqrt()`, `freq_tilt=(f_hi/100.0)^0.55`, колонка ADDED (Library, `width>=68`), `TrackData::formatted_date_add()` → YYYY-MM-DD, SearchRow + `added`, quad subpixel 2×2 (`QUADRANT_GLYPHS`, `resized_quadrant`, `best_quadrant_cell`), обложки 500×500, now_playing cover `clamp(4,26)`, flow_lyrics `min(14)`, tokio `worker_threads(4)`.
 - **v2.3:** Cavacore: октавная шкала 20 Гц–20 кГц (15 полос = ⅔ окт, 30 = ⅓ окт), энергия полосы `0.65·RMS + 0.35·peak`, `freq_tilt = (f_center/300)^0.25` (clamp 0.55–2.3), `eq = norm_fft·freq_tilt`, `set_num_bars` (динамический ресайз, FFT-буферы сохраняются), спектр 1:1 без ресемплинга; обложки — TrueColor 1:1-пиксели (Lanczos3, '▀' fg/bg, quad 2×2 удалён); Track Menu (`m`/`M`: favorite, плейлист, `radio.getSongRadio`, info) + Toast (3 с); Flow Modes (`f`/`g`: My Flow / 7 moods / 10 жанров через `radio.getUserRadio`, режим запоминается); тема: `BG_ELEVATED #252842`.

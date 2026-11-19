@@ -181,6 +181,9 @@ pub const FLOW_MODES: &[(&str, &str, bool, &str)] = &[
 ];
 
 pub struct App {
+    /// `true` только когда конфиг был прочитан с диска: тесты строят `App`
+    /// из `AppConfig::default()` и не должны перезаписывать `~/.config`.
+    pub persist_config: bool,
     pub now_playing: NowPlaying,
     pub search: Search,
     pub library: Library,
@@ -259,7 +262,15 @@ impl App {
         Self::with_config(AppConfig::default())
     }
 
+    /// Конфигурация по умолчанию (тесты, демо-режим): запись на диск выключена.
     pub fn with_config(cfg: AppConfig) -> Self {
+        let mut app = Self::with_loaded_config(cfg);
+        app.persist_config = false;
+        app
+    }
+
+    /// Боевой путь: конфиг прочитан с диска, поэтому изменения сохраняются.
+    pub fn with_loaded_config(cfg: AppConfig) -> Self {
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
@@ -279,7 +290,9 @@ impl App {
             .collect();
         global_spectrum.set_bars(&demo);
 
-        let cavacore = Cavacore::new(cfg.sample_rate_hz, 64).with_db_scale(cfg.db_scale);
+        let cavacore = Cavacore::new(cfg.sample_rate_hz, 64)
+            .with_db_scale(cfg.db_scale)
+            .with_scale_mode(cfg.effective_spectrum_scale());
         let mut settings = Settings::new();
         settings.sync_from_config(&cfg, None, None);
 
@@ -329,6 +342,7 @@ impl App {
             flow_mode_selected: 0,
             current_flow_mode_idx: 0,
             toast_message: None,
+            persist_config: false,
             cavacore,
             vis_consumer: None,
             audio_output: None,
@@ -2064,14 +2078,12 @@ impl App {
         if area.height >= 3 {
             let inner = Rect::new(area.left(), area.top() + 1, area.width, area.height - 2);
             if !inner.is_empty() {
-                let spec_rows = if self.config.show_spectrum && inner.height >= 22 {
-                    6u16
-                } else if self.config.show_spectrum && inner.height >= 12 {
-                    4u16
-                } else {
-                    0u16
-                };
                 let player_rows = if inner.height >= 5 { 1u16 } else { 0u16 };
+                let spec_rows = Self::spectrum_rows_for(
+                    inner.height,
+                    self.config.show_spectrum,
+                    self.config.effective_spectrum_rows(),
+                );
                 let footer_h = spec_rows + player_rows;
                 let viewport_h = inner.height.saturating_sub(footer_h);
 
@@ -2282,7 +2294,7 @@ impl App {
                     } else {
                         Some(trimmed)
                     };
-                    let _ = self.config.save();
+                    self.save_config();
                     self.sync_settings_view();
                     self.spawn_initial_load();
                 }
@@ -2407,7 +2419,7 @@ impl App {
                     } else {
                         Some(trimmed)
                     };
-                    let _ = self.config.save();
+                    self.save_config();
                     self.sync_settings_view();
                     self.spawn_initial_load();
                 }
@@ -2644,26 +2656,69 @@ impl App {
     pub fn toggle_spectrum(&mut self) {
         self.config.show_spectrum = !self.config.show_spectrum;
         self.settings.show_spectrum = self.config.show_spectrum;
-        let _ = self.config.save();
+        self.save_config();
     }
 
     pub fn toggle_lyrics(&mut self) {
         self.config.show_lyrics = !self.config.show_lyrics;
         self.now_playing.show_lyrics = self.config.show_lyrics;
         self.flow_lyrics.show_lyrics = self.config.show_lyrics;
-        let _ = self.config.save();
+        self.save_config();
     }
 
     pub fn toggle_db_scale(&mut self) {
         self.config.db_scale = !self.config.db_scale;
         self.settings.db_scale = self.config.db_scale;
         self.cavacore.set_db_scale(self.config.db_scale);
-        let _ = self.config.save();
+        self.save_config();
+    }
+
+    /// Высота панели спектра: AUTO даёт 4–6 строк по высоте окна, ручная высота
+    /// из Settings ограничивается свободной высотой (минус строка плеера).
+    fn spectrum_rows_for(inner_height: u16, show: bool, want: Option<u16>) -> u16 {
+        if !show {
+            return 0;
+        }
+        let player_rows = if inner_height >= 5 { 1u16 } else { 0u16 };
+        let auto = if inner_height >= 22 {
+            6u16
+        } else if inner_height >= 12 {
+            4u16
+        } else {
+            0u16
+        };
+        match want {
+            None => auto,
+            Some(n) if inner_height >= 12 => n.min(inner_height.saturating_sub(player_rows)),
+            Some(_) => 0,
+        }
+    }
+
+    /// Сохраняет конфигурацию, только если она была загружена с диска.
+    fn save_config(&mut self) {
+        if self.persist_config {
+            let _ = self.config.save();
+        }
+    }
+
+    /// Переключает шкалу высот спектра и применяет её к `Cavacore` сразу.
+    pub fn cycle_spectrum_scale(&mut self, forward: bool) {
+        let next = self.settings.cycle_spectrum_scale(forward);
+        self.config.spectrum_scale = next.as_str().to_string();
+        self.cavacore.set_scale_mode(next);
+        self.save_config();
+    }
+
+    /// Переключает высоту панели спектра (AUTO -> 4 -> 6 -> ... -> 12).
+    pub fn cycle_spectrum_rows(&mut self, forward: bool) {
+        let next = self.settings.cycle_spectrum_rows(forward);
+        self.config.spectrum_rows = next;
+        self.save_config();
     }
 
     pub fn toggle_sidebar(&mut self) {
         self.config.sidebar_collapsed = !self.config.sidebar_collapsed;
-        let _ = self.config.save();
+        self.save_config();
     }
 
     pub fn seek(&mut self, forward: bool) {
@@ -2699,7 +2754,7 @@ impl App {
             0 => {
                 let next_q = self.settings.cycle_quality(forward);
                 self.config.preferred_quality = next_q;
-                let _ = self.config.save();
+                self.save_config();
             }
             1 => {
                 self.settings.editing_arl = true;
@@ -2709,6 +2764,12 @@ impl App {
             }
             3 => {
                 self.toggle_db_scale();
+            }
+            4 => {
+                self.cycle_spectrum_scale(forward);
+            }
+            5 => {
+                self.cycle_spectrum_rows(forward);
             }
             _ => {}
         }
@@ -2808,7 +2869,7 @@ impl App {
                     self.spawn_fetch_more_flow();
                 }
             }
-            5 if self.settings.selected_row < 3 => self.settings.selected_row += 1,
+            5 if self.settings.selected_row < 5 => self.settings.selected_row += 1,
             _ => {}
         }
     }
@@ -2971,6 +3032,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsp::cavacore::SpectrumScale;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
 
@@ -3007,6 +3069,65 @@ mod tests {
     fn screen_has(terminal: &Terminal<TestBackend>, needle: &str) -> bool {
         let size = terminal.size().unwrap();
         (0..size.height).any(|y| row_has(terminal, y, needle))
+    }
+
+    #[test]
+    fn spectrum_panel_height_follows_auto_and_manual_setting() {
+        // AUTO: 6 строк на высоком окне, 4 на среднем, 0 на низком.
+        assert_eq!(App::spectrum_rows_for(28, true, None), 6);
+        assert_eq!(App::spectrum_rows_for(21, true, None), 4);
+        assert_eq!(App::spectrum_rows_for(11, true, None), 0);
+        assert_eq!(App::spectrum_rows_for(28, false, Some(10)), 0);
+        // Ручная высота.
+        assert_eq!(App::spectrum_rows_for(28, true, Some(12)), 12);
+        assert_eq!(App::spectrum_rows_for(13, true, Some(12)), 12);
+        // Ограничение свободной высотой: строка плеера всегда сохраняется.
+        assert_eq!(App::spectrum_rows_for(28, true, Some(30)), 27);
+        assert_eq!(App::spectrum_rows_for(12, true, Some(12)), 11);
+        // На низком окне ручная высота не рисуется вовсе.
+        assert_eq!(App::spectrum_rows_for(11, true, Some(6)), 0);
+    }
+
+    #[test]
+    fn settings_spectrum_rows_are_applied_to_layout() {
+        let mut app = App::new();
+        app.config.spectrum_rows = Some(12);
+        let terminal = render_ui(&app, 120, 30);
+        // inner.height = 28 -> панель занимает строки 17..28, верхние столбики видны на 20.
+        assert!(row_has(&terminal, 20, "\u{2588}"));
+        app.config.spectrum_rows = Some(4);
+        let small = render_ui(&app, 120, 30);
+        assert!(!row_has(&small, 20, "\u{2588}"));
+    }
+
+    #[test]
+    fn settings_spectrum_scale_cycles_into_config_and_cavacore() {
+        let mut app = App::new();
+        app.active_tab = 5;
+        app.settings.selected_row = 4;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            app.config.effective_spectrum_scale(),
+            SpectrumScale::FramePeak
+        );
+        assert_eq!(app.cavacore.scale_mode(), SpectrumScale::FramePeak);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.config.effective_spectrum_scale(), SpectrumScale::Legacy);
+        assert_eq!(app.cavacore.scale_mode(), SpectrumScale::Legacy);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            app.config.effective_spectrum_scale(),
+            SpectrumScale::FramePeak
+        );
+
+        app.settings.selected_row = 5;
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.config.effective_spectrum_rows(), Some(4));
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.config.effective_spectrum_rows(), None);
     }
 
     #[test]

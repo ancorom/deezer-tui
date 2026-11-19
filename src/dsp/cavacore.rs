@@ -14,10 +14,19 @@
 //!   спектра (`AGC_STRENGTH = 0.7`), относительный порог тишины `REL_SILENCE_GATE`
 //!   гасит шумовую полку и утечку FFT. Без них один общий множитель усиления оставляет
 //!   ВЧ в 30–40 дБ ниже баса, и «подпрыгивает» только самый громкий столбик.
-//! - Пространственный фильтр сглаживания Monstercat (`1.35^|i - j|`).
-//! - Параболическая гравитация падения (falloff) и интегральный фильтр (`0.62`).
-//! - Логарифмическое (dB) масштабирование по умолчанию (`db_scale = true`, окно 52 дБ);
-//!   в линейном режиме — мягкая компрессия `scaled^0.45`.
+//! - Пространственный фильтр сглаживания Monstercat (в Legacy — `1.35^|i - j|`,
+//!   в относительных шкалах — `2.0^|i - j|`, как в эталонной cava она отсутствует).
+//! - Параболическая гравитация падения (falloff) и интегральный фильтр
+//!   (`0.62` в Legacy, `0.5` в относительных шкалах).
+//! - Три шкалы высоты (`SpectrumScale`):
+//!   * `Legacy` — логарифмическое окно 52 дБ от 0 dBFS (v2.5) с по-полосным AGC и
+//!     авточувствительностью; честная, но сжатая в середину 0.2–0.6 манера;
+//!   * `TrackPeak` (по умолчанию) — окно 30 дБ от долгосрочного пика громкости трека:
+//!     тихие места не поднимаются в потолок, полоса в −30 дБ от пика уходит в ноль;
+//!   * `FramePeak` — окно 30 дБ от пика текущего кадра (манера cava: самый громкий
+//!     столбик всегда в потолке). В обеих относительных шкалах AGC, sens и
+//!     авточувствительность выключены, чтобы нормировка оставалась единственной.
+//! - Линейный режим (`db_scale = false`) — мягкая компрессия `scaled^0.45` (только Legacy).
 //! - Авточувствительность (`autosens`) с симметричной мёртвой зоной [0.4, 0.85].
 //! - Полное отсутствие аллокаций памяти внутри `process()` и `process_stereo()`.
 
@@ -100,6 +109,76 @@ const GRAVITY: f32 = 0.025;
 /// Коэффициент мягкой компрессии для линейного (не-dB) режима: `val^0.45`.
 /// Показатель меньше 1 поднимает тихие полосы, сохраняя «удар» баса.
 const LIN_COMPRESSION: f32 = 0.45;
+
+/// Окно пик-нормированной шкалы (дБ): полоса ниже опорного пика на всю ширину окна
+/// уходит в нуль. Замер на реальных треках: внутри кадра полосы различаются примерно
+/// на 20–25 дБ, поэтому окно 30 дБ использует высоту панели целиком, а окно 52–70 дБ
+/// сжимает всю музыку в середину шкалы (ни провалов, ни пиков).
+const REL_WINDOW: f32 = 30.0;
+/// Пик кадра ниже этого порога — считаем тишину и обнуляем состояние spectrum.
+const REL_SILENCE_PEAK: f32 = 1e-4;
+/// Полоса ниже 1 % от пика кадра (−40 дБ) гасится в пик-режимах (в Legacy — 0.4 %).
+const REL_BAND_GATE: f32 = 0.01;
+/// База пространственного фильтра в пик-режимах. В Legacy она 1.35, то есть соседняя
+/// полоса получает 74 % от пика, через одну 55 %, через три 41 % — панель никогда не
+/// бывает тёмной. 2.0 оставляет соседям 50 %/25 %/12 % и возвращает контраст.
+const REL_SPREAD_BASE: f32 = 2.0;
+/// Интегральное сглаживание в пик-режимах: чуть быстрее Legacy.
+const REL_INTEGRAL: f32 = 0.5;
+/// EMA медленного пика трека: подъём быстрый (0.05), спуск очень медленный (0.0005),
+/// чтобы опорная точка была «громкостью трека», а не «громкостью кадра».
+const TRACK_PEAK_ATTACK: f32 = 0.05;
+const TRACK_PEAK_RELEASE: f32 = 0.0005;
+
+/// Шкала преобразования энергии полосы в высоту столбика.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpectrumScale {
+    /// Логарифмическая шкала от 0 dBFS в окне 52 дБ + по-полосный AGC
+    /// и авточувствительность по амплитуде (режим v2.5).
+    #[default]
+    Legacy,
+    /// Относительная шкала: высота = расстояние полосы до **медленного пика трека**
+    /// в децибелах, окно 30 дБ. Громкость трека остаётся честной, контраст полный.
+    TrackPeak,
+    /// Относительная шкала от пика **кадра**: самый «кавовский» вид — столбики
+    /// регулярно упёрты в потолок, но средняя высота выше, а тихие треки становятся
+    /// такими же яркими, как громкие.
+    FramePeak,
+}
+
+impl SpectrumScale {
+    /// Каноническое имя для сохранения в `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::TrackPeak => "track_peak",
+            Self::FramePeak => "frame_peak",
+        }
+    }
+
+    /// Короткая подпись для экрана Settings.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "0 dBFS · 52 dB",
+            Self::TrackPeak => "Track peak · 30 dB",
+            Self::FramePeak => "Frame peak · 30 dB",
+        }
+    }
+}
+
+impl std::str::FromStr for SpectrumScale {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let v = value.trim().to_lowercase();
+        match v.as_str() {
+            "legacy" | "dbfs" | "0dbfs" => Ok(Self::Legacy),
+            "track_peak" | "trackpeak" | "slow" => Ok(Self::TrackPeak),
+            "frame_peak" | "framepeak" | "cava" => Ok(Self::FramePeak),
+            _ => Err("ожидалось legacy | track_peak | frame_peak"),
+        }
+    }
+}
 
 /// Динамический диапазон для логарифмического (dB) масштабирования (в децибелах).
 /// 52 дБ: чем уже окно, тем сильнее заметен подскок полосы (+10 дБ ≈ +0.19 высоты).
@@ -192,8 +271,12 @@ pub struct Cavacore {
     upper_bin: Vec<usize>,
     eq_weights: Vec<f32>,
 
-    // Предвычисленные веса Monstercat: MONSTERCAT_BASE^d
+    // Предвычисленные веса Monstercat: spread_base^d
     monstercat_weights: Vec<f32>,
+    /// Активная шкала высот и её параметры (базовый spread, медленный пик трека).
+    scale_mode: SpectrumScale,
+    spread_base: f32,
+    slow_peak: f32,
     raw_bars: Vec<f32>,
 
     // Состояние временного сглаживания и гравитации
@@ -272,8 +355,9 @@ impl Cavacore {
         let (use_bass_fft, lower_bin, upper_bin, eq_weights) =
             Self::compute_band_bins(num_bars, sample_rate);
 
+        let spread_base = MONSTERCAT_BASE;
         let monstercat_weights: Vec<f32> = (0..num_bars)
-            .map(|d| MONSTERCAT_BASE.powi(d as i32))
+            .map(|d| spread_base.powi(d as i32))
             .collect();
 
         Self {
@@ -281,6 +365,9 @@ impl Cavacore {
             sample_rate,
             db_scale: false,
             autosens: true,
+            scale_mode: SpectrumScale::Legacy,
+            spread_base,
+            slow_peak: 0.0,
             bass_r2c,
             mid_r2c,
             bass_in,
@@ -327,7 +414,7 @@ impl Cavacore {
         self.eq_weights = eq_weights;
 
         self.monstercat_weights = (0..num_bars)
-            .map(|d| MONSTERCAT_BASE.powi(d as i32))
+            .map(|d| self.spread_base.powi(d as i32))
             .collect();
 
         self.raw_bars.resize(num_bars, 0.0);
@@ -347,6 +434,36 @@ impl Cavacore {
     /// Переключает режим dB-скейлинга на лету.
     pub fn set_db_scale(&mut self, enabled: bool) {
         self.db_scale = enabled;
+    }
+
+    /// Устанавливает шкалу высот столбиков, сбрасывая сглаживание и опорный пик.
+    pub fn set_scale_mode(&mut self, mode: SpectrumScale) {
+        if self.scale_mode == mode {
+            return;
+        }
+        self.scale_mode = mode;
+        self.spread_base = if mode == SpectrumScale::Legacy {
+            MONSTERCAT_BASE
+        } else {
+            REL_SPREAD_BASE
+        };
+        self.monstercat_weights = (0..self.num_bars)
+            .map(|d| self.spread_base.powi(d as i32))
+            .collect();
+        self.slow_peak = 0.0;
+        self.sensitivity = 1.0;
+        self.reset();
+    }
+
+    /// Builder-версия `set_scale_mode`.
+    pub fn with_scale_mode(mut self, mode: SpectrumScale) -> Self {
+        self.set_scale_mode(mode);
+        self
+    }
+
+    /// Возвращает активную шкалу высот.
+    pub fn scale_mode(&self) -> SpectrumScale {
+        self.scale_mode
     }
 
     /// Возвращает количество столбиков спектра.
@@ -371,6 +488,7 @@ impl Cavacore {
         self.out_buf.fill(0.0);
         self.sensitivity = 1.0;
         self.band_ref.fill(0.0);
+        self.slow_peak = 0.0;
     }
 
     /// Основной метод обработки моно-сэмплов (например, напрямую из `VisRingBuffer`).
@@ -493,8 +611,7 @@ impl Cavacore {
             let toward = if lin > *ref_i { AGC_REF_ATTACK } else { AGC_REF_RELEASE };
             *ref_i += (lin - *ref_i) * toward;
 
-            self.raw_bars[n] = lin;
-        }
+            self.raw_bars[n] = lin;        }
 
         // Средний долгосрочный уровень спектра — опорная точка по-полосного AGC.
         let mut ref_sum = 0.0f32;
@@ -503,12 +620,51 @@ impl Cavacore {
         }
         let ref_mean = ref_sum / self.num_bars as f32;
 
+        // 1b. Относительные режимы: тишина гасится целиком, опорная точка шкалы —
+        //     медленный пик трека (EMA) или пик кадра.
+        let rel = self.scale_mode != SpectrumScale::Legacy;
+        if rel {
+            if peak_lin < REL_SILENCE_PEAK {
+                self.mem.fill(0.0);
+                self.prev.fill(0.0);
+                self.fall_step.fill(0.0);
+                self.out_buf.fill(0.0);
+                return &self.out_buf;
+            }
+            if self.scale_mode == SpectrumScale::TrackPeak {
+                let toward = if peak_lin > self.slow_peak {
+                    TRACK_PEAK_ATTACK
+                } else {
+                    TRACK_PEAK_RELEASE
+                };
+                self.slow_peak += (peak_lin - self.slow_peak) * toward;
+            }
+        }
+        let denom = match self.scale_mode {
+            SpectrumScale::Legacy => 1.0,
+            SpectrumScale::TrackPeak => self.slow_peak.max(1e-7),
+            SpectrumScale::FramePeak => peak_lin.max(1e-7),
+        };
+
         // 2. По-полосный AGC + логарифмическая (dB) шкала по умолчанию или мягкая
         //    компрессия в линейной. Без них самый громкий столбик съедает весь
         //    диапазон высот, и остальные полосы почти не «прыгают».
+        // В относительных режимах AGC и autosens не нужны: нормировка от опорного пика
+        // сама убирает общую громкость трека, а равная энергия на октаву (наклон
+        // `eq_weights`) уже компенсирует спектральный спад.
+        let band_gate = if rel { REL_BAND_GATE } else { REL_SILENCE_GATE };
         for n in 0..self.num_bars {
             let lin = self.raw_bars[n];
-            let scaled = if lin <= peak_lin * REL_SILENCE_GATE {
+            if rel {
+                let val = if lin <= peak_lin * band_gate {
+                    0.0
+                } else {
+                    (20.0 * (lin / denom).log10() + REL_WINDOW) / REL_WINDOW
+                };
+                self.raw_bars[n] = val.clamp(0.0, 1.0);
+                continue;
+            }
+            let scaled = if lin <= peak_lin * band_gate {
                 0.0
             } else {
                 let ref_i = self.band_ref[n].max(1e-7);
@@ -564,7 +720,8 @@ impl Cavacore {
 
             self.prev[i] = v;
 
-            let smoothed = self.mem[i] * INTEGRAL + v * (1.0 - INTEGRAL);
+            let integral = if rel { REL_INTEGRAL } else { INTEGRAL };
+            let smoothed = self.mem[i] * integral + v * (1.0 - integral);
             self.mem[i] = if smoothed < 1e-6 { 0.0 } else { smoothed };
 
             if self.mem[i] > 1.0 {
@@ -582,7 +739,7 @@ impl Cavacore {
                 (self.sensitivity * (AUTOSENS_DOWN * 0.9)).clamp(AUTOSENS_MIN, AUTOSENS_MAX);
         }
 
-        if self.autosens && peak_eq > 1e-5 {
+        if self.autosens && !rel && peak_eq > 1e-5 {
             let scaled_peak = peak_eq * self.sensitivity;
             // Мёртвая зона: пока пик в пределах [TARGET_LOW, TARGET_HIGH], чувствительность
             // не меняется — динамика трека сохраняется, а не «сжимается» до одной высоты.
@@ -617,6 +774,149 @@ mod tests {
         for (idx, &val) in bars.iter().enumerate() {
             assert_eq!(val, 0.0, "столбик {idx} должен быть равен 0.0 в тишине");
         }
+    }
+
+    /// Кормит сигнал до тех пор, пока высоты не перестанут меняться.
+    fn steady_state(cava: &mut Cavacore, signal: &[f32]) -> Vec<f32> {
+        let mut prev = cava.process(signal).to_vec();
+        for _ in 0..60 {
+            let next = cava.process(signal).to_vec();
+            if next
+                .iter()
+                .zip(prev.iter())
+                .all(|(a, b)| (a - b).abs() < 1e-3)
+            {
+                return next;
+            }
+            prev = next;
+        }
+        prev
+    }
+
+    #[test]
+    fn relative_modes_zero_on_silence() {
+        for mode in [SpectrumScale::TrackPeak, SpectrumScale::FramePeak] {
+            let mut cava = Cavacore::new(44_100.0, 15).with_scale_mode(mode);
+            let zeros = vec![0.0f32; N_BASS];
+            let bars = cava.process(&zeros);
+            assert!(
+                bars.iter().all(|v| *v == 0.0),
+                "{mode:?}: тишина должна обнулять все столбики"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_scale_mode_resets_smoothing() {
+        let signal = sine_wave(100.0, 44_100.0, N_BASS);
+        let mut cava = Cavacore::new(44_100.0, 15).with_db_scale(true);
+        let _ = steady_state(&mut cava, &signal);
+
+        cava.set_scale_mode(SpectrumScale::TrackPeak);
+        assert_eq!(cava.scale_mode(), SpectrumScale::TrackPeak);
+        let after_switch = cava.process(&signal).to_vec();
+
+        let mut fresh = Cavacore::new(44_100.0, 15)
+            .with_db_scale(true)
+            .with_scale_mode(SpectrumScale::TrackPeak);
+        let fresh_first = fresh.process(&signal).to_vec();
+
+        for (a, b) in after_switch.iter().zip(fresh_first.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "переключение шкалы должно сбрасывать сглаживание: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn track_peak_keeps_track_loudness_as_reference() {
+        let sr = 44_100.0;
+        let loud = sine_wave(100.0, sr, N_BASS);
+        let quiet: Vec<f32> = (0..N_BASS)
+            .map(|i| 0.01 * (2.0 * PI * 100.0 * i as f32 / sr).sin())
+            .collect();
+
+        let mut peak = Cavacore::new(sr, 15)
+            .with_db_scale(true)
+            .with_scale_mode(SpectrumScale::TrackPeak);
+        for _ in 0..120 {
+            let _ = peak.process(&loud);
+        }
+        for _ in 0..30 {
+            let _ = peak.process(&quiet);
+        }
+        let bars = peak.process(&quiet);
+        let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            max_bar < 0.2,
+            "тихий_pass после громкого не должен подняться до полной высоты: {max_bar}"
+        );
+
+        // FramePeak нормируется от собственного кадра и поднимает тихий фрагмент в потолок.
+        let mut frame = Cavacore::new(sr, 15)
+            .with_db_scale(true)
+            .with_scale_mode(SpectrumScale::FramePeak);
+        for _ in 0..120 {
+            let _ = frame.process(&loud);
+        }
+        for _ in 0..30 {
+            let _ = frame.process(&quiet);
+        }
+        let bars = frame.process(&quiet);
+        let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            max_bar > 0.9,
+            "FramePeak должен нормироваться от кадра и поднять тихий фрагмент: {max_bar}"
+        );
+    }
+
+    #[test]
+    fn track_peak_uses_more_of_the_height_range_than_legacy() {
+        let sr = 44_100.0;
+        // Громкий бас 60 Гц + тихая ВЧ-полоса 5 кГц (-26 дБ): окно 30 дБ должно
+        // показать и потолок, и провал, а окно 52 дБ от 0 dBБFS — только середину.
+        let signal: Vec<f32> = (0..N_BASS)
+            .map(|i| {
+                (2.0 * PI * 60.0 * i as f32 / sr).sin()
+                    + 0.05 * (2.0 * PI * 5_000.0 * i as f32 / sr).sin()
+            })
+            .collect();
+
+        let mut legacy = Cavacore::new(sr, 15).with_db_scale(true);
+        let mut peak = Cavacore::new(sr, 15)
+            .with_db_scale(true)
+            .with_scale_mode(SpectrumScale::TrackPeak);
+
+        let l = steady_state(&mut legacy, &signal);
+        let p = steady_state(&mut peak, &signal);
+        let range = |v: &[f32]| {
+            let hi = v.iter().copied().fold(0.0f32, f32::max);
+            let lo = v.iter().copied().fold(1.0f32, f32::min);
+            hi - lo
+        };
+
+        assert!(
+            range(&p) > range(&l),
+            "шкала от пика трека должна использовать вертикальный диапазон шире: {} vs {}",
+            range(&p),
+            range(&l)
+        );
+        assert!(
+            p.iter().any(|v| *v > 0.85),
+            "громкая полоса в TrackPeak должна упираться в потолок"
+        );
+        let dark = |v: &[f32]| v.iter().filter(|x| **x < 0.2).count();
+        assert!(
+            dark(&p) >= 4,
+            "в TrackPeak должны быть тёмные полосы: {}",
+            dark(&p)
+        );
+        assert_eq!(
+            dark(&l),
+            0,
+            "в Legacy окно 52 дБ не оставляет тёмных полос на такой смеси: {l:?}"
+        );
     }
 
     #[test]
@@ -728,6 +1028,7 @@ mod tests {
         let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
         assert!(max_bar > 0.05 && max_bar <= 1.0);
     }
+
     /// Шумовой генератор для имитации широкополосных ВЧ-транзиентов.
     fn noise(seed: &mut u32) -> f32 {
         *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -751,8 +1052,6 @@ mod tests {
             .collect()
     }
 
-    /// Регрессия на «плоскую правую половину спектра»: при громком басе ВЧ-полосы
-    /// обязаны оставаться заметными и подпрыгивать на транзиентах шляпок.
     #[test]
     fn loud_bass_does_not_flatten_high_bands() {
         let sr = 44_100.0;

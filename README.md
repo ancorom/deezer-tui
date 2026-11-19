@@ -15,7 +15,7 @@ runtime dependencies beyond ALSA/PipeWire.
 | Area | What you get |
 | --- | --- |
 | Playback | HiFi login by ARL token (no token → guest mode: 30 s MP3 previews); FLAC 1411 kbps, MP3 320/128 fallback; seek ±5 s; gapless prefetch of the next track (starts 20 s before the end) |
-| Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log-octave bands 20 Hz–20 kHz (15 bars = ⅔ octave per step, 30 = ⅓), band energy `Σ\|X_k\| + 0.35·peak` (equal energy per octave), **per-band AGC** so mid/high bands are visible next to a loud bass, relative silence gate (kills the noise floor / FFT leakage), Monstercat spatial filter (1.35^d), gravity falloff, autosens with a symmetric dead zone, dB scale by default (52 dB window) or linear mode with `x^0.45` compression; dynamic bar count (`set_num_bars`) and 1:1 rendering — no resampling |
+| Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log-octave bands 20 Hz–20 kHz (15 bars = ⅔ octave per step, 30 = ⅓), band energy `Σ\|X_k\| + 0.35·peak` (equal energy per octave), **per-band AGC** so mid/high bands are visible next to a loud bass, relative silence gate (kills the noise floor / FFT leakage), Monstercat spatial filter (1.35^d), gravity falloff, autosens with a symmetric dead zone, dB scale by default (52 dB window) or linear mode with `x^0.45` compression; dynamic bar count (`set_num_bars`) and 1:1 rendering — no resampling; three switchable height scales — **Track Peak** (30 dB window from the track's long-term loudness peak, default), **Frame Peak** (per-frame peak, cava-style) and **0 dBFS · 52 dB** (v2.5) — plus panel height AUTO 4–6 or fixed 4–12 rows |
 | Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale). **Track Menu** (`m`/`M`: favorite, add to playlist, Song Radio, info) and **Flow Modes** (`f`/`g`: My Flow / 7 moods / 10 genres) work from any track. Search — instant local library/playlist matching + infinite pagination (30/page, `PageDown`) |
 | Covers | 500×500 HD covers rendered as sextant 2×3 cells (6 subpixels per cell, 3× resolution of half-block art) — Unicode sextants U+1FB00–U+1FB3B + `▌`/`▐`/`█`, per-cell fg/bg color clustering, Lanczos3 downscale / CatmullRom upscale; optional HalfBlock mode |
 | System | MPRIS over D-Bus (souvlaki/zbus): hardware media keys, GNOME/KDE now-playing widgets, `playerctl` works out of the box |
@@ -167,7 +167,7 @@ cavacore на Rust). Один бинарник, без GUI-toolkit; единст
 Пять вкладок: **Now Playing** (крупная обложка 500×500, sextant 2×3 — 6 субпикселей
 на ячейку + синхронные lyrics), **Search**, **Library** (плейлисты + сортируемая таблица треков
 с колонкой ADDED), **Flow** (бесконечные рекомендации + живые lyrics), **Settings**
-(ARL-токен, качество, спектр, dB-масштаб). С любого трека — **Track Menu** (`m`/`M`:
+(ARL-токен, качество, спектр, dB-масштаб, шкала высот и высота панели спектра). С любого трека — **Track Menu** (`m`/`M`:
 избранное, плейлист, Song Radio, инфо) и **Flow Modes** (`f`/`g`: My Flow /
 настроения / жанры). Поиск: мгновенные совпадения по локальной медиатеке и
 бесконечная подгрузка результатов (30/страницу, `PageDown`). Интеграция MPRIS: аппаратные клавиши мультимедиа, виджеты
