@@ -8,7 +8,7 @@
 use ratatui::prelude::*;
 
 use crate::config::AppConfig;
-use crate::dsp::cavacore::SpectrumScale;
+use crate::dsp::cavacore::{SpectrumScale, MONSTERCAT_BASE};
 use crate::ui::theme;
 
 pub const QUALITY_CODES: [&str; 3] = ["FLAC", "MP3_320", "MP3_128"];
@@ -19,6 +19,10 @@ pub const SPECTRUM_SCALE_CHOICES: [SpectrumScale; 3] = [
     SpectrumScale::FramePeak,
     SpectrumScale::Legacy,
 ];
+
+/// Порядок переключения базы фильтра соседних полос: `0.0` — выключен (как в
+/// эталонной cava), дальше мягкие базы; `MONSTERCAT_BASE` (1.35) — «плато» v2.5.
+pub const SPECTRUM_SPREAD_CHOICES: [f32; 4] = [0.0, 3.0, 2.0, MONSTERCAT_BASE];
 
 /// Порядок переключения высоты панели спектра: `None` — авто (4–6 строк).
 pub const SPECTRUM_ROW_CHOICES: [Option<u16>; 6] =
@@ -35,6 +39,7 @@ pub struct Settings {
     pub db_scale: bool,
     pub spectrum_scale: SpectrumScale,
     pub spectrum_rows: Option<u16>,
+    pub spectrum_spread: f32,
 }
 
 impl Default for Settings {
@@ -55,6 +60,7 @@ impl Settings {
             db_scale: false,
             spectrum_scale: SpectrumScale::TrackPeak,
             spectrum_rows: None,
+            spectrum_spread: 0.0,
         }
     }
 
@@ -73,6 +79,7 @@ impl Settings {
         self.db_scale = cfg.db_scale;
         self.spectrum_scale = cfg.effective_spectrum_scale();
         self.spectrum_rows = cfg.effective_spectrum_rows();
+        self.spectrum_spread = cfg.effective_spectrum_spread();
 
         self.account_status = if let Some(user) = user_label {
             format!("CONNECTED as {user} (Deezer HiFi / BF_CBC_STRIPE ready)")
@@ -142,6 +149,32 @@ impl Settings {
         };
         self.spectrum_rows = SPECTRUM_ROW_CHOICES[next];
         self.spectrum_rows
+    }
+
+    /// Переключает базу фильтра соседних полос по кругу и возвращает новую.
+    pub fn cycle_spectrum_spread(&mut self, forward: bool) -> f32 {
+        let idx = SPECTRUM_SPREAD_CHOICES
+            .iter()
+            .position(|b| (*b - self.spectrum_spread).abs() < 1e-3)
+            .unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % SPECTRUM_SPREAD_CHOICES.len()
+        } else if idx == 0 {
+            SPECTRUM_SPREAD_CHOICES.len() - 1
+        } else {
+            idx - 1
+        };
+        self.spectrum_spread = SPECTRUM_SPREAD_CHOICES[next];
+        self.spectrum_spread
+    }
+
+    /// Подпись текущей базы фильтра соседних полос для экрана Settings.
+    pub fn spectrum_spread_label(&self) -> String {
+        if self.spectrum_spread <= 0.0 {
+            String::from("◄ OFF \u{00b7} cava ►")
+        } else {
+            format!("◄ {:.2} ►", self.spectrum_spread)
+        }
     }
 
     /// Подпись текущей высоты панели для экрана Settings.
@@ -218,7 +251,7 @@ impl Widget for &Settings {
             self.masked_arl()
         };
 
-        let items: [(&str, String, &str); 6] = [
+        let items: [(&str, String, &str); 7] = [
             (
                 "Preferred Audio Quality",
                 format!("◄ {} ►", self.quality_display_label()),
@@ -245,12 +278,17 @@ impl Widget for &Settings {
                 } else {
                     String::from("[OFF]")
                 },
-                "Legacy scale only: linear amplitude vs 52 dB logarithmic scale",
+                "Legacy scale only: linear amplitude vs 32 dB logarithmic scale",
             ),
             (
                 "Spectrum Height Scale",
                 format!("◄ {} ►", self.spectrum_scale.label()),
                 "◄► Track Peak: track loudness reference | Frame Peak: cava-like | 0 dBFS: v2.5",
+            ),
+            (
+                "Spectrum Neighbor Spread",
+                self.spectrum_spread_label(),
+                "◄► OFF (cava-like, bands stay independent) | 3.0 / 2.0 soft | 1.35 legacy plateau",
             ),
             (
                 "Spectrum Panel Rows",
@@ -341,9 +379,11 @@ mod tests {
         let screen = Settings::new();
         let terminal = render(&screen, 120, 30);
         assert!(row_has(&terminal, 11, "Spectrum Height Scale"));
-        assert!(row_has(&terminal, 11, "Track peak \u{00b7} 30 dB"));
-        assert!(row_has(&terminal, 13, "Spectrum Panel Rows"));
-        assert!(row_has(&terminal, 13, "AUTO (4\u{2013}6)"));
+        assert!(row_has(&terminal, 11, "Track peak \u{00b7} 26 dB"));
+        assert!(row_has(&terminal, 13, "Spectrum Neighbor Spread"));
+        assert!(row_has(&terminal, 13, "OFF \u{00b7} cava"));
+        assert!(row_has(&terminal, 15, "Spectrum Panel Rows"));
+        assert!(row_has(&terminal, 15, "AUTO (4\u{2013}6)"));
     }
 
     #[test]
@@ -353,6 +393,14 @@ mod tests {
         assert_eq!(screen.cycle_spectrum_scale(true), SpectrumScale::Legacy);
         assert_eq!(screen.cycle_spectrum_scale(true), SpectrumScale::TrackPeak);
         assert_eq!(screen.cycle_spectrum_scale(false), SpectrumScale::Legacy);
+
+        assert_eq!(screen.cycle_spectrum_spread(true), 3.0);
+        assert_eq!(screen.cycle_spectrum_spread(true), 2.0);
+        assert_eq!(screen.cycle_spectrum_spread(false), 3.0);
+        assert_eq!(screen.cycle_spectrum_spread(false), 0.0);
+        assert_eq!(screen.spectrum_spread_label(), "\u{25c4} OFF \u{00b7} cava \u{25ba}");
+        assert_eq!(screen.cycle_spectrum_spread(true), 3.0);
+        assert_eq!(screen.spectrum_spread_label(), "\u{25c4} 3.00 \u{25ba}");
 
         assert_eq!(screen.cycle_spectrum_rows(true), Some(4));
         assert_eq!(screen.cycle_spectrum_rows(true), Some(6));

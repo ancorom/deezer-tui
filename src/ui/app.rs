@@ -292,7 +292,8 @@ impl App {
 
         let cavacore = Cavacore::new(cfg.sample_rate_hz, 64)
             .with_db_scale(cfg.db_scale)
-            .with_scale_mode(cfg.effective_spectrum_scale());
+            .with_scale_mode(cfg.effective_spectrum_scale())
+            .with_spread_base(cfg.effective_spectrum_spread());
         let mut settings = Settings::new();
         settings.sync_from_config(&cfg, None, None);
 
@@ -2709,6 +2710,14 @@ impl App {
         self.save_config();
     }
 
+    /// Переключает базу фильтра соседних полос и применяет её к `Cavacore` сразу.
+    pub fn cycle_spectrum_spread(&mut self, forward: bool) {
+        let next = self.settings.cycle_spectrum_spread(forward);
+        self.config.spectrum_spread = next;
+        self.cavacore.set_spread_base(next);
+        self.save_config();
+    }
+
     /// Переключает высоту панели спектра (AUTO -> 4 -> 6 -> ... -> 12).
     pub fn cycle_spectrum_rows(&mut self, forward: bool) {
         let next = self.settings.cycle_spectrum_rows(forward);
@@ -2769,6 +2778,9 @@ impl App {
                 self.cycle_spectrum_scale(forward);
             }
             5 => {
+                self.cycle_spectrum_spread(forward);
+            }
+            6 => {
                 self.cycle_spectrum_rows(forward);
             }
             _ => {}
@@ -2869,7 +2881,7 @@ impl App {
                     self.spawn_fetch_more_flow();
                 }
             }
-            5 if self.settings.selected_row < 5 => self.settings.selected_row += 1,
+            5 if self.settings.selected_row < 6 => self.settings.selected_row += 1,
             _ => {}
         }
     }
@@ -3124,6 +3136,20 @@ mod tests {
         );
 
         app.settings.selected_row = 5;
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert!(
+            (app.config.effective_spectrum_spread() - 3.0).abs() < 1e-3,
+            "строка Neighbor Spread: OFF -> мягкая база 3.0"
+        );
+        assert!(
+            (app.cavacore.spread_base() - 3.0).abs() < 1e-3,
+            "база фильтра применяется к Cavacore сразу"
+        );
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.config.effective_spectrum_spread(), 0.0);
+        assert_eq!(app.cavacore.spread_base(), 0.0, "OFF выключает фильтр");
+
+        app.settings.selected_row = 6;
         app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.config.effective_spectrum_rows(), Some(4));
         app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();

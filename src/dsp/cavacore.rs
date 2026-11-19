@@ -56,11 +56,6 @@ const HIGH_HZ: f32 = 20_000.0;
 /// до незаметного «подскока» на пару пикселей.
 const INTEGRAL: f32 = 0.62;
 
-/// База пространственного затухания фильтра Monstercat.
-/// 1.35 (а не 1.5): бас размазывается по соседям заметно слабее, поэтому «стена
-/// баса» не затирает средние и высокие полосы.
-const MONSTERCAT_BASE: f32 = 1.35;
-
 /// Полка пикового бина в энергии полосы: короткие ВЧ-транзиенты (шляпки, щелчки,
 /// атака синтеза) сосредоточены в 1–2 бинах и при суммировании по широкой полосе
 /// почти не влияют на сумму, поэтому пик добавляется отдельным слагаемым.
@@ -103,7 +98,7 @@ const AUTOSENS_TARGET_LOW: f32 = 0.4;
 /// Пределы авточувствительности: не дают тихому треку раскачать спектр в 10 раз.
 const AUTOSENS_MIN: f32 = 0.25;
 const AUTOSENS_MAX: f32 = 8.0;
-/// Коэффициент параболической гравитации падения столбиков.
+/// Коэффициент параболической гравитации падения столбиков (Legacy / TrackPeak).
 const GRAVITY: f32 = 0.025;
 
 /// Коэффициент мягкой компрессии для линейного (не-dB) режима: `val^0.45`.
@@ -112,19 +107,38 @@ const LIN_COMPRESSION: f32 = 0.45;
 
 /// Окно пик-нормированной шкалы (дБ): полоса ниже опорного пика на всю ширину окна
 /// уходит в нуль. Замер на реальных треках: внутри кадра полосы различаются примерно
-/// на 20–25 дБ, поэтому окно 30 дБ использует высоту панели целиком, а окно 52–70 дБ
-/// сжимает всю музыку в середину шкалы (ни провалов, ни пиков).
-const REL_WINDOW: f32 = 30.0;
+/// на 20–25 дБ. 26 дБ вместо 30 (v2.7): при 30 дБ полосы в −10…−15 дБ от пика сидят в
+/// 0.5–0.65 и вместе с соседями дают «плато» (доля кадров с ≥6 столбиками выше 0.7 —
+/// 0.12–0.15), при 26 дБ они падают в долины (плато 0.05–0.07, полос <0.2 — 0.19–0.24).
+const REL_WINDOW: f32 = 26.0;
 /// Пик кадра ниже этого порога — считаем тишину и обнуляем состояние spectrum.
 const REL_SILENCE_PEAK: f32 = 1e-4;
 /// Полоса ниже 1 % от пика кадра (−40 дБ) гасится в пик-режимах (в Legacy — 0.4 %).
 const REL_BAND_GATE: f32 = 0.01;
-/// База пространственного фильтра в пик-режимах. В Legacy она 1.35, то есть соседняя
-/// полоса получает 74 % от пика, через одну 55 %, через три 41 % — панель никогда не
-/// бывает тёмной. 2.0 оставляет соседям 50 %/25 %/12 % и возвращает контраст.
-const REL_SPREAD_BASE: f32 = 2.0;
-/// Интегральное сглаживание в пик-режимах: чуть быстрее Legacy.
-const REL_INTEGRAL: f32 = 0.5;
+/// База пространственного фильтра соседних полос (Monstercat) в шкале `Legacy`.
+/// Соседняя полоса получает 74 % от пика, через одну 55 %, через три 41 %.
+pub const MONSTERCAT_BASE: f32 = 1.35;
+/// Порог включения пространственного фильтра: база ≤ него означает «выключен»
+/// (так же, как в эталонной cava, где фильтра нет вовсе).
+pub const SPREAD_MIN_BASE: f32 = 1.05;
+/// Верхний предел базы фильтра: сильнее 4.0 соседние полосы получают меньше 25 %/6 %
+/// от пика — фильтр практически перестает что-либо менять.
+pub const SPREAD_MAX: f32 = 4.0;
+/// Значение «выключен» для базы фильтра.
+const SPREAD_OFF: f32 = 0.0;
+/// Интегральное сглаживание по шкалам: `TrackPeak` чуть быстрее Legacy, `FramePeak`
+/// медленнее — опорный пик кадра меняется каждый кадр, и без более долгой постоянной
+/// времени столбики «дёргаются» (замер на реальном MP3, сред |Δ| за кадр: 0.032 при 0.5,
+/// 0.024 при 0.72 в `FramePeak`; 0.032 при 0.5, 0.026 при 0.70 в `TrackPeak`).
+const TRACK_PEAK_INTEGRAL: f32 = 0.70;
+const FRAME_PEAK_INTEGRAL: f32 = 0.72;
+/// Гравитация падения: в `FramePeak` падение быстрее Legacy, чтобы одиночный
+/// транзиент не висел столбом ~20 кадров и не собирался в плато.
+const FRAME_PEAK_GRAVITY: f32 = 0.05;
+/// Спуск опорного пика кадра после транзиента (~0.1 с удержания: подъём не ограничен,
+/// поэтому самый громкий столбик по-манере cava остаётся в потолке, но нормировка
+/// соседних полос не скачет вверх-вниз каждый кадр).
+const FRAME_PEAK_RELEASE: f32 = 0.12;
 /// EMA медленного пика трека: подъём быстрый (0.05), спуск очень медленный (0.0005),
 /// чтобы опорная точка была «громкостью трека», а не «громкостью кадра».
 const TRACK_PEAK_ATTACK: f32 = 0.05;
@@ -159,9 +173,9 @@ impl SpectrumScale {
     /// Короткая подпись для экрана Settings.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Legacy => "0 dBFS · 52 dB",
-            Self::TrackPeak => "Track peak · 30 dB",
-            Self::FramePeak => "Frame peak · 30 dB",
+            Self::Legacy => "0 dBFS · 32 dB",
+            Self::TrackPeak => "Track peak · 26 dB",
+            Self::FramePeak => "Frame peak · 26 dB",
         }
     }
 }
@@ -180,9 +194,11 @@ impl std::str::FromStr for SpectrumScale {
     }
 }
 
-/// Динамический диапазон для логарифмического (dB) масштабирования (в децибелах).
-/// 52 дБ: чем уже окно, тем сильнее заметен подскок полосы (+10 дБ ≈ +0.19 высоты).
-const DB_DYNAMIC_RANGE: f32 = 52.0;
+/// Динамический диапазон шкалы `Legacy` (дБ от 0 dBFS). 32 дБ вместо 52 (v2.7): при 52 дБ
+/// разброс полос внутри кадра (20–30 дБ) сжимался в 0.55–0.95 — «плато, упёртое вверх»
+/// (≥6 столбиков выше 0.7 в 100 % кадров, σ 0.10–0.12). 32 дБ даёт рельеф: плато 0.51–0.73,
+/// полос >0.85 — 0.06–0.07 вместо 0.26, при сохранном бас-доминанте.
+const DB_DYNAMIC_RANGE: f32 = 32.0;
 /// Порог тишины в амплитудных единицах: ниже него столбик остаётся нулевым
 /// (иначе логарифмическая шкала показала бы шум квантования как сигнал).
 const DB_SILENCE_FLOOR: f32 = 1e-4;
@@ -277,6 +293,17 @@ pub struct Cavacore {
     scale_mode: SpectrumScale,
     spread_base: f32,
     slow_peak: f32,
+    /// Опорный пик кадра с медленным спуском (эталон нормировки в `FramePeak`)
+    /// и скорость его спуска.
+    frame_ref: f32,
+    frame_ref_release: f32,
+    /// Ширина dB-окна относительной шкалы, постоянная сглаживания и гравитация —
+    /// подбираются по активной шкале (`set_scale_mode`).
+    rel_window: f32,
+    /// Ширина окна шкалы `Legacy` (от 0 dBFS), по умолчанию `DB_DYNAMIC_RANGE`.
+    db_window: f32,
+    integral: f32,
+    gravity: f32,
     raw_bars: Vec<f32>,
 
     // Состояние временного сглаживания и гравитации
@@ -355,10 +382,8 @@ impl Cavacore {
         let (use_bass_fft, lower_bin, upper_bin, eq_weights) =
             Self::compute_band_bins(num_bars, sample_rate);
 
-        let spread_base = MONSTERCAT_BASE;
-        let monstercat_weights: Vec<f32> = (0..num_bars)
-            .map(|d| spread_base.powi(d as i32))
-            .collect();
+        let spread_base = SPREAD_OFF;
+        let monstercat_weights: Vec<f32> = (0..num_bars).map(|_| 1.0f32).collect();
 
         Self {
             num_bars,
@@ -368,6 +393,12 @@ impl Cavacore {
             scale_mode: SpectrumScale::Legacy,
             spread_base,
             slow_peak: 0.0,
+            frame_ref: 0.0,
+            frame_ref_release: FRAME_PEAK_RELEASE,
+            rel_window: REL_WINDOW,
+            db_window: DB_DYNAMIC_RANGE,
+            integral: INTEGRAL,
+            gravity: GRAVITY,
             bass_r2c,
             mid_r2c,
             bass_in,
@@ -413,9 +444,7 @@ impl Cavacore {
         self.upper_bin = upper_bin;
         self.eq_weights = eq_weights;
 
-        self.monstercat_weights = (0..num_bars)
-            .map(|d| self.spread_base.powi(d as i32))
-            .collect();
+        self.rebuild_spread_weights();
 
         self.raw_bars.resize(num_bars, 0.0);
         self.band_ref.resize(num_bars, 0.0);
@@ -442,17 +471,55 @@ impl Cavacore {
             return;
         }
         self.scale_mode = mode;
-        self.spread_base = if mode == SpectrumScale::Legacy {
-            MONSTERCAT_BASE
-        } else {
-            REL_SPREAD_BASE
-        };
-        self.monstercat_weights = (0..self.num_bars)
-            .map(|d| self.spread_base.powi(d as i32))
-            .collect();
+        self.rel_window = REL_WINDOW;
+        match mode {
+            SpectrumScale::Legacy => {
+                self.db_window = DB_DYNAMIC_RANGE;
+                self.integral = INTEGRAL;
+                self.gravity = GRAVITY;
+            }
+            SpectrumScale::TrackPeak => {
+                self.integral = TRACK_PEAK_INTEGRAL;
+                self.gravity = GRAVITY;
+            }
+            SpectrumScale::FramePeak => {
+                self.integral = FRAME_PEAK_INTEGRAL;
+                self.gravity = FRAME_PEAK_GRAVITY;
+                self.frame_ref_release = FRAME_PEAK_RELEASE;
+            }
+        }
         self.slow_peak = 0.0;
+        self.frame_ref = 0.0;
         self.sensitivity = 1.0;
         self.reset();
+    }
+
+    /// Устанавливает базу пространственного фильтра соседних полос. Значение
+    /// `≤ 1.05` (в том числе `0.0`) выключает фильтр — как в эталонной cava:
+    /// доминирующая полоса не подтягивает соседей, и тёмные полосы остаются тёмными.
+    /// Больше базы — сильнее «плато» вокруг пика (1.35 — поведение шкалы v2.5).
+    pub fn set_spread_base(&mut self, base: f32) {
+        let base = if base <= SPREAD_MIN_BASE {
+            SPREAD_OFF
+        } else {
+            base.clamp(SPREAD_MIN_BASE, SPREAD_MAX)
+        };
+        if (self.spread_base - base).abs() < 1e-6 {
+            return;
+        }
+        self.spread_base = base;
+        self.rebuild_spread_weights();
+    }
+
+    /// Текущая база пространственного фильтра (`0.0` = выключен).
+    pub fn spread_base(&self) -> f32 {
+        self.spread_base
+    }
+
+    /// Builder-версия `set_spread_base`.
+    pub fn with_spread_base(mut self, base: f32) -> Self {
+        self.set_spread_base(base);
+        self
     }
 
     /// Builder-версия `set_scale_mode`.
@@ -489,6 +556,19 @@ impl Cavacore {
         self.sensitivity = 1.0;
         self.band_ref.fill(0.0);
         self.slow_peak = 0.0;
+        self.frame_ref = 0.0;
+    }
+
+    /// Пересчитывает веса пространственного фильтра; выключенный фильтр даёт веса 1.0
+    /// (в цикле распространения он тогда не участвует).
+    fn rebuild_spread_weights(&mut self) {
+        self.monstercat_weights = if self.spread_base > SPREAD_MIN_BASE {
+            (0..self.num_bars)
+                .map(|d| self.spread_base.powi(d as i32))
+                .collect()
+        } else {
+            vec![1.0f32; self.num_bars]
+        };
     }
 
     /// Основной метод обработки моно-сэмплов (например, напрямую из `VisRingBuffer`).
@@ -631,6 +711,15 @@ impl Cavacore {
                 self.out_buf.fill(0.0);
                 return &self.out_buf;
             }
+            if self.scale_mode == SpectrumScale::FramePeak {
+                // Подъём эталона не ограничен (пик кадра всегда эталон), спуск медленный:
+                // после транзиента нормировка «держится», а не скачет вверх-вниз каждый кадр.
+                if peak_lin > self.frame_ref {
+                    self.frame_ref = peak_lin;
+                } else {
+                    self.frame_ref += (peak_lin - self.frame_ref) * self.frame_ref_release;
+                }
+            }
             if self.scale_mode == SpectrumScale::TrackPeak {
                 let toward = if peak_lin > self.slow_peak {
                     TRACK_PEAK_ATTACK
@@ -643,7 +732,7 @@ impl Cavacore {
         let denom = match self.scale_mode {
             SpectrumScale::Legacy => 1.0,
             SpectrumScale::TrackPeak => self.slow_peak.max(1e-7),
-            SpectrumScale::FramePeak => peak_lin.max(1e-7),
+            SpectrumScale::FramePeak => self.frame_ref.max(1e-7),
         };
 
         // 2. По-полосный AGC + логарифмическая (dB) шкала по умолчанию или мягкая
@@ -659,7 +748,7 @@ impl Cavacore {
                 let val = if lin <= peak_lin * band_gate {
                     0.0
                 } else {
-                    (20.0 * (lin / denom).log10() + REL_WINDOW) / REL_WINDOW
+                    (20.0 * (lin / denom).log10() + self.rel_window) / self.rel_window
                 };
                 self.raw_bars[n] = val.clamp(0.0, 1.0);
                 continue;
@@ -682,7 +771,7 @@ impl Cavacore {
             let val = if scaled <= DB_SILENCE_FLOOR {
                 0.0
             } else if self.db_scale {
-                ((20.0 * scaled.log10()) + DB_DYNAMIC_RANGE) / DB_DYNAMIC_RANGE
+                ((20.0 * scaled.log10()) + self.db_window) / self.db_window
             } else {
                 scaled.powf(LIN_COMPRESSION)
             };
@@ -691,17 +780,22 @@ impl Cavacore {
         }
 
         // 2. Пространственный фильтр сглаживания Monstercat (без аллокаций):
-        // bars[i] = max_j(bars[j] / MONSTERCAT_BASE^|i - j|)
-        for i in 0..self.num_bars {
-            let mut peak = self.raw_bars[i];
-            for j in 0..self.num_bars {
-                let dist = i.abs_diff(j);
-                let candidate = self.raw_bars[j] / self.monstercat_weights[dist];
-                if candidate > peak {
-                    peak = candidate;
+        // bars[i] = max_j(bars[j] / spread_base^|i - j|). Выключен (база ≤ 1.05) —
+        // полосы остаются самостоятельными, как в эталонной cava.
+        if self.spread_base > SPREAD_MIN_BASE {
+            for i in 0..self.num_bars {
+                let mut peak = self.raw_bars[i];
+                for j in 0..self.num_bars {
+                    let dist = i.abs_diff(j);
+                    let candidate = self.raw_bars[j] / self.monstercat_weights[dist];
+                    if candidate > peak {
+                        peak = candidate;
+                    }
                 }
+                self.out_buf[i] = peak;
             }
-            self.out_buf[i] = peak;
+        } else {
+            self.out_buf.copy_from_slice(&self.raw_bars);
         }
 
         // 3. Параболическая гравитация падения, интегральное сглаживание (0.77)
@@ -711,7 +805,7 @@ impl Cavacore {
         for i in 0..self.num_bars {
             let mut v = self.out_buf[i];
             if v < self.prev[i] {
-                let factor = (1.0 - GRAVITY * self.fall_step[i].powi(2)).max(0.0);
+                let factor = (1.0 - self.gravity * self.fall_step[i].powi(2)).max(0.0);
                 v = (self.prev[i] * factor).max(v);
                 self.fall_step[i] += 1.0;
             } else {
@@ -720,7 +814,7 @@ impl Cavacore {
 
             self.prev[i] = v;
 
-            let integral = if rel { REL_INTEGRAL } else { INTEGRAL };
+            let integral = self.integral;
             let smoothed = self.mem[i] * integral + v * (1.0 - integral);
             self.mem[i] = if smoothed < 1e-6 { 0.0 } else { smoothed };
 
@@ -866,16 +960,18 @@ mod tests {
         let bars = frame.process(&quiet);
         let max_bar = bars.iter().copied().fold(0.0f32, f32::max);
         assert!(
-            max_bar > 0.9,
-            "FramePeak должен нормироваться от кадра и поднять тихий фрагмент: {max_bar}"
+            max_bar > 0.5,
+            "FramePeak нормируется от кадра (с удержанием ~0.1 с) и поднимает тихий \
+             фрагмент, но не в самый потолок: {max_bar}"
         );
     }
 
     #[test]
-    fn track_peak_uses_more_of_the_height_range_than_legacy() {
+    fn track_peak_drops_quiet_bands_into_valleys_legacy_keeps_midrange() {
         let sr = 44_100.0;
-        // Громкий бас 60 Гц + тихая ВЧ-полоса 5 кГц (-26 дБ): окно 30 дБ должно
-        // показать и потолок, и провал, а окно 52 дБ от 0 dBБFS — только середину.
+        // Громкий бас 60 Гц + тихая ВЧ-полоса 5 кГц (−26 дБ): окно 26 дБ в `TrackPeak`
+        // показывает и потолок, и провалы, а окно 32 дБ от 0 dBFS в `Legacy` держит
+        // громкие СЧ-полосы в середине шкалы и проваливает только действительно тихие.
         let signal: Vec<f32> = (0..N_BASS)
             .map(|i| {
                 (2.0 * PI * 60.0 * i as f32 / sr).sin()
@@ -897,8 +993,8 @@ mod tests {
         };
 
         assert!(
-            range(&p) > range(&l),
-            "шкала от пика трека должна использовать вертикальный диапазон шире: {} vs {}",
+            range(&p) > range(&l) - 0.05,
+            "обе шкалы используют вертикальный диапазон почти целиком: {} vs {}",
             range(&p),
             range(&l)
         );
@@ -909,13 +1005,93 @@ mod tests {
         let dark = |v: &[f32]| v.iter().filter(|x| **x < 0.2).count();
         assert!(
             dark(&p) >= 4,
-            "в TrackPeak должны быть тёмные полосы: {}",
+            "в TrackPeak тихие полосы должны уходить в провал: {}",
             dark(&p)
         );
+        let l_mid = l.iter().filter(|x| **x > 0.4 && **x < 0.7).count();
+        assert!(
+            l_mid >= 2,
+            "в Legacy окно 32 дБ держит громкие СЧ-полосы в середине шкалы: {l:?}"
+        );
+    }
+
+    #[test]
+    fn spread_filter_is_off_by_default_and_only_lifts_neighbors_when_enabled() {
+        let sr = 44_100.0;
+        let tone = sine_wave(60.0, sr, N_BASS);
+
+        let mut off = Cavacore::new(sr, 15)
+            .with_db_scale(true)
+            .with_scale_mode(SpectrumScale::Legacy);
+        assert_eq!(off.spread_base(), 0.0, "по умолчанию соседний фильтр выключен");
+        let b_off = steady_state(&mut off, &tone);
+
+        let mut on = Cavacore::new(sr, 15)
+            .with_db_scale(true)
+            .with_scale_mode(SpectrumScale::Legacy)
+            .with_spread_base(MONSTERCAT_BASE);
+        let b_on = steady_state(&mut on, &tone);
+
+        let dark = |v: &[f32]| v.iter().filter(|x| **x < 0.2).count();
+        let rest = |v: &[f32]| {
+            let hi = v.iter().copied().fold(0.0f32, f32::max);
+            v.iter().filter(|x| **x < hi).copied().fold(0.0f32, |acc, x| acc + x)
+        };
+        assert!(
+            dark(&b_off) >= 10,
+            "выключенный фильтр держит соседние полосы тёмными: {b_off:?}"
+        );
+        assert!(
+            dark(&b_on) <= 8 && rest(&b_on) > rest(&b_off) + 1.5,
+            "включённая база 1.35 подтягивает соседей к доминирующей полосе: {b_on:?}"
+        );
+    }
+
+    #[test]
+    fn spread_base_clamps_to_off_and_max() {
+        assert_eq!(Cavacore::new(44_100.0, 15).with_spread_base(1.0).spread_base(), 0.0);
+        assert_eq!(Cavacore::new(44_100.0, 15).with_spread_base(0.0).spread_base(), 0.0);
         assert_eq!(
-            dark(&l),
-            0,
-            "в Legacy окно 52 дБ не оставляет тёмных полос на такой смеси: {l:?}"
+            Cavacore::new(44_100.0, 15).with_spread_base(99.0).spread_base(),
+            SPREAD_MAX
+        );
+        assert_eq!(Cavacore::new(44_100.0, 15).with_spread_base(2.5).spread_base(), 2.5);
+    }
+
+    #[test]
+    fn frame_peak_hold_damps_quiet_passage_after_transient() {
+        let sr = 44_100.0;
+        let frame = (sr / 60.0) as usize;
+        let loud = sine_wave(100.0, sr, frame);
+        let quiet: Vec<f32> = sine_wave(100.0, sr, frame)
+            .iter()
+            .map(|s| s * 0.05)
+            .collect();
+
+        let max_after_quiet = |release: f32| -> f32 {
+            let mut cava = Cavacore::new(sr, 15)
+                .with_db_scale(true)
+                .with_scale_mode(SpectrumScale::FramePeak);
+            cava.frame_ref_release = release;
+            for _ in 0..120 {
+                let _ = cava.process(&loud);
+            }
+            for _ in 0..6 {
+                let _ = cava.process(&quiet);
+            }
+            cava.process(&quiet).iter().copied().fold(0.0f32, f32::max)
+        };
+
+        let instant = max_after_quiet(1.0);
+        let held = max_after_quiet(FRAME_PEAK_RELEASE);
+        assert!(
+            instant > 0.9,
+            "без удержания тихий фрагмент сразу нормируется в потолок: {instant}"
+        );
+        assert!(
+            held < instant - 0.25,
+            "удержание опорного пика кадра гасит скачок высоты после транзиента: \
+             {held} vs {instant}"
         );
     }
 

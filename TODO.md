@@ -1,4 +1,4 @@
-# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.6 — фазы 1..15 закрыты)
+# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.7 — фазы 1..16 закрыты)
 
 Выполняй задачи строго сверху вниз по одной за итерацию. После прохождения cargo test и cargo clippy --all-targets -- -D warnings меняй [ ] на [x].
 
@@ -138,3 +138,15 @@
 * [x] **Шаг 15.2 (`src/config.rs`, `src/ui/views/settings.rs`, `src/ui/app.rs`):** `config.spectrum_scale` (по умолчанию `track_peak`) и `config.spectrum_rows` (`None` = AUTO) с env-переопределениями `DEEZER_TUI_SPECTRUM_SCALE`/`DEEZER_TUI_SPECTRUM_ROWS`; строки Settings **Spectrum Height Scale** и **Spectrum Panel Rows** (`◄►`/`Enter`), ручная высота ограничивается свободной высотой окна через `App::spectrum_rows_for`; запись конфига только при загрузке с диска (`App::persist_config`).
 
 * [x] **Шаг 15.3 (тесты):** +10 тестов (нули в тише для относительных шкал, сброс сглаживания при смене шкалы, трек-эталон против кадр-эталона, контраст TrackPeak против Legacy, разрешение шкалы/строк, две строки Settings и их циклы, применение шкалы и высоты панели в раскладке). Гейт: `cargo build` без warning'ов, `cargo test` **128/128**, `cargo clippy --all-targets -- -D warnings` exit 0.
+
+## Фаза 16
+
+* [x] **Шаг 16.1 (`src/dsp/cavacore.rs`):** соседний фильтр Monstercat выключен по умолчанию (`SPREAD_OFF`, `SPREAD_MIN_BASE 1.05`, `SPREAD_MAX 4.0`, `rebuild_spread_weights`, `set_spread_base`/`spread_base`/`with_spread_base`); окна нормировки `REL_WINDOW` 30 → 26 дБ и `DB_DYNAMIC_RANGE` 52 → 32 дБ через поле `db_window`; `integral`/`gravity` — поля по шкалам (0.62/0.70/0.72 и 0.025/0.05).
+
+* [x] **Шаг 16.2 (`src/dsp/cavacore.rs`):** `FramePeak` опирается на `frame_ref` с несимметричной опорой (подъём не ограничен, спуск `FRAME_PEAK_RELEASE 0.12` ≈ 0.1 с удержания) вместо мгновенного пика кадра; метки шкал `0 dBFS · 32 dB` / `Track peak · 26 dB` / `Frame peak · 26 dB`.
+
+* [x] **Шаг 16.3 (`src/config.rs`, `src/ui/views/settings.rs`, `src/ui/app.rs`):** `config.spectrum_spread` + `effective_spectrum_spread()` + `spread_from_setting()` (env `DEEZER_TUI_SPECTRUM_SPREAD`, `off`/`0` = выключен), строка Settings «Spectrum Neighbor Spread» (`SPECTRUM_SPREAD_CHOICES`), `App::cycle_spectrum_spread` с применением к `Cavacore` и сохранением конфига.
+
+* [x] **Шаг 16.4 (замер и тесты):** зонд на реальных MP3 (three трека, 15 полос, 40–65 с, 60 FPS, метрики `сред/σ/Δ/%<0.2/%>0.85/плато/bleed`) — плато `FramePeak` 0.82–0.83 → 0.06–0.07, `Δ` 0.031 → 0.024, `Legacy` плато 1.00 → 0.51–0.73; зонд удалён, +3 регрессии в `cavacore.rs` (+7 в `config.rs`, циклы строки в `settings.rs`/`app.rs`). Гейт: `cargo build` без warning'ов, `cargo test` **131/131**, `cargo clippy --all-targets -- -D warnings` exit 0.
+
+

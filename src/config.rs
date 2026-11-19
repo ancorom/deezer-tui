@@ -53,6 +53,12 @@ pub struct AppConfig {
     /// Переопределяется `DEEZER_TUI_SPECTRUM_ROWS` (`0` — авто).
     #[serde(default)]
     pub spectrum_rows: Option<u16>,
+    /// База пространственного фильтра соседних полос (Monstercat): `0.0` — выключен
+    /// (как в эталонной cava, по умолчанию), больше базы — сильнее «плато» вокруг
+    /// доминирующей полосы (`1.35` — поведение шкалы v2.5). Значения ≤ 1.05 считаются
+    /// выключенными. Переопределяется `DEEZER_TUI_SPECTRUM_SPREAD`.
+    #[serde(default)]
+    pub spectrum_spread: f32,
     /// Свёрнут ли левый сайдбар навигации (переключается по `s`).
     #[serde(default)]
     pub sidebar_collapsed: bool,
@@ -98,6 +104,7 @@ impl Default for AppConfig {
             db_scale: default_db_scale(),
             spectrum_scale: default_spectrum_scale(),
             spectrum_rows: None,
+            spectrum_spread: 0.0,
             sidebar_collapsed: false,
         }
     }
@@ -167,6 +174,15 @@ impl AppConfig {
         )
     }
 
+    /// Активная база фильтра соседних полос: `DEEZER_TUI_SPECTRUM_SPREAD` важнее
+    /// `config.toml`; `0`, «off» и некорректное значение означают «выключен».
+    pub fn effective_spectrum_spread(&self) -> f32 {
+        spread_from_setting(
+            self.spectrum_spread,
+            env::var("DEEZER_TUI_SPECTRUM_SPREAD").ok().as_deref(),
+        )
+    }
+
     /// Сохранение конфигурации по стандартному пути.
     pub fn save(&self) -> Result<()> {
         self.save_to(&Self::path())
@@ -228,6 +244,23 @@ fn scale_from_setting(setting: &str, env_value: Option<&str>) -> SpectrumScale {
 }
 
 /// Разрешение высоты панели спектра: `0` и некорректные значения = авто.
+/// Чистое разрешение базы фильтра соседних полос (без чтения окружения).
+fn spread_from_setting(setting: f32, env_value: Option<&str>) -> f32 {
+    let raw = match env_value.filter(|v| !v.trim().is_empty()) {
+        Some("off") | Some("OFF") | Some("0") => 0.0,
+        Some(v) => match v.trim().parse::<f32>() {
+            Ok(v) => v,
+            Err(_) => setting,
+        },
+        None => setting,
+    };
+    if raw <= crate::dsp::cavacore::SPREAD_MIN_BASE {
+        0.0
+    } else {
+        raw.clamp(crate::dsp::cavacore::SPREAD_MIN_BASE, crate::dsp::cavacore::SPREAD_MAX)
+    }
+}
+
 fn rows_from_setting(setting: Option<u16>, env_value: Option<&str>) -> Option<u16> {
     let raw = env_value
         .filter(|v| !v.trim().is_empty())
@@ -266,6 +299,33 @@ mod tests {
         assert_eq!(rows_from_setting(Some(8), Some("0")), None);
         assert_eq!(rows_from_setting(Some(8), Some("3")), Some(3));
         assert_eq!(rows_from_setting(Some(1), None), Some(SPECTRUM_ROWS_MIN));
+        assert_eq!(spread_from_setting(0.0, None), 0.0);
+        assert_eq!(spread_from_setting(1.35, None), 1.35);
+        assert_eq!(
+            spread_from_setting(1.35, Some("2.0")),
+            2.0,
+            "переменная окружения важнее config.toml"
+        );
+        assert_eq!(
+            spread_from_setting(2.0, Some("off")),
+            0.0,
+            "«off» выключает фильтр"
+        );
+        assert_eq!(
+            spread_from_setting(2.0, Some("bogus")),
+            2.0,
+            "некорректное значение окружения сохраняет настройку"
+        );
+        assert_eq!(
+            spread_from_setting(99.0, None),
+            crate::dsp::cavacore::SPREAD_MAX,
+            "база ограничивается сверху"
+        );
+        assert_eq!(
+            spread_from_setting(1.0, None),
+            0.0,
+            "база ниже порога включения считается выключенной"
+        );
     }
 
     #[test]
@@ -307,6 +367,7 @@ mod tests {
             db_scale: true,
             spectrum_scale: "frame_peak".into(),
             spectrum_rows: Some(8),
+            spectrum_spread: 2.0,
             sidebar_collapsed: true,
         };
         config.save_to(&cfg_path).expect("save_to failed");
