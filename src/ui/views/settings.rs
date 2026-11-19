@@ -8,16 +8,17 @@
 use ratatui::prelude::*;
 
 use crate::config::AppConfig;
-use crate::dsp::cavacore::{SpectrumScale, MONSTERCAT_BASE};
+use crate::dsp::cavacore::{ABS_DB_WINDOW, MONSTERCAT_BASE, SpectrumScale};
 use crate::ui::theme;
 
 pub const QUALITY_CODES: [&str; 3] = ["FLAC", "MP3_320", "MP3_128"];
 
 /// Порядок переключения шкалы высот спектра стрелками `←`/`→`.
-pub const SPECTRUM_SCALE_CHOICES: [SpectrumScale; 3] = [
+pub const SPECTRUM_SCALE_CHOICES: [SpectrumScale; 4] = [
     SpectrumScale::TrackPeak,
     SpectrumScale::FramePeak,
     SpectrumScale::Legacy,
+    SpectrumScale::Absolute,
 ];
 
 /// Порядок переключения базы фильтра соседних полос: `0.0` — выключен (как в
@@ -27,6 +28,11 @@ pub const SPECTRUM_SPREAD_CHOICES: [f32; 4] = [0.0, 3.0, 2.0, MONSTERCAT_BASE];
 /// Порядок переключения высоты панели спектра: `None` — авто (4–6 строк).
 pub const SPECTRUM_ROW_CHOICES: [Option<u16>; 6] =
     [None, Some(4), Some(6), Some(8), Some(10), Some(12)];
+
+/// Порядок переключения ширины dB-окна шкалы `Absolute` (контраст пиков к фону):
+/// узкое окно поднимает пики в потолок и опускает тихие полосы, широкое (70 дБ —
+/// дефолт cava) даёт плотную картину. Применяется только к шкале `Absolute`.
+pub const SPECTRUM_ABS_WINDOW_CHOICES: [f32; 6] = [30.0, 40.0, 50.0, 60.0, 70.0, 90.0];
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -40,6 +46,8 @@ pub struct Settings {
     pub spectrum_scale: SpectrumScale,
     pub spectrum_rows: Option<u16>,
     pub spectrum_spread: f32,
+    /// Ширина dB-окна шкалы `Absolute` (контраст), см. `SPECTRUM_ABS_WINDOW_CHOICES`.
+    pub spectrum_abs_window: f32,
 }
 
 impl Default for Settings {
@@ -61,6 +69,7 @@ impl Settings {
             spectrum_scale: SpectrumScale::TrackPeak,
             spectrum_rows: None,
             spectrum_spread: 0.0,
+            spectrum_abs_window: ABS_DB_WINDOW,
         }
     }
 
@@ -80,6 +89,7 @@ impl Settings {
         self.spectrum_scale = cfg.effective_spectrum_scale();
         self.spectrum_rows = cfg.effective_spectrum_rows();
         self.spectrum_spread = cfg.effective_spectrum_spread();
+        self.spectrum_abs_window = cfg.effective_spectrum_abs_db_window();
 
         self.account_status = if let Some(user) = user_label {
             format!("CONNECTED as {user} (Deezer HiFi / BF_CBC_STRIPE ready)")
@@ -185,6 +195,28 @@ impl Settings {
         }
     }
 
+    /// Переключает ширину dB-окна шкалы `Absolute` по кругу и возвращает новую.
+    pub fn cycle_spectrum_abs_window(&mut self, forward: bool) -> f32 {
+        let idx = SPECTRUM_ABS_WINDOW_CHOICES
+            .iter()
+            .position(|w| (*w - self.spectrum_abs_window).abs() < 1e-3)
+            .unwrap_or(SPECTRUM_ABS_WINDOW_CHOICES.len() - 2);
+        let next = if forward {
+            (idx + 1) % SPECTRUM_ABS_WINDOW_CHOICES.len()
+        } else if idx == 0 {
+            SPECTRUM_ABS_WINDOW_CHOICES.len() - 1
+        } else {
+            idx - 1
+        };
+        self.spectrum_abs_window = SPECTRUM_ABS_WINDOW_CHOICES[next];
+        self.spectrum_abs_window
+    }
+
+    /// Подпись текущей ширины dB-окна для экрана Settings.
+    pub fn spectrum_abs_window_label(&self) -> String {
+        format!("◄ {:.0} dB ►", self.spectrum_abs_window)
+    }
+
     pub fn masked_arl(&self) -> String {
         let trimmed = self.arl_input.trim();
         if trimmed.is_empty() {
@@ -251,7 +283,7 @@ impl Widget for &Settings {
             self.masked_arl()
         };
 
-        let items: [(&str, String, &str); 7] = [
+        let items: [(&str, String, &str); 8] = [
             (
                 "Preferred Audio Quality",
                 format!("◄ {} ►", self.quality_display_label()),
@@ -294,6 +326,11 @@ impl Widget for &Settings {
                 "Spectrum Panel Rows",
                 self.spectrum_rows_label(),
                 "◄► AUTO (4–6 rows) or fixed 4..12 rows for finer visual detail",
+            ),
+            (
+                "Spectrum Peak Contrast (dB Window)",
+                self.spectrum_abs_window_label(),
+                "Absolute scale only: ◄► 30–40 dB tall peaks over low floor | 70 dB dense cava default",
             ),
         ];
 
@@ -384,6 +421,8 @@ mod tests {
         assert!(row_has(&terminal, 13, "OFF \u{00b7} cava"));
         assert!(row_has(&terminal, 15, "Spectrum Panel Rows"));
         assert!(row_has(&terminal, 15, "AUTO (4\u{2013}6)"));
+        assert!(row_has(&terminal, 17, "Spectrum Peak Contrast"));
+        assert!(row_has(&terminal, 17, "70 dB"));
     }
 
     #[test]
@@ -391,8 +430,9 @@ mod tests {
         let mut screen = Settings::new();
         assert_eq!(screen.cycle_spectrum_scale(true), SpectrumScale::FramePeak);
         assert_eq!(screen.cycle_spectrum_scale(true), SpectrumScale::Legacy);
+        assert_eq!(screen.cycle_spectrum_scale(true), SpectrumScale::Absolute);
         assert_eq!(screen.cycle_spectrum_scale(true), SpectrumScale::TrackPeak);
-        assert_eq!(screen.cycle_spectrum_scale(false), SpectrumScale::Legacy);
+        assert_eq!(screen.cycle_spectrum_scale(false), SpectrumScale::Absolute);
 
         assert_eq!(screen.cycle_spectrum_spread(true), 3.0);
         assert_eq!(screen.cycle_spectrum_spread(true), 2.0);
@@ -412,6 +452,13 @@ mod tests {
         assert_eq!(screen.spectrum_rows_label(), "\u{25c4} 10 rows \u{25ba}");
         assert_eq!(screen.cycle_spectrum_rows(true), Some(12));
         assert_eq!(screen.cycle_spectrum_rows(true), None);
+
+        assert_eq!(screen.spectrum_abs_window, ABS_DB_WINDOW);
+        assert_eq!(screen.spectrum_abs_window_label(), "\u{25c4} 70 dB \u{25ba}");
+        assert_eq!(screen.cycle_spectrum_abs_window(true), 90.0);
+        assert_eq!(screen.cycle_spectrum_abs_window(true), 30.0);
+        assert_eq!(screen.cycle_spectrum_abs_window(false), 90.0);
+        assert_eq!(screen.cycle_spectrum_abs_window(false), 70.0);
     }
 
     #[test]

@@ -101,6 +101,29 @@ const AUTOSENS_MAX: f32 = 8.0;
 /// Коэффициент параболической гравитации падения столбиков (Legacy / TrackPeak).
 const GRAVITY: f32 = 0.025;
 
+/// Ширина dB-окна шкалы `Absolute`: в дефолте cava высота = `amplitude_to_decibels(v)/70`,
+/// то есть полоса на −70 дБ от 0 dBFS уже нуль. Широкое окно — как раз то, из-за чего
+/// соседи доминанты не упёрты в потолок: −20 дБ даёт 0.71, −40 дБ даёт 0.43.
+pub const ABS_DB_WINDOW: f32 = 70.0;
+/// Нижняя граница настраиваемого dB-окна `Absolute`: уже этого окна пики обрезаются
+/// так сильно, что картина рассыпается в отдельные столбики.
+pub const ABS_WINDOW_MIN: f32 = 24.0;
+/// Верхняя граница: шире дефолта cava смысла нет — всё и так лежит в потолке.
+pub const ABS_WINDOW_MAX: f32 = 90.0;
+/// Полоса ниже −100 дБ считается тишиной (в cava не-конечное значение даёт 0).
+const ABS_SILENCE_FLOOR: f32 = 1e-5;
+/// Интегральное сглаживание дефолта cava (`[smoothing] integral = 0.77`).
+const ABS_INTEGRAL: f32 = 0.77;
+/// Гравитация падения, подобранная под дефолт cava (`gravity = 2.5`, `fall += 0.028`
+/// при 60 FPS → столбик доходит до нуля за ~22 кадра ≈ 0.37 с). Наша форма
+/// `1 - gravity·fall²` с шагом `fall = 1` за кадр даёт ноль при `fall = 1/√gravity`.
+const ABS_GRAVITY: f32 = 0.0021;
+/// Авточувствительность дефолта cava: один общий `sens`, медленный рост каждый кадр
+/// (`×(1 + 0.001·framerate_mod)`) и падение только при переполнении
+/// (`×(1 − 0.02·framerate_mod)`), где `framerate_mod = 66/60 = 1.1`.
+const ABS_SENS_UP: f32 = 1.0011;
+const ABS_SENS_DOWN: f32 = 0.978;
+
 /// Коэффициент мягкой компрессии для линейного (не-dB) режима: `val^0.45`.
 /// Показатель меньше 1 поднимает тихие полосы, сохраняя «удар» баса.
 const LIN_COMPRESSION: f32 = 0.45;
@@ -158,6 +181,12 @@ pub enum SpectrumScale {
     /// регулярно упёрты в потолок, но средняя высота выше, а тихие треки становятся
     /// такими же яркими, как громкие.
     FramePeak,
+    /// Абсолютная шкала по образцу дефолта cava: полоса = **средняя** магнитуда своих
+    /// бинов (сумма делится на их число), высота = расстояние до 0 dBFS в окне 70 дБ,
+    /// без по-полосного AGC, без гейта от пика кадра и без нормировки по пикам.
+    /// Полосы не связаны общей опорной точкой, поэтому перескок доминанты не меняет
+    /// высоты остальных: сосед на −30 дБ остаётся на 0.57, а не упёрт в потолок.
+    Absolute,
 }
 
 impl SpectrumScale {
@@ -167,6 +196,7 @@ impl SpectrumScale {
             Self::Legacy => "legacy",
             Self::TrackPeak => "track_peak",
             Self::FramePeak => "frame_peak",
+            Self::Absolute => "absolute",
         }
     }
 
@@ -176,6 +206,7 @@ impl SpectrumScale {
             Self::Legacy => "0 dBFS · 32 dB",
             Self::TrackPeak => "Track peak · 26 dB",
             Self::FramePeak => "Frame peak · 26 dB",
+            Self::Absolute => "Absolute · cava-style dB",
         }
     }
 }
@@ -188,8 +219,9 @@ impl std::str::FromStr for SpectrumScale {
         match v.as_str() {
             "legacy" | "dbfs" | "0dbfs" => Ok(Self::Legacy),
             "track_peak" | "trackpeak" | "slow" => Ok(Self::TrackPeak),
-            "frame_peak" | "framepeak" | "cava" => Ok(Self::FramePeak),
-            _ => Err("ожидалось legacy | track_peak | frame_peak"),
+            "frame_peak" | "framepeak" => Ok(Self::FramePeak),
+            "absolute" | "cava" | "cava_default" => Ok(Self::Absolute),
+            _ => Err("ожидалось legacy | track_peak | frame_peak | absolute"),
         }
     }
 }
@@ -302,6 +334,10 @@ pub struct Cavacore {
     rel_window: f32,
     /// Ширина окна шкалы `Legacy` (от 0 dBFS), по умолчанию `DB_DYNAMIC_RANGE`.
     db_window: f32,
+    /// Ширина dB-окна шкалы `Absolute`: насколько тихие полосы ниже громких.
+    /// Узкое окно даёт высокий контраст (пики up, фон низкий), широкое — плотную
+    /// картину. Настраивается из конфигурации, см. `ABS_WINDOW_MIN`/`ABS_WINDOW_MAX`.
+    abs_window: f32,
     integral: f32,
     gravity: f32,
     raw_bars: Vec<f32>,
@@ -397,6 +433,7 @@ impl Cavacore {
             frame_ref_release: FRAME_PEAK_RELEASE,
             rel_window: REL_WINDOW,
             db_window: DB_DYNAMIC_RANGE,
+            abs_window: ABS_DB_WINDOW,
             integral: INTEGRAL,
             gravity: GRAVITY,
             bass_r2c,
@@ -487,11 +524,37 @@ impl Cavacore {
                 self.gravity = FRAME_PEAK_GRAVITY;
                 self.frame_ref_release = FRAME_PEAK_RELEASE;
             }
+            SpectrumScale::Absolute => {
+                // Окно `abs_window` здесь не трогаем: оно общий регулятор контраста,
+                // и при переключении шкал туда-обратно пользовательское значение должно
+                // сохраняться.
+                self.integral = ABS_INTEGRAL;
+                self.gravity = ABS_GRAVITY;
+            }
         }
         self.slow_peak = 0.0;
         self.frame_ref = 0.0;
         self.sensitivity = 1.0;
         self.reset();
+    }
+
+    /// Устанавливает ширину dB-окна шкалы `Absolute` (контраст): узкое окно — пики
+    /// up в потолок и низкий фон, широкое — плотная картина. Значение вне границ
+    /// `ABS_WINDOW_MIN`..`ABS_WINDOW_MAX` прижимается к ближайшей границе. Окно
+    /// применяется только к `Absolute`; переключение шкалы его не сбрасывает.
+    pub fn set_abs_window(&mut self, window: f32) {
+        self.abs_window = window.clamp(ABS_WINDOW_MIN, ABS_WINDOW_MAX);
+    }
+
+    /// Builder-вариант `set_abs_window`.
+    pub fn with_abs_window(mut self, window: f32) -> Self {
+        self.set_abs_window(window);
+        self
+    }
+
+    /// Активная ширина dB-окна шкалы `Absolute`.
+    pub fn abs_window(&self) -> f32 {
+        self.abs_window
     }
 
     /// Устанавливает базу пространственного фильтра соседних полос. Значение
@@ -680,7 +743,15 @@ impl Cavacore {
                 sum + PEAK_BLEND * peak
             };
 
-            let lin = mag * self.eq_weights[n];
+            // В `Absolute` полоса = среднее магнитуд по её бинам: дефолт cava делит
+            // `eq[n]` на число бинов полосы (`upper_cut_off - lower_cut_off + 1`).
+            // Без этого деления широкие ВЧ-полосы (сотни бинов) систематически выше
+            // узких НЧ-полос, и вся картина дышит целиком вместе с доминантой.
+            let lin = if self.scale_mode == SpectrumScale::Absolute {
+                mag * self.eq_weights[n] / count as f32
+            } else {
+                mag * self.eq_weights[n]
+            };
             if lin > peak_lin {
                 peak_lin = lin;
             }
@@ -702,7 +773,12 @@ impl Cavacore {
 
         // 1b. Относительные режимы: тишина гасится целиком, опорная точка шкалы —
         //     медленный пик трека (EMA) или пик кадра.
-        let rel = self.scale_mode != SpectrumScale::Legacy;
+        // Относительные режимы — только TrackPeak и FramePeak. `Absolute`, как и
+        // `Legacy`, не нормируется по пикам, но и AGC/гейта у него нет.
+        let rel = matches!(
+            self.scale_mode,
+            SpectrumScale::TrackPeak | SpectrumScale::FramePeak
+        );
         if rel {
             if peak_lin < REL_SILENCE_PEAK {
                 self.mem.fill(0.0);
@@ -730,7 +806,7 @@ impl Cavacore {
             }
         }
         let denom = match self.scale_mode {
-            SpectrumScale::Legacy => 1.0,
+            SpectrumScale::Legacy | SpectrumScale::Absolute => 1.0,
             SpectrumScale::TrackPeak => self.slow_peak.max(1e-7),
             SpectrumScale::FramePeak => self.frame_ref.max(1e-7),
         };
@@ -744,6 +820,22 @@ impl Cavacore {
         let band_gate = if rel { REL_BAND_GATE } else { REL_SILENCE_GATE };
         for n in 0..self.num_bars {
             let lin = self.raw_bars[n];
+            if self.scale_mode == SpectrumScale::Absolute {
+                // Абсолютная dB-шкала: никакой опорной точки, никакого по-полосного AGC
+                // и никакого гейта относительно пика кадра — только порог тишины и один
+                // общий медленный `sens` ниже. Полосы физически независимы друг от друга.
+                let val = if lin <= ABS_SILENCE_FLOOR {
+                    0.0
+                } else {
+                    (20.0 * lin.log10() + self.abs_window) / self.abs_window
+                };
+                // Высоту здесь не обрезаем до 1.0: в дефолте cava значения выше единицы
+                // доходят до сглаживания, и именно там переполнение (`mem > 1`) заставляет
+                // общий `sens` падать. С обрезкой до единицы переполнение невозможно, sens
+                // растёт бесконечно, и вся картина прилипает к потолку.
+                self.raw_bars[n] = val * self.sensitivity;
+                continue;
+            }
             if rel {
                 let val = if lin <= peak_lin * band_gate {
                     0.0
@@ -826,14 +918,26 @@ impl Cavacore {
             }
         }
 
-        if overshoot && self.autosens {
+        if self.scale_mode == SpectrumScale::Absolute {
+            // Как в дефолте cava: один общий `sens` растёт медленно каждый кадр и падает
+            // только когда высоты упёрлись в потолок. Он не реагирует на перескок
+            // доминирующей полосы, поэтому соседние столбики не подпрыгивают вместе с ней.
+            if self.autosens {
+                if overshoot {
+                    self.sensitivity *= ABS_SENS_DOWN;
+                } else if peak_lin > ABS_SILENCE_FLOOR {
+                    self.sensitivity *= ABS_SENS_UP;
+                }
+                self.sensitivity = self.sensitivity.clamp(AUTOSENS_MIN, AUTOSENS_MAX);
+            }
+        } else if overshoot && self.autosens {
             // Жёсткий антиклиппинг: если высоты всё же упёрлись в потолок, сбрасываем
             // чувствительность быстрее, иначе спектр «прилипает» к максимуму.
             self.sensitivity =
                 (self.sensitivity * (AUTOSENS_DOWN * 0.9)).clamp(AUTOSENS_MIN, AUTOSENS_MAX);
         }
 
-        if self.autosens && !rel && peak_eq > 1e-5 {
+        if self.autosens && !rel && self.scale_mode != SpectrumScale::Absolute && peak_eq > 1e-5 {
             let scaled_peak = peak_eq * self.sensitivity;
             // Мёртвая зона: пока пик в пределах [TARGET_LOW, TARGET_HIGH], чувствительность
             // не меняется — динамика трека сохраняется, а не «сжимается» до одной высоты.

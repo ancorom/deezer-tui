@@ -293,7 +293,8 @@ impl App {
         let cavacore = Cavacore::new(cfg.sample_rate_hz, 64)
             .with_db_scale(cfg.db_scale)
             .with_scale_mode(cfg.effective_spectrum_scale())
-            .with_spread_base(cfg.effective_spectrum_spread());
+            .with_spread_base(cfg.effective_spectrum_spread())
+            .with_abs_window(cfg.effective_spectrum_abs_db_window());
         let mut settings = Settings::new();
         settings.sync_from_config(&cfg, None, None);
 
@@ -2718,6 +2719,15 @@ impl App {
         self.save_config();
     }
 
+    /// Ширина dB-окна шкалы `Absolute` (контраст пиков к фону): применяется к
+    /// `Cavacore` сразу и сохраняется в `config.toml`. На другие шкалы не влияет.
+    pub fn cycle_spectrum_abs_window(&mut self, forward: bool) {
+        let next = self.settings.cycle_spectrum_abs_window(forward);
+        self.config.spectrum_abs_db_window = Some(next);
+        self.cavacore.set_abs_window(next);
+        self.save_config();
+    }
+
     /// Переключает высоту панели спектра (AUTO -> 4 -> 6 -> ... -> 12).
     pub fn cycle_spectrum_rows(&mut self, forward: bool) {
         let next = self.settings.cycle_spectrum_rows(forward);
@@ -2782,6 +2792,9 @@ impl App {
             }
             6 => {
                 self.cycle_spectrum_rows(forward);
+            }
+            7 => {
+                self.cycle_spectrum_abs_window(forward);
             }
             _ => {}
         }
@@ -2881,7 +2894,7 @@ impl App {
                     self.spawn_fetch_more_flow();
                 }
             }
-            5 if self.settings.selected_row < 6 => self.settings.selected_row += 1,
+            5 if self.settings.selected_row < 7 => self.settings.selected_row += 1,
             _ => {}
         }
     }
@@ -3167,6 +3180,16 @@ mod tests {
         assert_eq!(app.config.effective_spectrum_rows(), Some(4));
         app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.config.effective_spectrum_rows(), None);
+
+        app.settings.selected_row = 7;
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.config.effective_spectrum_abs_db_window(), 90.0);
+        assert!(
+            (app.cavacore.abs_window() - 90.0).abs() < 1e-3,
+            "окно контраста применяется к Cavacore сразу"
+        );
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.config.effective_spectrum_abs_db_window(), 70.0);
     }
 
     #[test]

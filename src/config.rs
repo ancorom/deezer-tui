@@ -59,6 +59,13 @@ pub struct AppConfig {
     /// выключенными. Переопределяется `DEEZER_TUI_SPECTRUM_SPREAD`.
     #[serde(default)]
     pub spectrum_spread: f32,
+    /// Ширина dB-окна шкалы `"absolute"` — регулятор контраста: узкое окно (например
+    /// `40`) поднимает пики в потолок и опускает тихие полосы, широкое (дефолт cava
+    /// `70`) даёт плотную картину. `None` — дефолт. Применяется только к `"absolute"`
+    /// и не меняется при переключении шкалы. Переопределяется
+    /// `DEEZER_TUI_SPECTRUM_ABS_DB` (в дБ).
+    #[serde(default)]
+    pub spectrum_abs_db_window: Option<f32>,
     /// Свёрнут ли левый сайдбар навигации (переключается по `s`).
     #[serde(default)]
     pub sidebar_collapsed: bool,
@@ -105,6 +112,7 @@ impl Default for AppConfig {
             spectrum_scale: default_spectrum_scale(),
             spectrum_rows: None,
             spectrum_spread: 0.0,
+            spectrum_abs_db_window: None,
             sidebar_collapsed: false,
         }
     }
@@ -180,6 +188,16 @@ impl AppConfig {
         spread_from_setting(
             self.spectrum_spread,
             env::var("DEEZER_TUI_SPECTRUM_SPREAD").ok().as_deref(),
+        )
+    }
+
+    /// Активная ширина dB-окна шкалы `Absolute`: `DEEZER_TUI_SPECTRUM_ABS_DB` важнее
+    /// `config.toml`; значение вне границ прижимается к ближайшей границе, а
+    /// некорректное или отсутствующее приводит к дефолту cava (`70` дБ).
+    pub fn effective_spectrum_abs_db_window(&self) -> f32 {
+        abs_window_from_setting(
+            self.spectrum_abs_db_window,
+            env::var("DEEZER_TUI_SPECTRUM_ABS_DB").ok().as_deref(),
         )
     }
 
@@ -261,6 +279,20 @@ fn spread_from_setting(setting: f32, env_value: Option<&str>) -> f32 {
     }
 }
 
+fn abs_window_from_setting(setting: Option<f32>, env_value: Option<&str>) -> f32 {
+    let raw = env_value
+        .filter(|v| !v.trim().is_empty())
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .or(setting);
+    match raw {
+        Some(v) => v.clamp(
+            crate::dsp::cavacore::ABS_WINDOW_MIN,
+            crate::dsp::cavacore::ABS_WINDOW_MAX,
+        ),
+        None => crate::dsp::cavacore::ABS_DB_WINDOW,
+    }
+}
+
 fn rows_from_setting(setting: Option<u16>, env_value: Option<&str>) -> Option<u16> {
     let raw = env_value
         .filter(|v| !v.trim().is_empty())
@@ -329,6 +361,36 @@ mod tests {
     }
 
     #[test]
+    fn abs_window_from_setting_clamps_and_defaults() {
+        assert_eq!(
+            abs_window_from_setting(None, None),
+            crate::dsp::cavacore::ABS_DB_WINDOW,
+            "без значения остаётся дефолт cava"
+        );
+        assert_eq!(abs_window_from_setting(Some(40.0), None), 40.0);
+        assert_eq!(
+            abs_window_from_setting(Some(40.0), Some("55")),
+            55.0,
+            "переменная окружения важнее config.toml"
+        );
+        assert_eq!(
+            abs_window_from_setting(Some(40.0), Some("bogus")),
+            40.0,
+            "некорректное значение окружения сохраняет значение из конфига"
+        );
+        assert_eq!(
+            abs_window_from_setting(Some(10.0), None),
+            crate::dsp::cavacore::ABS_WINDOW_MIN,
+            "окно ограничивается снизу"
+        );
+        assert_eq!(
+            abs_window_from_setting(Some(300.0), None),
+            crate::dsp::cavacore::ABS_WINDOW_MAX,
+            "окно ограничивается сверху"
+        );
+    }
+
+    #[test]
     fn load_missing_file_returns_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg_path = dir.path().join("nonexistent").join("config.toml");
@@ -368,6 +430,7 @@ mod tests {
             spectrum_scale: "frame_peak".into(),
             spectrum_rows: Some(8),
             spectrum_spread: 2.0,
+            spectrum_abs_db_window: Some(45.0),
             sidebar_collapsed: true,
         };
         config.save_to(&cfg_path).expect("save_to failed");
@@ -375,6 +438,7 @@ mod tests {
         let loaded = AppConfig::load_from(&cfg_path);
         assert_eq!(loaded, config);
         assert_eq!(loaded.preferred_audio_quality(), AudioQuality::Mp3_320);
+        assert_eq!(loaded.effective_spectrum_abs_db_window(), 45.0);
     }
 }
 
