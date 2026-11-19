@@ -343,7 +343,7 @@ impl App {
             flow_mode_selected: 0,
             current_flow_mode_idx: 0,
             toast_message: None,
-            persist_config: false,
+            persist_config: true,
             cavacore,
             vis_consumer: None,
             audio_output: None,
@@ -3110,6 +3110,19 @@ mod tests {
         app.config.spectrum_rows = Some(4);
         let small = render_ui(&app, 120, 30);
         assert!(!row_has(&small, 20, "\u{2588}"));
+    }
+
+    #[test]
+    fn loaded_config_is_persisted_and_default_config_is_not() {
+        assert!(
+            App::with_loaded_config(AppConfig::default()).persist_config,
+            "боевой путь из main.rs обязан сохранять config.toml"
+        );
+        assert!(
+            !App::with_config(AppConfig::default()).persist_config,
+            "тесты и демо-режим не должны писать реальный config.toml"
+        );
+        assert!(!App::new().persist_config);
     }
 
     #[test]

@@ -1,187 +1,231 @@
 # deezer-tui
 
-Native Linux TUI client for **Deezer HiFi** — plays FLAC 1411 kbps straight from Deezer's
-CDN with an in-terminal 60 FPS spectrum analyzer built on a Rust port of the
-[cavacore](docs/reference/cava/) algorithm. Single Rust binary, no GUI toolkit, no
-runtime dependencies beyond ALSA/PipeWire.
+A native terminal (TUI) music client for Deezer, written in Rust. It streams the
+real Deezer CDN — FLAC 1411 kbps on Premium/HiFi accounts, MP3 320/128 otherwise,
+30-second previews when you give it no token — decodes the encrypted stream on the
+fly and renders a 60 FPS spectrum analyzer, HD cover art and synced lyrics inside
+the terminal. Single binary, no GUI toolkit, no web view, no daemon.
 
-- **Rust**: Edition 2024, MSRV 1.88 (built with 1.99)
-- **UI**: [ratatui 0.30](https://ratatui.rs) + crossterm, TrueColor, 60 FPS render loop
-- **Audio**: Symphonia 0.6 decoder → rtrb 0.4 lock-free rings → cpal 0.18 real-time callback
-- **Crypto**: Deezer `BF_CBC_STRIPE` (Blowfish-CBC, 2048-byte chunks) on the fly
+Current status: **alpha, version 0.2.7**. It works for everyday listening on Linux
+and macOS, but the Deezer API surface is unofficial and untested against every
+account type. Release tags use semver `0.x.y`; the phase numbers in `TODO.md`,
+`PLAN.md` and `ARCHITECTURE.md` are internal development phases (Phase 17 = 0.2.7).
+
+> **Disclaimer.** This is an unofficial Deezer client, not affiliated with or endorsed
+> by Deezer. It reads your own `arl` session cookie and decrypts media you already have
+> access to (`BF_CBC_STRIPE`) for local playback only. Use it with your own account, at
+> your own risk; respect Deezer's terms of service in your region.
 
 ## Features
 
-| Area | What you get |
-| --- | --- |
-| Playback | HiFi login by ARL token (no token → guest mode: 30 s MP3 previews); FLAC 1411 kbps, MP3 320/128 fallback; seek ±5 s; gapless prefetch of the next track (starts 20 s before the end) |
-| Spectrum | cavacore port: dual FFT (4096 bass / 2048 mid-high), Hann window, log-octave bands 20 Hz–20 kHz (15 bars = ⅔ octave per step, 30 = ⅓), band energy `Σ\|X_k\| + 0.35·peak` (equal energy per octave), **per-band AGC** so mid/high bands are visible next to a loud bass, relative silence gate (kills the noise floor / FFT leakage), **Monstercat spatial filter — off by default** (cava has none; cycle `OFF / 3.0 / 2.0 / 1.35` in Settings), gravity falloff, autosens with a symmetric dead zone, dB scale by default (**32 dB window**) or linear mode with `x^0.45` compression; dynamic bar count (`set_num_bars`) and 1:1 rendering — no resampling; three switchable height scales — **Track Peak** (**26 dB** window from the track's long-term loudness peak, default), **Frame Peak** (**26 dB** window from the per-frame peak with a ~0.1 s peak hold, cava-style) and **0 dBFS · 32 dB** (v2.5) — plus panel height AUTO 4–6 or fixed 4–12 rows |
-| Screens | 5 tabs: **Now Playing** (big cover, lyrics panel), **Search**, **Library** (playlists + sortable track table with ADDED column), **Flow** (infinite recommendations + live lyrics), **Settings** (ARL token, quality, spectrum, dB scale, spectrum height scale, neighbor spread, panel height). **Track Menu** (`m`/`M`: favorite, add to playlist, Song Radio, info) and **Flow Modes** (`f`/`g`: My Flow / 7 moods / 10 genres) work from any track. Search — instant local library/playlist matching + infinite pagination (30/page, `PageDown`) |
-| Covers | 500×500 HD covers rendered as sextant 2×3 cells (6 subpixels per cell, 3× resolution of half-block art) — Unicode sextants U+1FB00–U+1FB3B + `▌`/`▐`/`█`, per-cell fg/bg color clustering, Lanczos3 downscale / CatmullRom upscale; optional HalfBlock mode |
-| System | MPRIS over D-Bus (souvlaki/zbus): hardware media keys, GNOME/KDE now-playing widgets, `playerctl` works out of the box |
-| Resilience | Generation counter (`playback_seq`) prevents races on rapid track switching; in-memory decrypted stream buffer — no temp files, no FD sharing |
+- **Playback** — FLAC 1411 kbps / MP3 320 / MP3 128, ±5 s seek, volume 0–100 %,
+  gapless prefetch: the next track starts downloading 20 s before the current one ends.
+- **Spectrum analyzer** — a Rust port of cava's `cavacore`: dual FFT (4096 samples for
+  bass, 2048 for mids/highs), Hann window, log-octave bands from 20 Hz to 20 kHz
+  (15 bars = ⅔ octave, 30 bars = ⅓ octave), per-band AGC so mids stay visible next to
+  a loud bass, a relative silence gate that removes the noise floor, gravity falloff
+  and three switchable height scales (see [Spectrum](#spectrum)).
+- **Screens** — Now Playing (big cover + lyrics), Search, Library (playlists and a
+  sortable track table), Flow (infinite recommendations with live lyrics), Settings.
+- **From any track** — Track Menu (`m`: favorite, add to playlist, Song Radio, info)
+  and Flow Modes (`f`: My Flow, 7 moods, 10 genres).
+- **Search** — instant local matching against your library and playlists, plus
+  infinite Deezer pagination (30 results per page, `PageDown` loads more).
+- **Cover art** — 500×500 covers drawn with Unicode sextants (2×3 subpixels per cell,
+  three times the resolution of half-block art) with per-cell colour clustering and
+  Lanczos3 downscale.
+- **MPRIS over D-Bus** — hardware media keys, GNOME/KDE "now playing" widgets and
+  `playerctl` work out of the box.
+- **Audio pipeline** — Symphonia 0.6 decoder → rtrb 0.4 lock-free rings → cpal 0.18
+  real-time callback (no locks, no allocations, no I/O inside the callback).
 
-## Quick start
+## Requirements
+
+| Requirement | Detail |
+| --- | --- |
+| Rust | 1.88 or newer (Edition 2024; built and tested with 1.99) |
+| OS | Linux (ALSA or PipeWire) and macOS (CoreAudio). Windows: through WSL2 |
+| Build deps (Linux) | C compiler, `pkg-config`, ALSA headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel` on Fedora, `alsa-lib` on Arch) |
+| Terminal | TrueColor (24-bit) strongly recommended, 256 colours minimum; a font with Unicode sextants (U+1FB00–U+1FB3B) for HD covers; comfortable size ~100×30, everything adapts down to 80×24 |
+| Deezer account | Premium or HiFi for FLAC and full-length tracks. Without any token the app runs in guest mode: 30-second MP3 previews, no lyrics |
+
+## Install
+
+### Option A — zero-setup script (Linux and macOS)
+
+Installs the system packages, Rust (via rustup, if missing or older than 1.88),
+fetches the source and builds the binary into `~/.local/bin`:
 
 ```sh
-# build (release)
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/ancorom/deezer-tui/main/install.sh | bash
+```
 
-# run
+If you prefer to read the script before running it:
+
+```sh
+git clone https://github.com/ancorom/deezer-tui && cd deezer-tui
+bash install.sh
+```
+
+Script options:
+
+| Flag | Effect |
+| --- | --- |
+| `--ref <tag-or-branch>` | Build a specific release tag or branch instead of `main` |
+| `--pipewire` | Build with cpal's native PipeWire backend instead of ALSA |
+| `--no-deps` | Skip system package installation (you installed the deps yourself) |
+| `--dir <path>` | Where to clone/build the source (default `~/.local/share/deezer-tui-src`) |
+| `--prefix <path>` | Where to install the binary (default `~/.local/bin`) |
+| `--dry-run` | Print every command without running any of them |
+
+### Option B — build from source
+
+```sh
+git clone https://github.com/ancorom/deezer-tui
+cd deezer-tui
+cargo build --release            # or: cargo build --release --features pipewire
 ./target/release/deezer-tui
 ```
 
-Provide your ARL token (Deezer web cookie `arl=...`) either in the config file or the
-environment:
+### Option C — cargo install
 
 ```sh
-# ~/.config/deezer-tui/config.toml
-arl = "YOUR_ARL_TOKEN"
-
-# or
-export DEEZER_ARL="YOUR_ARL_TOKEN"
+cargo install --git https://github.com/ancorom/deezer-tui --rev v0.2.7
 ```
 
-Or paste it interactively: launch the app, press `L` (or open `5` → ARL row → `L`).
+## Getting your ARL token
 
-Terminal 256-color or TrueColor; minimum comfortable size ~80×24, everything is adaptive.
+The token is your Deezer session cookie. The app never asks for your password.
+
+1. Log in to [deezer.com](https://www.deezer.com) in your browser (Chrome, Firefox, Edge).
+2. Open DevTools: `F12` (or `Ctrl+Shift+I` / `Cmd+Opt+I` on macOS).
+3. Go to **Application** (Chrome) / **Storage** (Firefox) → **Cookies** → `https://www.deezer.com`.
+4. Find the cookie named **`arl`** — a 32-character hex string. Copy its value
+   (do **not** copy `arl_ui`, it is a different cookie).
+5. Paste it into `~/.config/deezer-tui/config.toml` as `arl = "…"`, or launch the app
+   and press `L` to paste it interactively (it is saved to the config file).
+
+The cookie rotates when you log out or Deezer refreshes the session. When the app
+starts reporting `401` / "invalid credentials", repeat steps 2–5.
+
+## Configuration
+
+Config file: `~/.config/deezer-tui/config.toml` (path override: `DEEZER_TUI_CONFIG`).
+It is read at startup and rewritten whenever you change a setting or paste the ARL
+token — but the app does not invent it: create the file yourself the first time.
+Environment variables override the file.
+
+```toml
+arl = "0123456789abcdef0123456789abcdef"
+volume = 0.8
+preferred_quality = "FLAC"          # FLAC | MP3_320 | MP3_128
+spectrum_scale = "track_peak"       # track_peak | frame_peak | legacy
+spectrum_spread = 0.0               # 0.0 = off (cava-like), 1.35 = Monstercat look
+spectrum_rows = 5                   # omit for AUTO (4–6 rows depending on height)
+show_lyrics = true
+db_scale = true                     # Legacy height scale: dB window vs linear amplitude
+```
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `arl` | string | *(unset → guest mode)* | Deezer `arl` cookie; enables full tracks and HiFi |
+| `volume` | float | `0.8` | `0.0`–`1.0`, live with `+`/`-` |
+| `sample_rate_hz` | float | `44100.0` | Deezer streams are 44.1 kHz; change only if your output device refuses it |
+| `preferred_quality` | string | `FLAC` | `FLAC`, `MP3_320`, `MP3_128`; falls back automatically when the account lacks HiFi |
+| `show_spectrum` | bool | `true` | Bottom spectrum panel; `v` toggles it live |
+| `show_lyrics` | bool | `true` | Synchronized lyrics panel; `y` toggles it live |
+| `db_scale` | bool | `true` | **Legacy** height scale only: 32 dB logarithmic window vs linear amplitude with `x^0.45` |
+| `spectrum_scale` | string | `track_peak` | `track_peak`, `frame_peak`, `legacy` (see below) |
+| `spectrum_spread` | float | `0.0` | Neighbor pull-up base. `0.0` = off (bands independent, as in cava); `2.0`/`3.0` soft; `1.35` = the classic Monstercat look |
+| `spectrum_rows` | integer or omitted | *(AUTO)* | Panel height: AUTO picks 4–6 rows from the terminal height; explicit values are clamped to 2–12 |
+| `sidebar_collapsed` | bool | `false` | Left navigation sidebar collapsed; `s` toggles it |
+
+Environment overrides:
+
+| Variable | Values | Overrides |
+| --- | --- | --- |
+| `DEEZER_ARL` | token | `arl` |
+| `DEEZER_TUI_SPECTRUM_SCALE` | `legacy` / `track_peak` / `frame_peak` | `spectrum_scale` |
+| `DEEZER_TUI_SPECTRUM_SPREAD` | `off`, `0`, or a number (`1.05`–`4.0`) | `spectrum_spread` |
+| `DEEZER_TUI_SPECTRUM_ROWS` | `0` (= AUTO) or `2`–`12` | `spectrum_rows` |
+| `DEEZER_TUI_CONFIG` | path | config file location |
+| `DEEZER_TUI_LOG_DIR` | path | log directory (default `~/.config/deezer-tui/`, rolling daily file `deezer-tui.log`) |
+
+## Spectrum
+
+The analyzer draws 15 or 30 log-octave bars. Bar *height* is always normalized to
+one of three scales, cycled with `←`/`→` on the **Settings** tab (row *Spectrum
+Height Scale*):
+
+| Scale | Reference | Window | Behaviour |
+| --- | --- | --- | --- |
+| `track_peak` (**default**) | the track's slow long-term loudness peak | 26 dB below it | Stable contrast across songs; quiet bands stay quiet |
+| `frame_peak` | the current frame's peak, held ~0.1 s before it is allowed to fall | 26 dB below it | cava-style: the loudest bar touches the ceiling, loudness changes stay visible |
+| `legacy` | absolute 0 dBFS | 32 dB | Reference-style absolute levels, no peak tracking |
+
+Two more knobs on the same tab: **Spectrum Neighbor Spread** (off by default —
+the Monstercat filter that pulled neighbouring bars toward the dominant one is a
+near no-op on dense real spectra, so it is opt-in) and **Spectrum Panel Rows**
+(AUTO 4–6, or a fixed 2–12 rows for finer vertical detail).
 
 ## Key bindings
 
 | Key | Action |
 | --- | --- |
-| `1`–`5` / `F1`–`F5`, `Tab`/`Shift-Tab` | Switch screens (Now Playing / Search / Library / Flow / Settings) |
-| `Space` | Play / pause (works everywhere) |
-| `n` / `>`, `p` / `<` | Next / previous track in queue |
-| `←` / `→` | Seek ∓5 s (on screens without panel focus) |
-| `+`/`=` , `-` | Volume ±5 % |
-| `/` (or `f` on Search) | Focus search input; `Enter` — search, `Esc` — unfocus |
-| `PageDown` / `PageUp` (Search) | Jump ±10 rows; PageDown near the end loads the next page (30/page) |
-| `f` (elsewhere) / `g` | Flow Modes modal (My Flow / moods / genres) |
-| `m` / `M` | Track Menu: ❤️ favorite, ➕ playlist, 📻 Song Radio, ℹ️ info |
-| `y` | Toggle lyrics panel |
-| `s` | Toggle navigation sidebar |
-| `v` | Toggle spectrum |
-| `i` | Track & Stream Info modal (codec, sample rate, bitrate, size, mode) |
-| `o` / `r` (Library) | Cycle sort criterion (Added/Title/Artist/Album) / flip direction |
-| `h` / `l` (Library) | Focus playlists / tracks panel (also `Tab`) |
-| `a` (Library) | "Choose playlist" modal (add current track to a playlist) |
+| `q` | Quit |
+| `Space` | Play / pause (works on every screen) |
+| `n` / `>`, `p` / `<` | Next / previous track in the queue |
+| `←` / `→` | Seek ∓5 s (when no panel needs the arrows) |
+| `+` / `=`, `-` | Volume ±5 % |
+| `1`–`5`, `F1`–`F5`, `Tab` / `Shift-Tab` | Switch screens: Now Playing, Search, Library, Flow, Settings |
+| `/` | Focus the search input (`Enter` searches, `Esc` releases focus) |
+| `PageDown` / `PageUp` | Jump ±10 rows in a table; near the end of the search results, load the next page |
+| `f` / `g` | Flow Modes modal: My Flow, 7 moods, 10 genres |
+| `m` | Track Menu: favorite, add to playlist, Song Radio, info |
+| `y` | Toggle the lyrics panel |
+| `s` | Toggle the navigation sidebar |
+| `v` | Toggle the spectrum analyzer |
+| `i` | Track & stream info modal (codec, sample rate, bitrate, stream mode) |
 | `L` | Jump to Settings → ARL token input |
 | `5` / `,` | Settings screen |
-| `q` | Quit |
-| `Enter`, `Esc` | Play/confirm, close/unfocus |
+| `Enter` / `Esc` | Play / confirm, close / release focus |
+| `↑` / `↓`, `j` / `k` | Move in lists, panels and settings rows |
+| `o` / `r` (Library) | Cycle the sort criterion (Added, Title, Artist, Album) / flip the direction |
+| `h` / `l` (Library) | Focus the playlists panel / the tracks panel (also `Tab`) |
+| `a` (Library) | "Choose playlist" modal — add the current track to a playlist |
 
-## Configuration
-
-`~/.config/deezer-tui/config.toml` (created on first run; ARL can also come from
-`DEEZER_ARL` env var, env wins):
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `arl` | `String?` | Deezer ARL cookie for HiFi guest login |
-| `volume` | `f32` | Master volume, `0.0–1.0` |
-| `sample_rate_hz` | `f32` | Sample rate for the Cavacore DSP (default 44100 — Deezer HiFi FLAC standard; cpal output explicitly requests 44100) |
-| `preferred_quality` | `String` | `"FLAC"` (1411 kbps), `"MP3_320"`, `"MP3_128"` |
-| `show_spectrum` | `bool` | Global spectrum on/off |
-| `show_lyrics` | `bool` | Lyrics panel on/off (key `y`) |
-| `db_scale` | `bool` | dB scaling in the spectrum (default `true`; toggle with `c` on the Settings tab) |
-| `spectrum_scale` | `String` | Height scale: `track_peak` (default) / `frame_peak` / `legacy` (cycle with `◄►` on the Settings tab) |
-| `spectrum_spread` | `f32` | Monstercat neighbor pull-up: `0.0` = off (default, cava-like — bands stay independent), `3.0` / `2.0` soft, `1.35` = v2.5 plateau |
-| `spectrum_rows` | `Option<u16>` | Spectrum panel height: `null` = AUTO (4–6 rows), otherwise 2…12 |
-| `sidebar_collapsed` | `bool` | Sidebar collapsed state |
-
-Logs: `~/.config/deezer-tui/deezer-tui.log` (daily rolling, via tracing; override the
-directory with `DEEZER_TUI_LOG_DIR`).
-
-Environment overrides: `DEEZER_ARL`, `DEEZER_TUI_LOG_DIR`, `DEEZER_TUI_SPECTRUM_SCALE` (`legacy`/`track_peak`/`frame_peak`), `DEEZER_TUI_SPECTRUM_SPREAD` (`off` or a number ≥ 1.05), `DEEZER_TUI_SPECTRUM_ROWS` (`0` = AUTO).
-
-## Architecture (short)
-
-```
-tokio pool ── HTTP gw-light.php / media.deezer.com ──► DeezerStream
-   (Blowfish-CBC decrypt, in-memory buffer, 256 KB prebuffer)         │
-                                                                     ▼
-                              Symphonia decoder thread ──► rtrb AudioRing (stereo f32)
-                                                                     │      │
-                                                                     ▼      ▼ mono
-                                          cpal 0.18 RT callback ◄───  VisRing ──► Cavacore
-                                          (44.1 kHz, no allocs)              │ bars [0..1]
-                                                                     ▼
-                              ratatui 60 FPS render ◄── tokio::sync::mpsc BgEvents
-```
-
-Full details — see [ARCHITECTURE.md](ARCHITECTURE.md) (Russian): zero-latency pipeline,
-Deezer API & Blowfish spec, Cavacore math, UI layout, screen specs. Development
-constraints for AI agents — [AGENT.md](AGENT.md).
-
-## Project structure
-
-```
-src/
-├── main.rs               # logger init, config load, App::run
-├── config.rs             # ~/.config/deezer-tui/config.toml (serde/toml)
-├── api/
-│   ├── client.rs         # gw-light.php client: auth, search, playlists, flow, lyrics, stream URL
-│   ├── crypto.rs         # MD5 key derivation + Blowfish-CBC chunk decryption
-│   └── models.rs         # API data models (tracks, playlists, lyrics, user)
-├── audio/
-│   ├── stream.rs         # DeezerStream: Read+Seek+MediaSource over the decrypted in-memory buffer
-│   ├── decoder.rs        # Symphonia decode → rtrb, Seek channel, StreamTechInfo
-│   ├── output.rs         # cpal device/streams, RT callback, volume, played_frames
-│   ├── prefetch.rs       # gapless next-track prefetch (download+decrypt 20 s early)
-│   └── ring_buffers.rs  # rtrb AudioRing (65536 stereo) / VisRing (16384 mono)
-├── dsp/
-│   └── cavacore.rs       # cavacore port: FFT, bands, spatial filter, gravity, autosens
-├── mpris.rs              # MPRIS over souvlaki/zbus (media keys, desktop integration)
-└── ui/
-    ├── app.rs            # AppShell: 5 tabs, global player bar + spectrum, event loop,
-    │                     #   Track Menu (m/M), Flow Modes (f/g), toast notifications
-    ├── theme.rs          # TrueColor palette + turquoise→violet gradient
-    ├── widgets/
-    │   ├── spectrum.rs   # sub-symbol bar widget with peak holds, 1:1 rendering (v2.3)
-    │   ├── cover_art.rs  # sextant 2×3 cover renderer (U+1FB00–U+1FB3B, fg/bg clustering)
-    │   └── modal.rs      # popups: Choose Playlist, Track Menu, Flow Modes, Track & Stream Info
-    └── views/
-        ├── now_playing.rs  # cover + metadata + lyrics panel
-        ├── search.rs       # search input + results table
-        ├── library.rs      # playlists + sortable track table (ADDED column)
-        ├── flow_lyrics.rs  # infinite Flow + live lyrics
-        └── settings.rs     # ARL, quality, spectrum, dB scale
-```
+Settings rows are edited with `←`/`→` (cycle a value) or `Enter` (open / edit).
 
 ## Development
 
 ```sh
-cargo test                                   # 118 tests (render tests: 120×40 and 40×12)
-cargo clippy --all-targets -- -D warnings   # zero-warning policy
+cargo build                      # debug build
+cargo test                       # unit + render tests (TestBackend)
+cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-Milestones and per-phase changelog — [CHANGELOG.md](CHANGELOG.md). Per-phase progress:
-[docs/crates/progress.md](docs/crates/progress.md). Crate-level API docs: `docs/crates/`.
+The gate for every change is: clean `cargo build` with zero warnings, all tests
+green, clippy `-D warnings` clean. Spectrum changes are verified by measuring the
+real renderer output on real MP3 files (15 bars, 60 FPS) — the numbers behind each
+release are recorded in `CHANGELOG.md`.
 
----
+Layout: `src/dsp/` (cavacore port), `src/audio/` (Symphonia decoder, encrypted
+stream, cpal output, lock-free rings, prefetch), `src/api/` (Deezer API client,
+`BF_CBC_STRIPE` crypto, models), `src/ui/` (views, widgets, theme, app loop),
+`src/mpris.rs` (D-Bus integration).
+Long-term design notes are in [ARCHITECTURE.md](ARCHITECTURE.md) (Russian), the
+release history in [CHANGELOG.md](CHANGELOG.md), open work in [TODO.md](TODO.md),
+and agent-facing hard constraints in [AGENT.md](AGENT.md).
 
-## Резюме (RU)
+## Troubleshooting
 
-Нативный Linux TUI-клиент для **Deezer HiFi**: FLAC 1411 кбит/с прямо из CDN Deezer
-с расшифровкой Blowfish-CBC «на лету» и спектроанализатором на 60 FPS (порт
-cavacore на Rust). Один бинарник, без GUI-toolkit; единственный внешний запрос к
-системе — ALSA/PipeWire для вывода звука.
-
-Пять вкладок: **Now Playing** (крупная обложка 500×500, sextant 2×3 — 6 субпикселей
-на ячейку + синхронные lyrics), **Search**, **Library** (плейлисты + сортируемая таблица треков
-с колонкой ADDED), **Flow** (бесконечные рекомендации + живые lyrics), **Settings**
-(ARL-токен, качество, спектр, dB-масштаб, шкала высот, соседний фильтр полос и высота панели спектра). С любого трека — **Track Menu** (`m`/`M`:
-избранное, плейлист, Song Radio, инфо) и **Flow Modes** (`f`/`g`: My Flow /
-настроения / жанры). Поиск: мгновенные совпадения по локальной медиатеке и
-бесконечная подгрузка результатов (30/страницу, `PageDown`). Интеграция MPRIS: аппаратные клавиши мультимедиа, виджеты
-«сейчас играет» GNOME/KDE, `playerctl`. Gapless-предзагрузка следующего трека
-начинается за 20 секунд до конца текущего; счётчик поколений `playback_seq`
-устраняет гонки при быстром переключении треков.
-
-Быстрый старт: `cargo build --release && ./target/release/deezer-tui`; ARL-токен —
-в `~/.config/deezer-tui/config.toml` (`arl = "..."`) или переменной `DEEZER_ARL`,
-либо в интерактивном режиме по клавише `L`. Полная документация:
-[ARCHITECTURE.md](ARCHITECTURE.md), ограничения — [AGENT.md](AGENT.md), история
-версий — [CHANGELOG.md](CHANGELOG.md).
+| Symptom | Fix |
+| --- | --- |
+| Build fails with `Could not find library alsa` | Install ALSA headers and `pkg-config`, or build with `--features pipewire` |
+| No sound, callback underruns | Your output device does not offer 44.1 kHz — set `sample_rate_hz` to the device rate, or pick another device |
+| `401` / "invalid credentials" | The `arl` cookie expired: re-copy it (press `L` in the app) |
+| Covers look like mosaic garbage | Terminal without TrueColor or a font without Unicode sextants — use a different terminal/font |
+| Only 30-second previews | No token loaded: check `config.toml` or `DEEZER_ARL`, then press `L` |
+| Bars all pinned to the top | Switch the height scale (`←`/`→` on the Settings tab) or widen the window by using `legacy` |
+| Nothing but noise floor in the bars | Guest-mode previews are short and quiet; with a token the gate removes the floor |

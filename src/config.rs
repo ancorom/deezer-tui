@@ -43,8 +43,8 @@ pub struct AppConfig {
     /// диапазон и «самый громкий столбик» подавляет остальные полосы.
     #[serde(default = "default_db_scale")]
     pub db_scale: bool,
-    /// Шкала высот столбиков спектра: `"legacy"` (от 0 dBFS, окно 52 дБ),
-    /// `"track_peak"` (от медленного пика трека, окно 30 дБ) или `"frame_peak"`
+    /// Шкала высот столбиков спектра: `"legacy"` (от 0 dBFS, окно 32 дБ),
+    /// `"track_peak"` (от медленного пика трека, окно 26 дБ) или `"frame_peak"`
     /// (от пика кадра, окно 30 дБ). Переопредляется `DEEZER_TUI_SPECTRUM_SCALE`.
     #[serde(default = "default_spectrum_scale")]
     pub spectrum_scale: String,

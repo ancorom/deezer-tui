@@ -1,4 +1,4 @@
-# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, v2.7 — фазы 1..16 закрыты)
+# TODO.md — Пошаговый чеклист задач для AI-агента (Редакция: Ноябрь 2026, релиз 0.2.7 / фазы 1..17 закрыты)
 
 Выполняй задачи строго сверху вниз по одной за итерацию. После прохождения cargo test и cargo clippy --all-targets -- -D warnings меняй [ ] на [x].
 
@@ -148,5 +148,15 @@
 * [x] **Шаг 16.3 (`src/config.rs`, `src/ui/views/settings.rs`, `src/ui/app.rs`):** `config.spectrum_spread` + `effective_spectrum_spread()` + `spread_from_setting()` (env `DEEZER_TUI_SPECTRUM_SPREAD`, `off`/`0` = выключен), строка Settings «Spectrum Neighbor Spread» (`SPECTRUM_SPREAD_CHOICES`), `App::cycle_spectrum_spread` с применением к `Cavacore` и сохранением конфига.
 
 * [x] **Шаг 16.4 (замер и тесты):** зонд на реальных MP3 (three трека, 15 полос, 40–65 с, 60 FPS, метрики `сред/σ/Δ/%<0.2/%>0.85/плато/bleed`) — плато `FramePeak` 0.82–0.83 → 0.06–0.07, `Δ` 0.031 → 0.024, `Legacy` плато 1.00 → 0.51–0.73; зонд удалён, +3 регрессии в `cavacore.rs` (+7 в `config.rs`, циклы строки в `settings.rs`/`app.rs`). Гейт: `cargo build` без warning'ов, `cargo test` **131/131**, `cargo clippy --all-targets -- -D warnings` exit 0.
+
+## Фаза 17
+
+* [x] **Шаг 17.1 (версионирование):** `Cargo.toml` `0.1.0` → `0.2.7` (альфа, semver `0.x.y`); `CHANGELOG.md` получает релизную секцию `## [0.2.7]` и пояснение, что `v2.x` — внутренние номера фаз (`v2.7` = фаза 16 = релиз `0.2.7`). Сообщения коммитов и текстовые артефакты репозитория — только на английском.
+
+* [x] **Шаг 17.2 (`README.md`):** переписан целиком на английский (~230 строк, средний объём): disclaimer про неофициальный Deezer API, таблица требований (MSRV 1.88, ALSA/PipeWire, TrueColor + Unicode sextants, Premium/HiFi vs гостевой режим), три способа установки, пошаговое получение `arl`-куки через DevTools, полная таблица полей `config.toml` с дефолтами и таблица env-переопределений, секция «Spectrum» (три шкалы высот, соседний фильтр, строки панели), полная таблица клавиш, «Development», «Troubleshooting». Русская секция «Резюме (RU)» убрана, секции License нет (лицензия не выбрана).
+
+* [x] **Шаг 17.3 (`install.sh`):** установка с нуля для Linux/macOS — зависимости по пакетному менеджеру (apt/dnf/pacman/zypper/brew: `build-essential`/`gcc`, `pkg-config`, ALSA-заголовки), rustup при отсутствии Rust или версии < 1.88, `git clone --depth 1 --branch` с запасным tarball-вариантом, `cargo build --release`, бинарь в `~/.local/bin`, подсказка про `PATH`, финальные шаги с токеном; флаги `--ref`, `--pipewire`, `--no-deps`, `--dir`, `--prefix`, `--dry-run`. Проверено `bash -n` и `bash install.sh --dry-run` (ничего не меняет).
+
+* [x] **Шаг 17.4 (`src/ui/app.rs`):** исправлено сохранение конфига — `App::with_loaded_config` ставил `persist_config: false`, поэтому ARL-токен из модалки и изменения Settings не попадали в `config.toml`; боевой путь теперь сохраняет, `with_config`/`new` (тесты и демо) — нет, добавлен тест `loaded_config_is_persisted_and_default_config_is_not`; doc-комментарии `src/config.rs` про окна шкал исправлены (52/30 → 32/26 дБ). Гейт: `cargo build` без warning'ов, `cargo test` **132/132**, `cargo clippy --all-targets -- -D warnings` exit 0.
 
 
