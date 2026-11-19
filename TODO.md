@@ -159,4 +159,16 @@
 
 * [x] **Шаг 17.4 (`src/ui/app.rs`):** исправлено сохранение конфига — `App::with_loaded_config` ставил `persist_config: false`, поэтому ARL-токен из модалки и изменения Settings не попадали в `config.toml`; боевой путь теперь сохраняет, `with_config`/`new` (тесты и демо) — нет, добавлен тест `loaded_config_is_persisted_and_default_config_is_not`; doc-комментарии `src/config.rs` про окна шкал исправлены (52/30 → 32/26 дБ). Гейт: `cargo build` без warning'ов, `cargo test` **132/132**, `cargo clippy --all-targets -- -D warnings` exit 0.
 
+## Фаза 18 (v2.8, не релиз)
+
+* [x] **Шаг 18.1 (`src/dsp/cavacore.rs`):** шкала `SpectrumScale::Absolute` — формула cava (сумма `hypot(re, im)` по бинам полосы, деление на число бинов, `20·log10` в окне, авточувствительность cava), без по-полосного AGC и пик-нормализации; `raw_bars` перестал клампиться до сглаживания (иначе `overshoot` не срабатывал и `sensitivity` раздувался до `AUTOSENS_MAX`). Подпись шкалы «Absolute · cava-style dB», алиас `"cava"` в `FromStr` → `Absolute`.
+
+* [x] **Шаг 18.2 (`src/config.rs` + Settings):** `spectrum_abs_db_window` (`Option<f32>`) + `effective_spectrum_abs_db_window()` + env `DEEZER_TUI_SPECTRUM_ABS_DB` (24–90 дБ, дефолт 70) и строка «Spectrum Peak Contrast (dB Window)» с шагами 30…90; тесты `abs_window_from_setting_clamps_and_defaults`, рендер и цикл строки, сквозной тест `App` → `config` + `cavacore`.
+
+* [x] **Шаг 18.3 (`src/dsp/cavacore.rs` + `src/config.rs` + Settings):** пресет отклика `SpectrumResponse::{Cava,Snappy}` (`Cava` — дефолт, константы cava `0.77/0.0021/1.0011`; `Snappy` — `0.55/0.0040/1.0035`), `set_response()`/`with_response()`/`apply_response()`, `spectrum_fast_response` + env `DEEZER_TUI_SPECTRUM_FAST_RESPONSE`, строка Settings «Spectrum Response», `App::cycle_spectrum_response`. Замер подъёма к 0.51 на тоне 120 Гц при 60 fps: 7 кадров (≈133 мс) против 4 (≈83 мс), спад ≈363 мс против ≈263 мс, адаптация `sens` ≈10.5 с против ≈3.3 с; FFT-окно не менялось (`N_BASS = 4096` ≈ 93 мс).
+
+* [x] **Шаг 18.4 (замер на реальном FLAC):** Slumberjack — «Pain» (212 с), участок 80–110 с, RMS −13.2 dBFS, 60 полос: Absolute 70 дБ `сред 0.480 / σ 0.236 / Δ 0.008`, 40 дБ `0.227 / 0.192 / 0.009`, 30 дБ `0.119 / 0.138 / 0.007`, TrackPeak `0.284 / 0.168 / 0.019`; рендер-слайды собраны из дампа кадров, временный зонд `src/api/probe_v027.rs` удалён.
+
+* [x] **Шаг 18.5 (точка возврата и документация):** коммит `948f2ae` с аннотированным тегом `spectrum-absolute-40db` (вид пользователя: Absolute + 40 дБ + spread OFF + строки AUTO); обновлены `README.md` (EN), `CHANGELOG.md` (`[v2.8]`), `ARCHITECTURE.md` (п. 7c), `docs/crates/progress.md` (Фаза 18). Гейт: `cargo build` без warning'ов, `cargo test` **135/135**, `cargo clippy --all-targets -- -D warnings` exit 0. Дефолты кода не изменены.
+
 

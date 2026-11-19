@@ -66,6 +66,12 @@ pub struct AppConfig {
     /// `DEEZER_TUI_SPECTRUM_ABS_DB` (в дБ).
     #[serde(default)]
     pub spectrum_abs_db_window: Option<f32>,
+    /// Скорость отклика полос шкалы `"absolute"`: `true` — быстрый пресет
+    /// (`integral 0.55`, крутая гравитация падения, `sens` растёт втрое быстрее),
+    /// `false` или `None` — дефолт cava (`integral 0.77`). Переопределяется
+    /// `DEEZER_TUI_SPECTRUM_FAST_RESPONSE` (`1`/`true`/`yes`/`on`).
+    #[serde(default)]
+    pub spectrum_fast_response: Option<bool>,
     /// Свёрнут ли левый сайдбар навигации (переключается по `s`).
     #[serde(default)]
     pub sidebar_collapsed: bool,
@@ -113,6 +119,7 @@ impl Default for AppConfig {
             spectrum_rows: None,
             spectrum_spread: 0.0,
             spectrum_abs_db_window: None,
+            spectrum_fast_response: None,
             sidebar_collapsed: false,
         }
     }
@@ -198,6 +205,18 @@ impl AppConfig {
         abs_window_from_setting(
             self.spectrum_abs_db_window,
             env::var("DEEZER_TUI_SPECTRUM_ABS_DB").ok().as_deref(),
+        )
+    }
+
+    /// Активный пресет отклика полос шкалы `Absolute`: `DEEZER_TUI_SPECTRUM_FAST_RESPONSE`
+    /// важнее `config.toml`; некорректное или отсутствующее значение — дефолт cava
+    /// (`false`).
+    pub fn effective_spectrum_fast_response(&self) -> bool {
+        fast_response_from_setting(
+            self.spectrum_fast_response,
+            env::var("DEEZER_TUI_SPECTRUM_FAST_RESPONSE")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -293,6 +312,15 @@ fn abs_window_from_setting(setting: Option<f32>, env_value: Option<&str>) -> f32
     }
 }
 
+fn fast_response_from_setting(setting: Option<bool>, env_value: Option<&str>) -> bool {
+    let parsed = match env_value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => Some(true),
+        Some("0" | "false" | "no" | "off") => Some(false),
+        _ => None,
+    };
+    parsed.or(setting).unwrap_or(false)
+}
+
 fn rows_from_setting(setting: Option<u16>, env_value: Option<&str>) -> Option<u16> {
     let raw = env_value
         .filter(|v| !v.trim().is_empty())
@@ -358,6 +386,19 @@ mod tests {
             0.0,
             "база ниже порога включения считается выключенной"
         );
+    }
+
+    #[test]
+    fn fast_response_from_setting_prefers_env_and_defaults_to_cava() {
+        assert!(!fast_response_from_setting(None, None), "без значения — дефолт cava");
+        assert!(fast_response_from_setting(Some(true), None));
+        assert!(!fast_response_from_setting(Some(true), Some("0")));
+        assert!(fast_response_from_setting(Some(false), Some("yes")));
+        assert!(
+            fast_response_from_setting(Some(true), Some("bogus")),
+            "некорректное значение окружения игнорируется и остаётся значение конфига"
+        );
+        assert!(fast_response_from_setting(Some(true), Some(" TRUE ")));
     }
 
     #[test]
@@ -431,6 +472,7 @@ mod tests {
             spectrum_rows: Some(8),
             spectrum_spread: 2.0,
             spectrum_abs_db_window: Some(45.0),
+            spectrum_fast_response: Some(true),
             sidebar_collapsed: true,
         };
         config.save_to(&cfg_path).expect("save_to failed");

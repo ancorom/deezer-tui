@@ -26,7 +26,7 @@ use crate::audio::prefetch::{GaplessPolicy, PrefetchSlot};
 use crate::audio::ring_buffers::{create_rings, AUDIO_RING_BUFFER_CAPACITY};
 use crate::audio::stream::DeezerStream;
 use crate::config::AppConfig;
-use crate::dsp::cavacore::Cavacore;
+use crate::dsp::cavacore::{Cavacore, SpectrumResponse};
 use crate::mpris::{self, Mpris};
 use crate::ui::theme;
 use crate::ui::views::flow_lyrics::{FlowLyrics, FlowRow};
@@ -294,7 +294,12 @@ impl App {
             .with_db_scale(cfg.db_scale)
             .with_scale_mode(cfg.effective_spectrum_scale())
             .with_spread_base(cfg.effective_spectrum_spread())
-            .with_abs_window(cfg.effective_spectrum_abs_db_window());
+            .with_abs_window(cfg.effective_spectrum_abs_db_window())
+            .with_response(if cfg.effective_spectrum_fast_response() {
+                SpectrumResponse::Snappy
+            } else {
+                SpectrumResponse::Cava
+            });
         let mut settings = Settings::new();
         settings.sync_from_config(&cfg, None, None);
 
@@ -2728,6 +2733,15 @@ impl App {
         self.save_config();
     }
 
+    /// Пресет отклика полос шкалы `Absolute`: дефолт cava или быстрый. Применяется
+    /// к `Cavacore` сразу и сохраняется в `config.toml`. На другие шкалы не влияет.
+    pub fn cycle_spectrum_response(&mut self, forward: bool) {
+        let next = self.settings.cycle_spectrum_response(forward);
+        self.config.spectrum_fast_response = Some(next == SpectrumResponse::Snappy);
+        self.cavacore.set_response(next);
+        self.save_config();
+    }
+
     /// Переключает высоту панели спектра (AUTO -> 4 -> 6 -> ... -> 12).
     pub fn cycle_spectrum_rows(&mut self, forward: bool) {
         let next = self.settings.cycle_spectrum_rows(forward);
@@ -2795,6 +2809,9 @@ impl App {
             }
             7 => {
                 self.cycle_spectrum_abs_window(forward);
+            }
+            8 => {
+                self.cycle_spectrum_response(forward);
             }
             _ => {}
         }
@@ -2894,7 +2911,7 @@ impl App {
                     self.spawn_fetch_more_flow();
                 }
             }
-            5 if self.settings.selected_row < 7 => self.settings.selected_row += 1,
+            5 if self.settings.selected_row < 8 => self.settings.selected_row += 1,
             _ => {}
         }
     }
@@ -3190,6 +3207,14 @@ mod tests {
         );
         app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.config.effective_spectrum_abs_db_window(), 70.0);
+
+        app.settings.selected_row = 8;
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert!(app.config.effective_spectrum_fast_response());
+        assert_eq!(app.cavacore.response(), SpectrumResponse::Snappy);
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert!(!app.config.effective_spectrum_fast_response());
+        assert_eq!(app.cavacore.response(), SpectrumResponse::Cava);
     }
 
     #[test]

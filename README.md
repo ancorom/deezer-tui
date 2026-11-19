@@ -119,7 +119,9 @@ Environment variables override the file.
 arl = "0123456789abcdef0123456789abcdef"
 volume = 0.8
 preferred_quality = "FLAC"          # FLAC | MP3_320 | MP3_128
-spectrum_scale = "track_peak"       # track_peak | frame_peak | legacy
+spectrum_scale = "track_peak"       # track_peak | frame_peak | legacy | absolute
+spectrum_abs_db_window = 40.0       # absolute scale only: contrast window in dB
+spectrum_fast_response = false      # absolute scale only: faster bars than cava smoothing
 spectrum_spread = 0.0               # 0.0 = off (cava-like), 1.35 = Monstercat look
 spectrum_rows = 5                   # omit for AUTO (4–6 rows depending on height)
 show_lyrics = true
@@ -135,7 +137,9 @@ db_scale = true                     # Legacy height scale: dB window vs linear a
 | `show_spectrum` | bool | `true` | Bottom spectrum panel; `v` toggles it live |
 | `show_lyrics` | bool | `true` | Synchronized lyrics panel; `y` toggles it live |
 | `db_scale` | bool | `true` | **Legacy** height scale only: 32 dB logarithmic window vs linear amplitude with `x^0.45` |
-| `spectrum_scale` | string | `track_peak` | `track_peak`, `frame_peak`, `legacy` (see below) |
+| `spectrum_scale` | string | `track_peak` | `track_peak`, `frame_peak`, `legacy`, `absolute` (`"cava"` is accepted as an alias of `absolute`; see below) |
+| `spectrum_abs_db_window` | float or omitted | *(70)* | **Absolute** scale only: contrast window in dB, clamped to 24–90. `30`–`40` makes peaks hit the ceiling and drops quiet bands; `70` is the dense cava default |
+| `spectrum_fast_response` | bool or omitted | *(false)* | **Absolute** scale only: `true` = faster attack and release than the cava smoothing (see *Spectrum Response*) |
 | `spectrum_spread` | float | `0.0` | Neighbor pull-up base. `0.0` = off (bands independent, as in cava); `2.0`/`3.0` soft; `1.35` = the classic Monstercat look |
 | `spectrum_rows` | integer or omitted | *(AUTO)* | Panel height: AUTO picks 4–6 rows from the terminal height; explicit values are clamped to 2–12 |
 | `sidebar_collapsed` | bool | `false` | Left navigation sidebar collapsed; `s` toggles it |
@@ -145,7 +149,9 @@ Environment overrides:
 | Variable | Values | Overrides |
 | --- | --- | --- |
 | `DEEZER_ARL` | token | `arl` |
-| `DEEZER_TUI_SPECTRUM_SCALE` | `legacy` / `track_peak` / `frame_peak` | `spectrum_scale` |
+| `DEEZER_TUI_SPECTRUM_SCALE` | `legacy` / `track_peak` / `frame_peak` / `absolute` | `spectrum_scale` |
+| `DEEZER_TUI_SPECTRUM_ABS_DB` | `24`–`90` (dB) | `spectrum_abs_db_window` |
+| `DEEZER_TUI_SPECTRUM_FAST_RESPONSE` | `1` / `true` / `yes` / `on` (or `0` / `false` / `no` / `off`) | `spectrum_fast_response` |
 | `DEEZER_TUI_SPECTRUM_SPREAD` | `off`, `0`, or a number (`1.05`–`4.0`) | `spectrum_spread` |
 | `DEEZER_TUI_SPECTRUM_ROWS` | `0` (= AUTO) or `2`–`12` | `spectrum_rows` |
 | `DEEZER_TUI_CONFIG` | path | config file location |
@@ -162,11 +168,24 @@ Height Scale*):
 | `track_peak` (**default**) | the track's slow long-term loudness peak | 26 dB below it | Stable contrast across songs; quiet bands stay quiet |
 | `frame_peak` | the current frame's peak, held ~0.1 s before it is allowed to fall | 26 dB below it | cava-style: the loudest bar touches the ceiling, loudness changes stay visible |
 | `legacy` | absolute 0 dBFS | 32 dB | Reference-style absolute levels, no peak tracking |
+| `absolute` | absolute 0 dBFS, exactly like cava's dB mode | 70 dB by default, tunable 24–90 | cava formula per band (sum of `hypot(re, im)`, divided by the bin count, then `20·log10` inside the window) plus cava's auto-sensitivity. Narrower windows make peaks saturate and quiet bands sink toward the floor |
 
-Two more knobs on the same tab: **Spectrum Neighbor Spread** (off by default —
+Three more knobs on the same tab: **Spectrum Neighbor Spread** (off by default —
 the Monstercat filter that pulled neighbouring bars toward the dominant one is a
-near no-op on dense real spectra, so it is opt-in) and **Spectrum Panel Rows**
-(AUTO 4–6, or a fixed 2–12 rows for finer vertical detail).
+near no-op on dense real spectra, so it is opt-in), **Spectrum Peak Contrast (dB
+Window)** (the window width of the `absolute` scale: 30–40 dB gives tall peaks over
+a low floor, 70 dB the dense cava picture) and **Spectrum Response** (`absolute`
+scale only). *Cava smoothing* keeps cava's `integral 0.77` and the parabolic fall
+(`gravity 0.0021`); *Snappy* uses `integral 0.55` with `gravity 0.0040` and lets the
+auto-sensitivity rises about three times faster. Measured on a synthetic 120 Hz tone
+at 60 fps: a bar reaches a mid height in 7 frames (≈133 ms) with Cava and 4 frames
+(≈83 ms) with Snappy, the fall to zero takes ≈363 ms and ≈263 ms, and the
+auto-sensitivity adaptation after a track change shrinks from roughly 10 s to
+roughly 3 s. The FFT window is untouched either way, so the lowest bands still
+average about 93 ms of audio. Snappy is opt-in and smooths less — it looks livelier
+but also twitchier, which is why *Cava smoothing* stays the default. **Spectrum
+Panel Rows** sits next to them: AUTO 4–6 rows, or a fixed 2–12 rows for finer
+vertical detail.
 
 ## Key bindings
 

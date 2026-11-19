@@ -8,7 +8,7 @@
 use ratatui::prelude::*;
 
 use crate::config::AppConfig;
-use crate::dsp::cavacore::{ABS_DB_WINDOW, MONSTERCAT_BASE, SpectrumScale};
+use crate::dsp::cavacore::{ABS_DB_WINDOW, MONSTERCAT_BASE, SpectrumResponse, SpectrumScale};
 use crate::ui::theme;
 
 pub const QUALITY_CODES: [&str; 3] = ["FLAC", "MP3_320", "MP3_128"];
@@ -48,6 +48,8 @@ pub struct Settings {
     pub spectrum_spread: f32,
     /// Ширина dB-окна шкалы `Absolute` (контраст), см. `SPECTRUM_ABS_WINDOW_CHOICES`.
     pub spectrum_abs_window: f32,
+    /// `true` — быстрый отклик полос шкалы `Absolute`, `false` — дефолт cava.
+    pub spectrum_fast_response: bool,
 }
 
 impl Default for Settings {
@@ -70,6 +72,7 @@ impl Settings {
             spectrum_rows: None,
             spectrum_spread: 0.0,
             spectrum_abs_window: ABS_DB_WINDOW,
+            spectrum_fast_response: false,
         }
     }
 
@@ -90,6 +93,7 @@ impl Settings {
         self.spectrum_rows = cfg.effective_spectrum_rows();
         self.spectrum_spread = cfg.effective_spectrum_spread();
         self.spectrum_abs_window = cfg.effective_spectrum_abs_db_window();
+        self.spectrum_fast_response = cfg.effective_spectrum_fast_response();
 
         self.account_status = if let Some(user) = user_label {
             format!("CONNECTED as {user} (Deezer HiFi / BF_CBC_STRIPE ready)")
@@ -217,6 +221,27 @@ impl Settings {
         format!("◄ {:.0} dB ►", self.spectrum_abs_window)
     }
 
+    /// Активный пресет отклика полос шкалы `Absolute`.
+    pub fn spectrum_response(&self) -> SpectrumResponse {
+        if self.spectrum_fast_response {
+            SpectrumResponse::Snappy
+        } else {
+            SpectrumResponse::Cava
+        }
+    }
+
+    /// Переключает пресет отклика: вариантов два, поэтому оба направления
+    /// (`←` и `→`) меняют значение на противоположное.
+    pub fn cycle_spectrum_response(&mut self, _forward: bool) -> SpectrumResponse {
+        self.spectrum_fast_response = !self.spectrum_fast_response;
+        self.spectrum_response()
+    }
+
+    /// Подпись пресета отклика для экрана Settings.
+    pub fn spectrum_response_label(&self) -> String {
+        format!("\u{25c4} {} \u{25ba}", self.spectrum_response().label())
+    }
+
     pub fn masked_arl(&self) -> String {
         let trimmed = self.arl_input.trim();
         if trimmed.is_empty() {
@@ -283,7 +308,7 @@ impl Widget for &Settings {
             self.masked_arl()
         };
 
-        let items: [(&str, String, &str); 8] = [
+        let items: [(&str, String, &str); 9] = [
             (
                 "Preferred Audio Quality",
                 format!("◄ {} ►", self.quality_display_label()),
@@ -330,7 +355,12 @@ impl Widget for &Settings {
             (
                 "Spectrum Peak Contrast (dB Window)",
                 self.spectrum_abs_window_label(),
-                "Absolute scale only: ◄► 30–40 dB tall peaks over low floor | 70 dB dense cava default",
+                "Absolute scale only: ◄► 30–40 dB tall peaks | 70 dB dense cava default",
+            ),
+            (
+                "Spectrum Response",
+                self.spectrum_response_label(),
+                "Absolute scale only: cava smoothing 0.77 | snappy 0.55 reacts faster",
             ),
         ];
 
@@ -423,6 +453,8 @@ mod tests {
         assert!(row_has(&terminal, 15, "AUTO (4\u{2013}6)"));
         assert!(row_has(&terminal, 17, "Spectrum Peak Contrast"));
         assert!(row_has(&terminal, 17, "70 dB"));
+        assert!(row_has(&terminal, 19, "Spectrum Response"));
+        assert!(row_has(&terminal, 19, "Cava smoothing"));
     }
 
     #[test]
@@ -459,6 +491,15 @@ mod tests {
         assert_eq!(screen.cycle_spectrum_abs_window(true), 30.0);
         assert_eq!(screen.cycle_spectrum_abs_window(false), 90.0);
         assert_eq!(screen.cycle_spectrum_abs_window(false), 70.0);
+
+        assert_eq!(screen.spectrum_response(), SpectrumResponse::Cava);
+        assert_eq!(
+            screen.spectrum_response_label(),
+            "\u{25c4} Cava smoothing \u{25ba}"
+        );
+        assert_eq!(screen.cycle_spectrum_response(true), SpectrumResponse::Snappy);
+        assert_eq!(screen.spectrum_response_label(), "\u{25c4} Snappy \u{25ba}");
+        assert_eq!(screen.cycle_spectrum_response(false), SpectrumResponse::Cava);
     }
 
     #[test]

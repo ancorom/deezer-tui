@@ -79,9 +79,10 @@
         │                           #   (clamp 0.85–2.2), по-полосный AGC + относительный порог
         │                           #   тишины (v2.5), Monstercat spatial filter (1.35^d), gravity
         │                           #   falloff, autosens (мёртвая зона 0.4–0.85), три шкалы
-        │                           #   высоты: TrackPeak / FramePeak (окно 30 дБ от пика
-        │                           #   трека / кадра) и Legacy (0 dBFS, 52 дБ), линейный
-        │                           #   x^0.45, set_num_bars.
+        │                           #   высоты: TrackPeak / FramePeak (окно 26 дБ от пика
+        │                           #   трека / кадра), Legacy (0 dBFS, 32 дБ), линейный
+        │                           #   x^0.45 и Absolute (cava-style dB, окно 24–90 дБ,
+        │                           #   пресет отклика Cava/Snappy), set_num_bars.
         │                           #   process(&[f32]).
         └── ui/
             ├── mod.rs              # pub-экспорт: app, theme, views, widgets.
@@ -288,6 +289,28 @@
     - `set_scale_mode()` не трогает соседний фильтр: задаёт `rel_window`/`db_window`, `integral`,
       `gravity`, `frame_ref_release` и сбрасывает `mem`/`prev`/`fall_step`/`band_ref`/`slow_peak`/
       `frame_ref`/`sensitivity`.
+ 7c. Абсолютная шкала `Absolute` и пресет отклика `SpectrumResponse` (v2.8):
+     - `Absolute` воспроизводит dB-режим cava: сумма `hypot(re, im)` по бинам полосы **делится на число
+       бинов** (вес `cut_off^0.85 / log2(FFTsize) / (upper−lower+1)`, как в `cavacore.c`), затем
+       `(20·log10(sum) + abs_window) / abs_window` и умножение на `sensitivity`. По-полосного AGC и
+       пик-нормализации нет; `raw_bars` намеренно не клампится до сглаживания — с клампом `mem > 1`
+       невозможно, `overshoot` не срабатывает и `sensitivity` раздувается до `AUTOSENS_MAX`.
+     - `abs_window` — отдельный регулятор контраста (`ABS_WINDOW_MIN = 24` … `ABS_WINDOW_MAX = 90`,
+       дефолт `ABS_DB_WINDOW = 70`), при смене шкалы не сбрасывается; Settings → **Spectrum Peak
+       Contrast (dB Window)**, env `DEEZER_TUI_SPECTRUM_ABS_DB`. Замер на реальном FLAC (Slumberjack —
+       «Pain», участок 80–110 с, 60 полос): `сред` 0.480 (70 дБ) / 0.227 (40 дБ) / 0.119 (30 дБ),
+       σ 0.236 / 0.192 / 0.138, Δ 0.008–0.009.
+     - `SpectrumResponse::Cava` — константы cava (`ABS_INTEGRAL 0.77`, `ABS_GRAVITY 0.0021`,
+       `ABS_SENS_UP 1.0011`); `Snappy` — `0.55 / 0.0040 / 1.0035`. Замер подъёма к 0.51 на тоне 120 Гц
+       при 60 fps: 7 кадров (≈133 мс) против 4 кадров (≈83 мс); спад до нуля ≈363 мс против ≈263 мс;
+       удвоение `sens` после смены трека ≈10.5 с против ≈3.3 с. FFT-окно (`N_BASS = 4096` ≈ 93 мс,
+       `N_MID_HIGH = 2048` ≈ 46 мс) не менялось: `apply_hann_from_ring` берёт последние N отсчётов
+       (фазового сдвига нет), а `step_dsp` вычитывает VisRing целиком за кадр — накопления очереди нет,
+       то есть визуализация скорее чуть опережает устройство, чем отстаёт от него.
+     - `set_response()` действует только на `Absolute`; `set_scale_mode()` вызывает `apply_response()`
+       и ширину окна не трогает. Дефолт отклика — `Cava`, выбранный вид закреплён тегом
+       `spectrum-absolute-40db`.
+     - Алиас `"cava"` в `SpectrumScale::FromStr` ведёт в `Absolute` (раньше — в `frame_peak`).
 
 8. Динамическое число полос (v2.3):
    `set_num_bars(desired_bars)` — пересчёт границ, bin-индексов и EQ-весов; `mem`/`prev` ресайзятся (новые полосы обнулены), FFT-буферы и окна Ханна сохраняются (аудио-состояние не сбрасывается); вызывает App при ресайзе окна. `Spectrum::render` отрисовывает полосы 1:1 — без ресемплинга (`sample_slice` убран).

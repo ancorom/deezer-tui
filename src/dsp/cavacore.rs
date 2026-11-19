@@ -123,6 +123,34 @@ const ABS_GRAVITY: f32 = 0.0021;
 /// (`×(1 − 0.02·framerate_mod)`), где `framerate_mod = 66/60 = 1.1`.
 const ABS_SENS_UP: f32 = 1.0011;
 const ABS_SENS_DOWN: f32 = 0.978;
+/// Быстрый отклик для `Absolute`:integral 0.55 поднимает полосу до 0.5 за
+/// ~1.5 кадра (у дефолта cava 0.77 — ~3.6 кадра), более крутая гравитация
+/// короче возвращает столбик в долину, а `sens` растёт втрое быстрее, поэтому
+/// смена трека не выглядит «запозданием» на секунды.
+const SNAPPY_INTEGRAL: f32 = 0.55;
+const SNAPPY_GRAVITY: f32 = 0.0040;
+const SNAPPY_SENS_UP: f32 = 1.0035;
+
+/// Скорость отклика полос в шкале `Absolute`. Дефолт повторяет cava; быстрый
+/// вариант подбирать тот же вид, но столбики взлетают и падают заметно живее.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpectrumResponse {
+    /// Дефолт cava: integral 0.77, gravity 0.0021, медленный рост `sens`.
+    #[default]
+    Cava,
+    /// Быстрее rise/fall и быстрее адаптация `sens` при смене трека.
+    Snappy,
+}
+
+impl SpectrumResponse {
+    /// Короткая подпись для экрана Settings.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cava => "Cava smoothing",
+            Self::Snappy => "Snappy",
+        }
+    }
+}
 
 /// Коэффициент мягкой компрессии для линейного (не-dB) режима: `val^0.45`.
 /// Показатель меньше 1 поднимает тихие полосы, сохраняя «удар» баса.
@@ -338,6 +366,8 @@ pub struct Cavacore {
     /// Узкое окно даёт высокий контраст (пики up, фон низкий), широкое — плотную
     /// картину. Настраивается из конфигурации, см. `ABS_WINDOW_MIN`/`ABS_WINDOW_MAX`.
     abs_window: f32,
+    response: SpectrumResponse,
+    sens_up: f32,
     integral: f32,
     gravity: f32,
     raw_bars: Vec<f32>,
@@ -434,6 +464,8 @@ impl Cavacore {
             rel_window: REL_WINDOW,
             db_window: DB_DYNAMIC_RANGE,
             abs_window: ABS_DB_WINDOW,
+            response: SpectrumResponse::default(),
+            sens_up: ABS_SENS_UP,
             integral: INTEGRAL,
             gravity: GRAVITY,
             bass_r2c,
@@ -528,8 +560,7 @@ impl Cavacore {
                 // Окно `abs_window` здесь не трогаем: оно общий регулятор контраста,
                 // и при переключении шкал туда-обратно пользовательское значение должно
                 // сохраняться.
-                self.integral = ABS_INTEGRAL;
-                self.gravity = ABS_GRAVITY;
+                self.apply_response();
             }
         }
         self.slow_peak = 0.0;
@@ -555,6 +586,43 @@ impl Cavacore {
     /// Активная ширина dB-окна шкалы `Absolute`.
     pub fn abs_window(&self) -> f32 {
         self.abs_window
+    }
+
+    /// Устанавливает скорость отклика полос шкалы `Absolute`: пресет меняет
+    /// `integral`, гравитацию падения и скорость роста `sens`. Для остальных шкал
+    /// значение сохраняется и применяется при возврате к `Absolute`.
+    pub fn set_response(&mut self, response: SpectrumResponse) {
+        self.response = response;
+        if self.scale_mode == SpectrumScale::Absolute {
+            self.apply_response();
+        }
+    }
+
+    /// Builder-вариант `set_response`.
+    pub fn with_response(mut self, response: SpectrumResponse) -> Self {
+        self.set_response(response);
+        self
+    }
+
+    /// Активный пресет отклика.
+    pub fn response(&self) -> SpectrumResponse {
+        self.response
+    }
+
+    /// Выставляет константы сглаживания и роста `sens` по выбранному пресету.
+    fn apply_response(&mut self) {
+        match self.response {
+            SpectrumResponse::Cava => {
+                self.integral = ABS_INTEGRAL;
+                self.gravity = ABS_GRAVITY;
+                self.sens_up = ABS_SENS_UP;
+            }
+            SpectrumResponse::Snappy => {
+                self.integral = SNAPPY_INTEGRAL;
+                self.gravity = SNAPPY_GRAVITY;
+                self.sens_up = SNAPPY_SENS_UP;
+            }
+        }
     }
 
     /// Устанавливает базу пространственного фильтра соседних полос. Значение
@@ -926,7 +994,7 @@ impl Cavacore {
                 if overshoot {
                     self.sensitivity *= ABS_SENS_DOWN;
                 } else if peak_lin > ABS_SILENCE_FLOOR {
-                    self.sensitivity *= ABS_SENS_UP;
+                    self.sensitivity *= self.sens_up;
                 }
                 self.sensitivity = self.sensitivity.clamp(AUTOSENS_MIN, AUTOSENS_MAX);
             }
@@ -1025,6 +1093,72 @@ mod tests {
                 "переключение шкалы должно сбрасывать сглаживание: {a} vs {b}"
             );
         }
+    }
+
+    #[test]
+    fn snappy_response_rises_faster_than_cava_default() {
+        let tone: Vec<f32> = sine_wave(120.0, 44_100.0, 735)
+            .iter()
+            .map(|s| s * 0.25)
+            .collect();
+        let build = |response: SpectrumResponse| {
+            Cavacore::new(44_100.0, 32)
+                .with_scale_mode(SpectrumScale::Absolute)
+                .with_abs_window(40.0)
+                .with_response(response)
+        };
+        let mut cava = build(SpectrumResponse::Cava);
+        let mut snappy = build(SpectrumResponse::Snappy);
+
+        // Первые кадры после сброса: `sens` ещё равен 1 у обоих пресетов, поэтому
+        // разница здесь чисто от скорости сглаживания (`integral`).
+        let frames = 16;
+        let rise = |core: &mut Cavacore| -> Vec<f32> {
+            core.reset();
+            (0..frames)
+                .map(|_| {
+                    let bars = core.process(&tone);
+                    bars.iter().copied().fold(0.0f32, f32::max)
+                })
+                .collect()
+        };
+        let slow_rise = rise(&mut cava);
+        let fast_rise = rise(&mut snappy);
+        println!(
+            "cava   : {}",
+            slow_rise.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>().join(" ")
+        );
+        println!(
+            "snappy : {}",
+            fast_rise.iter().map(|v| format!("{v:.2}")).collect::<Vec<_>>().join(" ")
+        );
+
+        for (idx, (fast, slow)) in fast_rise.iter().zip(slow_rise.iter()).enumerate() {
+            assert!(
+                fast >= slow,
+                "кадр {idx}: быстрый пресет не может быть тише дефолта ({fast:.2} < {slow:.2})"
+            );
+        }
+        assert!(
+            fast_rise[1] > slow_rise[1],
+            "на втором кадре быстрый пресет уже должен быть впереди: {:.2} против {:.2}",
+            fast_rise[1],
+            slow_rise[1]
+        );
+
+        let threshold = slow_rise[frames - 1].min(fast_rise[frames - 1]) * 0.8;
+        let reached = |bars: &[f32]| bars.iter().position(|&v| v >= threshold).unwrap_or(frames);
+        let fast = reached(&fast_rise);
+        let slow = reached(&slow_rise);
+        println!(
+            "порог {threshold:.2}: cava {slow} кадров ({:.0} мс), snappy {fast} кадров ({:.0} мс)",
+            (slow + 1) as f64 * 16.67,
+            (fast + 1) as f64 * 16.67
+        );
+        assert!(
+            fast < slow,
+            "быстрый пресет должен раньше достичь порога: {fast} против {slow} кадров"
+        );
     }
 
     #[test]
