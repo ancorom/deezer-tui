@@ -27,3 +27,6 @@ project_dump*.txt
 # Локальный корпус внешних LLM-ревью (диагнозы и слайсы кода) — не публикуется
 # Ссылки в PLAN.md и docs/crates/progress.md указывают на локальную копию
 gemini_review/
+
+# План-задание для ручного запуска antigravity CLI (локальный handoff, не публикуется)
+AGY_PLAN.md
